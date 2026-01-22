@@ -371,6 +371,31 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         // 6: max  1*16= 16 bytes,   8 half
         ggml_cuda_unroll<6>{}(load);
     } else {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+        constexpr int vec_h2 = 4;
+        if (D2 % vec_h2 == 0 && stride_KV % vec_h2 == 0 && stride_tile % vec_h2 == 0) {
+            const int nthreads = nwarps * WARP_SIZE;
+            const int vecs_per_row = D2 / vec_h2;
+            const int total_vecs = nbatch_fa * vecs_per_row;
+            const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
+
+            for (int idx = tid; idx < total_vecs; idx += nthreads) {
+                const int row = idx / vecs_per_row;
+                const int col = (idx - row * vecs_per_row) * vec_h2;
+                const int col_sw = swizzle_enabled ?
+                    ggml_cuda_fattn_swizzle_col<swizzle_vec, swizzle_per_phase, swizzle_max_phase>(row, col) : col;
+                half2 * const dst = tile_KV + row * stride_tile + col_sw;
+
+                if (!oob_check || row < i_sup) {
+                    ggml_cuda_memcpy_1<vec_h2 * sizeof(half2)>(dst, KV + row * stride_KV + col);
+                } else {
+                    const int4 zero = {0, 0, 0, 0};
+                    *reinterpret_cast<int4 *>(dst) = zero;
+                }
+            }
+            return;
+        }
+#endif
         // TODO use ggml_cuda_memcpy_1
         auto load = [&] __device__ (const int n) {
             const int stride_k = WARP_SIZE >> n;
