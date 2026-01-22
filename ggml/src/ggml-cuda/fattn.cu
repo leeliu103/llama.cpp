@@ -33,11 +33,18 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 
 template <int DKQ, int DV>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    if (amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc)) {
+        // Match Gluon's fixed BLOCK_M/BLOCK_N by keeping ncols=64 and ncols2=1.
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64, 1>(ctx, dst);
+        return;
+    }
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
@@ -349,27 +356,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && Q->ne[0] <= 128 && Q->ne[0] != 40 && Q->ne[0] != 72) {
-        if (can_use_vector_kernel) {
-            if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-                if (Q->ne[1] == 1) {
-                    if (!gqa_opt_applies) {
-                        return BEST_FATTN_KERNEL_VEC;
-                    }
-                }
-            } else {
-                if (Q->ne[1] <= 2) {
-                    return BEST_FATTN_KERNEL_VEC;
-                }
-            }
-        }
-        int gqa_ratio_eff = 1;
-        const int ncols2_max = Q->ne[0] == 576 ? 16 : 8;
-        while (gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
-            gqa_ratio_eff *= 2;
-        }
-        if (Q->ne[1] * gqa_ratio_eff <= 8) {
-            return BEST_FATTN_KERNEL_TILE; // AMD WMMA is only faster if the full tile width of 16 can be utilized.
-        }
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 

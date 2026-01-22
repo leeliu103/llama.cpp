@@ -13,6 +13,14 @@ static __device__ __forceinline__ float ggml_cuda_fattn_expf(const float x) {
 #endif // defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
 }
 
+static constexpr __host__ __device__ int ggml_cuda_next_pow2(const int x) {
+    int v = 1;
+    while (v < x) {
+        v <<= 1;
+    }
+    return v;
+}
+
 // Config options for the MMA kernel.
 // Should not affect results, only speed/register pressure/shared memory use.
 struct fattn_mma_config {
@@ -107,7 +115,12 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 }
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna(const int DKQ, const int DV, const int ncols) {
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  32,  64,  64,  64, 2, true);
+    // Align RDNA4 tiles with Gluon prefill (BLOCK_M=64, BLOCK_N=32).
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 64, 128, 6,  32,  32,  32,  32, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 80,  80, 64, 128, 6,  32,  40,  40,  40, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 96,  96, 64, 128, 6,  32,  48,  48,  48, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(112, 112, 64, 128, 6,  32,  56,  56,  56, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 6,  32,  64,  64,  64, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16, 128, 2,  64, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 2, true);
@@ -264,7 +277,7 @@ static __device__ __forceinline__ void ggml_cuda_fattn_load_ldmatrix_swizzle(
         TileT & t, const half2 * __restrict__ xs0, const int stride, const int col_offset) {
 #if defined(AMD_WMMA_AVAILABLE)
     constexpr int swizzle_span = swizzle_vec * swizzle_max_phase;
-    constexpr bool swizzle_enabled = (swizzle_vec != 0) && (swizzle_max_phase != 1) && ((stride_tile - 4) >= swizzle_span);
+    constexpr bool swizzle_enabled = (swizzle_vec != 0) && (swizzle_max_phase != 1) && (stride_tile >= swizzle_span);
     if constexpr (pack_rows) {
 #pragma unroll
         for (int l = 0; l < t.ne; ++l) {
@@ -314,7 +327,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     // K/V data is loaded with decreasing granularity for D for better memory bandwidth.
     // The minimum granularity with cp.async is 16 bytes, with synchronous data loading it's 4 bytes.
     constexpr int swizzle_span = swizzle_vec * swizzle_max_phase;
-    constexpr bool swizzle_enabled = (swizzle_vec != 0) && (swizzle_max_phase != 1) && ((stride_tile - 4) >= swizzle_span);
+    constexpr bool swizzle_enabled = (swizzle_vec != 0) && (swizzle_max_phase != 1) && (stride_tile >= swizzle_span);
     if constexpr (use_cp_async) {
         static_assert(!swizzle_enabled, "swizzled cp_async not supported");
         static_assert(!oob_check, "OOB check not compatible with cp_async");
@@ -514,17 +527,22 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2);
 
-    constexpr int stride_tile_Q = DKQ/2     + 4;
+    constexpr int stride_tile_Q = DKQ/2 + 4;
+#if defined(AMD_WMMA_AVAILABLE)
+    constexpr int stride_tile_K = ggml_cuda_next_pow2(nbatch_K2);
+    static_assert(!mla || nbatch_K2 >= nbatch_V2, "bad nbatch_K2, nbatch_V2 for MLA");
+    constexpr int stride_tile_V = mla ? stride_tile_K : ggml_cuda_next_pow2(nbatch_V2);
+#else
     constexpr int stride_tile_K = nbatch_K2 + 4;
-
     static_assert(!mla || nbatch_K2 >= nbatch_V2, "bad nbatch_K2, nbatch_V2 for MLA");
     constexpr int stride_tile_V = mla ? stride_tile_K : nbatch_V2 + 4;
+#endif
 
 #if defined(AMD_WMMA_AVAILABLE)
     // Shared swizzle params in half2 units matching Gluon's shared_k/shared_v layouts.
     constexpr int k_swizzle_vec = 4;
     constexpr int k_swizzle_per_phase = 1;
-    constexpr int k_swizzle_max_phase = 16;
+    constexpr int k_swizzle_max_phase = stride_tile_K / k_swizzle_vec;
     constexpr int v_swizzle_vec = 1;
     constexpr int v_swizzle_per_phase = 1;
     constexpr int v_swizzle_max_phase = 1;
@@ -1109,18 +1127,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     static_assert(nwarps * (cols_per_warp/ncols2) % ncols1 == 0, "bad nwarps");
 
-    constexpr int stride_tile_Q = DKQ/2     + 4;
+    constexpr int stride_tile_Q = DKQ/2 + 4;
+#if defined(AMD_WMMA_AVAILABLE)
+    constexpr int stride_tile_K = ggml_cuda_next_pow2(nbatch_K2);
+    static_assert(!mla || nbatch_K2 >= nbatch_V2, "bad nbatch_K2, nbatch_V2 for MLA");
+    constexpr int stride_tile_V = mla ? stride_tile_K : ggml_cuda_next_pow2(nbatch_V2);
+#else
     constexpr int stride_tile_K = nbatch_K2 + 4;
-
     static_assert(!mla || nbatch_K2 >= nbatch_V2, "bad nbatch_K2, nbatch_V2 for MLA");
     constexpr int stride_tile_V = mla ? stride_tile_K : nbatch_V2 + 4;
+#endif
     constexpr int stride_tile_KV_max = stride_tile_K > stride_tile_V ? stride_tile_K : stride_tile_V;
 
 #if defined(AMD_WMMA_AVAILABLE)
     // Shared swizzle params in half2 units matching Gluon's shared_k/shared_v layouts.
     constexpr int k_swizzle_vec = 4;
     constexpr int k_swizzle_per_phase = 1;
-    constexpr int k_swizzle_max_phase = 16;
+    constexpr int k_swizzle_max_phase = stride_tile_K / k_swizzle_vec;
     constexpr int v_swizzle_vec = 1;
     constexpr int v_swizzle_per_phase = 1;
     constexpr int v_swizzle_max_phase = 1;
@@ -1826,8 +1849,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     constexpr bool mla = DKQ == 576;
 
-    const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
+    const int stride_K = amd_wmma_available(cc) ? ggml_cuda_next_pow2(nbatch_K2) : nbatch_K2 + 4;
+    const int stride_V = amd_wmma_available(cc) ? ggml_cuda_next_pow2(nbatch_V2) : nbatch_V2 + 4;
+    const size_t nbytes_shared_KV_1stage = nbatch_fa * std::max(stride_K, stride_V) * sizeof(half2);
+    const size_t nbytes_shared_KV_2stage = nbatch_fa *         (stride_K + stride_V) * sizeof(half2);
     const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
     const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
     const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
