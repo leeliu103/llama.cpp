@@ -238,12 +238,48 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, c
 
 // ------------------------------------------------------------------------------------------------------------------
 
-template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check>
+template<int swizzle_vec, int swizzle_per_phase, int swizzle_max_phase>
+static __device__ __forceinline__ int ggml_cuda_fattn_swizzle_col(const int row, const int col) {
+    if constexpr (swizzle_vec == 0 || swizzle_max_phase == 1) {
+        return col;
+    } else {
+        const int phase = (row / swizzle_per_phase) & (swizzle_max_phase - 1);
+        return col ^ (phase * swizzle_vec);
+    }
+}
+
+template<int stride_tile, int swizzle_vec, int swizzle_per_phase, int swizzle_max_phase, typename TileT>
+static __device__ __forceinline__ void ggml_cuda_fattn_load_ldmatrix_swizzle(
+        TileT & t, const half2 * __restrict__ xs0, const int stride) {
+#if defined(AMD_WMMA_AVAILABLE)
+    constexpr int swizzle_span = swizzle_vec * swizzle_max_phase;
+    constexpr bool swizzle_enabled = (swizzle_vec != 0) && (swizzle_max_phase != 1) && ((stride_tile - 4) >= swizzle_span);
+    if constexpr (swizzle_enabled) {
+#pragma unroll
+        for (int l = 0; l < t.ne; ++l) {
+            const int row = t.get_i(l);
+            const int col = t.get_j(l);
+            const int col_sw = ggml_cuda_fattn_swizzle_col<swizzle_vec, swizzle_per_phase, swizzle_max_phase>(row, col);
+            t.x[l] = xs0[row*stride + col_sw];
+        }
+    } else {
+        load_ldmatrix(t, xs0, stride);
+    }
+#else
+    load_ldmatrix(t, xs0, stride);
+#endif // defined(AMD_WMMA_AVAILABLE)
+}
+
+template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check,
+         int swizzle_vec = 0, int swizzle_per_phase = 1, int swizzle_max_phase = 1>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV, const int i_sup) {
     // K/V data is loaded with decreasing granularity for D for better memory bandwidth.
     // The minimum granularity with cp.async is 16 bytes, with synchronous data loading it's 4 bytes.
+    constexpr int swizzle_span = swizzle_vec * swizzle_max_phase;
+    constexpr bool swizzle_enabled = (swizzle_vec != 0) && (swizzle_max_phase != 1) && ((stride_tile - 4) >= swizzle_span);
     if constexpr (use_cp_async) {
+        static_assert(!swizzle_enabled, "swizzled cp_async not supported");
         static_assert(!oob_check, "OOB check not compatible with cp_async");
         constexpr int preload = 64;
         constexpr int h2_per_chunk = 16/sizeof(half2);
@@ -307,8 +343,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 #pragma unroll
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == WARP_SIZE ? threadIdx.x : threadIdx.x % stride_k);
+                    const int k_dst = swizzle_enabled ?
+                        ggml_cuda_fattn_swizzle_col<swizzle_vec, swizzle_per_phase, swizzle_max_phase>(i, k) : k;
 
-                    tile_KV[i*stride_tile + k] = !oob_check || i < i_sup ? KV[i*stride_KV + k] : make_half2(0.0f, 0.0f);
+                    tile_KV[i*stride_tile + k_dst] = !oob_check || i < i_sup ? KV[i*stride_KV + k] : make_half2(0.0f, 0.0f);
                 }
             }
         };
@@ -445,6 +483,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     static_assert(!mla || nbatch_K2 >= nbatch_V2, "bad nbatch_K2, nbatch_V2 for MLA");
     constexpr int stride_tile_V = mla ? stride_tile_K : nbatch_V2 + 4;
 
+#if defined(AMD_WMMA_AVAILABLE)
+    // Shared swizzle params in half2 units matching Gluon's shared_k/shared_v layouts.
+    constexpr int k_swizzle_vec = 4;
+    constexpr int k_swizzle_per_phase = 1;
+    constexpr int k_swizzle_max_phase = 16;
+    constexpr int v_swizzle_vec = 1;
+    constexpr int v_swizzle_per_phase = 1;
+    constexpr int v_swizzle_max_phase = 1;
+#else
+    constexpr int k_swizzle_vec = 0;
+    constexpr int k_swizzle_per_phase = 1;
+    constexpr int k_swizzle_max_phase = 1;
+    constexpr int v_swizzle_vec = 0;
+    constexpr int v_swizzle_per_phase = 1;
+    constexpr int v_swizzle_max_phase = 1;
+#endif // defined(AMD_WMMA_AVAILABLE)
+
     const int k_VKQ_0 = kb0 * nbatch_fa;
 #if defined(AMD_WMMA_AVAILABLE)
     constexpr bool wmma_c_swapped = true;
@@ -466,7 +521,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();
-        flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
+        flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check,
+                                     v_swizzle_vec, v_swizzle_per_phase, v_swizzle_max_phase>
             (V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
     } else {
         constexpr bool use_cp_async = nstages == 1;
@@ -483,7 +539,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             constexpr bool use_cp_async = nstages == 1;
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check,
+                                         k_swizzle_vec, k_swizzle_per_phase, k_swizzle_max_phase>
                 (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
             if (use_cp_async) {
                 cp_async_wait_all();
@@ -499,7 +556,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
                 for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
                     T_A_KQ K_A;
-                    load_ldmatrix(K_A, tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
+                    ggml_cuda_fattn_load_ldmatrix_swizzle<stride_tile_K, k_swizzle_vec, k_swizzle_per_phase, k_swizzle_max_phase>(
+                        K_A, tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
                     if constexpr (cols_per_warp == 8) {
                         mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[k_KQ_0/T_A_KQ::J]);
                     } else {
@@ -525,7 +583,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int i_KQ_0 = i_KQ_00 + (threadIdx.y % np)*T_A_KQ::I;
 
                     T_A_KQ K_A;
-                    load_ldmatrix(K_A, tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
+                    ggml_cuda_fattn_load_ldmatrix_swizzle<stride_tile_K, k_swizzle_vec, k_swizzle_per_phase, k_swizzle_max_phase>(
+                        K_A, tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
 
                     // Wide version of KQ_C is column-major
 #if defined(AMD_WMMA_AVAILABLE)
@@ -795,7 +854,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                     (mask_h + k_VKQ_0 + nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
             }
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check,
+                                         k_swizzle_vec, k_swizzle_per_phase, k_swizzle_max_phase>
                 (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
         }
     }
@@ -819,7 +879,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             if (i0_start < reusable_cutoff) {
                 constexpr bool use_cp_async = nstages == 1;
-                flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
+                flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check,
+                                             v_swizzle_vec, v_swizzle_per_phase, v_swizzle_max_phase>
                     (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
                 if (use_cp_async) {
                     cp_async_wait_all();
@@ -845,7 +906,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 // TODO: Try to transpose tile_V when loading gmem to smem.
                 // Use mma to transpose T_A_VKQ for RDNA.
                 T_A_VKQ A_trans;
-                load_ldmatrix(A_trans, tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
+                ggml_cuda_fattn_load_ldmatrix_swizzle<stride_tile_V, v_swizzle_vec, v_swizzle_per_phase, v_swizzle_max_phase>(
+                    A_trans, tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
                 mma(A, A_trans, A_identity);
 #endif // defined(TURING_MMA_AVAILABLE)
                 if constexpr (T_B_KQ::I == 8) {
@@ -988,6 +1050,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int stride_tile_V = mla ? stride_tile_K : nbatch_V2 + 4;
     constexpr int stride_tile_KV_max = stride_tile_K > stride_tile_V ? stride_tile_K : stride_tile_V;
 
+#if defined(AMD_WMMA_AVAILABLE)
+    // Shared swizzle params in half2 units matching Gluon's shared_k/shared_v layouts.
+    constexpr int k_swizzle_vec = 4;
+    constexpr int k_swizzle_per_phase = 1;
+    constexpr int k_swizzle_max_phase = 16;
+    constexpr int v_swizzle_vec = 1;
+    constexpr int v_swizzle_per_phase = 1;
+    constexpr int v_swizzle_max_phase = 1;
+#else
+    constexpr int k_swizzle_vec = 0;
+    constexpr int k_swizzle_per_phase = 1;
+    constexpr int k_swizzle_max_phase = 1;
+    constexpr int v_swizzle_vec = 0;
+    constexpr int v_swizzle_per_phase = 1;
+    constexpr int v_swizzle_max_phase = 1;
+#endif // defined(AMD_WMMA_AVAILABLE)
+
     extern __shared__ half2 tile_Q[];
     half2 * tile_K    = Q_in_reg              ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
     half2 * tile_V    =           nstages > 1 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
@@ -1078,7 +1157,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (mask_h + kb0*nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
         }
-        flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+        flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check,
+                                     k_swizzle_vec, k_swizzle_per_phase, k_swizzle_max_phase>
             (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
     }
 
