@@ -228,7 +228,7 @@ def check_wmma_layout(name, layout, shape):
 def main():
     block_m = 64
     block_n = 32
-    block_d = 128
+    block_ds = [128]
 
     failures = 0
 
@@ -238,66 +238,70 @@ def main():
     blocked_v = gl.BlockedLayout([1, 4], [2, 16], [4, 1], [1, 0])
     blocked_m = gl.BlockedLayout([1], [32], [4], [0])
 
-    if check_blocked_layout(
-        "blocked_q", [block_m, block_d // 2], blocked_q, (1, 4, 2, 16, 4, 1, 1, 0)
-    ):
-        print("blocked_q: OK")
-    else:
-        failures += 1
-    if check_blocked_layout(
-        "blocked_k", [block_d // 2, block_n], blocked_k, (4, 1, 16, 2, 1, 4, 0, 1)
-    ):
-        print("blocked_k: OK")
-    else:
-        failures += 1
-    if check_blocked_layout(
-        "blocked_v", [block_n, block_d // 2], blocked_v, (1, 4, 2, 16, 4, 1, 1, 0)
-    ):
-        print("blocked_v: OK")
-    else:
-        failures += 1
-
-    lin_m = to_linear_layout(blocked_m, [block_m])
-    ll_m = make_linear_layout(lin_m)
-    reg_count = 1 << len(lin_m.reg_bases)
-    lane_count = 1 << len(lin_m.lane_bases)
-    warp_count = 1 << len(lin_m.warp_bases)
-    ok_m = True
-    for warp in range(warp_count):
-        for lane in range(lane_count):
-            coords_layout = set()
-            for reg in range(reg_count):
-                out = ll_m.apply({"register": reg, "lane": lane, "warp": warp, "block": 0})
-                if out["dim0"] < block_m:
-                    coords_layout.add(out["dim0"])
-            if not coords_layout:
-                ok_m = False
-                break
-        if not ok_m:
-            break
-    if ok_m:
-        print("blocked_m: OK")
-    else:
-        print("blocked_m: mismatch")
-        failures += 1
-
     # Swizzled shared layouts in half2 units.
     shared_q = gl.SwizzledSharedLayout(4, 1, 16, order=[1, 0])
     shared_k = gl.SwizzledSharedLayout(4, 1, 16, order=[0, 1])
     shared_v = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
 
-    if check_shared_swizzle("shared_q", [block_m, block_d // 2], shared_q, 4, 1, 16, [1, 0]):
-        print("shared_q: OK")
-    else:
-        failures += 1
-    if check_shared_swizzle("shared_k", [block_d // 2, block_n], shared_k, 4, 1, 16, [0, 1]):
-        print("shared_k: OK")
-    else:
-        failures += 1
-    if check_shared_swizzle("shared_v", [block_n, block_d // 2], shared_v, 1, 1, 1, [1, 0]):
-        print("shared_v: OK")
-    else:
-        failures += 1
+    for block_d in block_ds:
+        print(f"block_d={block_d}")
+
+        if check_blocked_layout(
+            "blocked_q", [block_m, block_d // 2], blocked_q, (1, 4, 2, 16, 4, 1, 1, 0)
+        ):
+            print("blocked_q: OK")
+        else:
+            failures += 1
+        if check_blocked_layout(
+            "blocked_k", [block_d // 2, block_n], blocked_k, (4, 1, 16, 2, 1, 4, 0, 1)
+        ):
+            print("blocked_k: OK")
+        else:
+            failures += 1
+        if check_blocked_layout(
+            "blocked_v", [block_n, block_d // 2], blocked_v, (1, 4, 2, 16, 4, 1, 1, 0)
+        ):
+            print("blocked_v: OK")
+        else:
+            failures += 1
+
+        lin_m = to_linear_layout(blocked_m, [block_m])
+        ll_m = make_linear_layout(lin_m)
+        reg_count = 1 << len(lin_m.reg_bases)
+        lane_count = 1 << len(lin_m.lane_bases)
+        warp_count = 1 << len(lin_m.warp_bases)
+        ok_m = True
+        for warp in range(warp_count):
+            for lane in range(lane_count):
+                coords_layout = set()
+                for reg in range(reg_count):
+                    out = ll_m.apply({"register": reg, "lane": lane, "warp": warp, "block": 0})
+                    if out["dim0"] < block_m:
+                        coords_layout.add(out["dim0"])
+                if not coords_layout:
+                    ok_m = False
+                    break
+            if not ok_m:
+                break
+        if ok_m:
+            print("blocked_m: OK")
+        else:
+            print("blocked_m: mismatch")
+            failures += 1
+
+        max_phase = block_d // 8
+        if check_shared_swizzle("shared_q", [block_m, block_d // 2], shared_q, 4, 1, max_phase, [1, 0]):
+            print("shared_q: OK")
+        else:
+            failures += 1
+        if check_shared_swizzle("shared_k", [block_d // 2, block_n], shared_k, 4, 1, max_phase, [0, 1]):
+            print("shared_k: OK")
+        else:
+            failures += 1
+        if check_shared_swizzle("shared_v", [block_n, block_d // 2], shared_v, 1, 1, 1, [1, 0]):
+            print("shared_v: OK")
+        else:
+            failures += 1
 
     # WMMA and dot layouts (scalar shapes).
     wmma_layout = gl.amd.AMDWMMALayout(version=2, transposed=True, warp_bases=[[1, 0], [2, 0]])
