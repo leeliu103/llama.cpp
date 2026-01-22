@@ -944,12 +944,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             for (int reg = 0; reg < T_B_VKQ::ne; ++reg) {
                 const int row0 = 2 * (T_B_VKQ::ne * col_group + reg);
                 const int row1 = row0 + 1;
-                const int row_group0 = row0 / 8;
-                const int row_group1 = row1 / 8;
                 const int row_in_group0 = row0 % 8;
                 const int row_in_group1 = row1 % 8;
-                const float v0 = __shfl_sync(0xFFFFFFFFu, KQ_C[k].x[row_in_group0], col_kq + 16*row_group0, WARP_SIZE);
-                const float v1 = __shfl_sync(0xFFFFFFFFu, KQ_C[k].x[row_in_group1], col_kq + 16*row_group1, WARP_SIZE);
+                float v0;
+                float v1;
+#if defined(RDNA4)
+                if constexpr (T_B_VKQ::ne == 4 && WARP_SIZE == 32) {
+                    // For RDNA4 dot-0 tiles, the source lane matches the current lane.
+                    v0 = KQ_C[k].x[row_in_group0];
+                    v1 = KQ_C[k].x[row_in_group1];
+                } else
+#endif
+                {
+                    const int row_group0 = row0 / 8;
+                    const int row_group1 = row1 / 8;
+                    v0 = __shfl_sync(0xFFFFFFFFu, KQ_C[k].x[row_in_group0], col_kq + 16*row_group0, WARP_SIZE);
+                    v1 = __shfl_sync(0xFFFFFFFFu, KQ_C[k].x[row_in_group1], col_kq + 16*row_group1, WARP_SIZE);
+                }
                 B_k.x[reg] = make_half2(v0, v1);
             }
             B[k] = B_k;
