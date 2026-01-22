@@ -446,6 +446,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_V = mla ? stride_tile_K : nbatch_V2 + 4;
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
+#if defined(AMD_WMMA_AVAILABLE)
+    constexpr bool wmma_c_swapped = true;
+#else
+    constexpr bool wmma_c_swapped = false;
+#endif // defined(AMD_WMMA_AVAILABLE)
 #if defined(TURING_MMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
 #elif defined(AMD_WMMA_AVAILABLE)
@@ -565,8 +570,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
-                    const int i = i0 + T_C_KQ::get_i(l);
-                    const int j = ((threadIdx.y / np)*T_C_KQ::J + T_C_KQ::get_j(l)) / ncols2;
+                    const int row = wmma_c_swapped ? T_C_KQ::get_j(l) : T_C_KQ::get_i(l);
+                    const int col = wmma_c_swapped ? T_C_KQ::get_i(l) : T_C_KQ::get_j(l);
+                    const int i = i0 + row;
+                    const int j = ((threadIdx.y / np)*T_C_KQ::J + col) / ncols2;
 
                     KQ_C[i00/(np*T_C_KQ::I)].x[l] += slope * __half2float(tile_mask[j*(nbatch_fa + 8) + i]);
                 }
@@ -580,7 +587,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
 #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
+                const int row = wmma_c_swapped ? T_C_KQ::get_j(l) : T_C_KQ::get_i(l);
+                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::I + row < k_VKQ_sup) {
 #if defined(AMD_WMMA_AVAILABLE)
                     constexpr int KQ_idx = 0;
 #else
@@ -606,7 +614,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
 #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
+                const int row = wmma_c_swapped ? T_C_KQ::get_j(l) : T_C_KQ::get_i(l);
+                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::I + row < k_VKQ_sup) {
 #if defined(AMD_WMMA_AVAILABLE)
                     constexpr int KQ_idx = 0;
 #else
@@ -627,8 +636,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
 #pragma unroll
                 for (int l0 = 0; l0 < T_C_KQ::ne; l0 += 2) {
-                    const int i = (i0 + T_C_KQ::get_j(l0)) / 2;
-                    const int j = ((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l0)) / ncols2;
+                    const int row = wmma_c_swapped ? T_C_KQ::get_j(l0) : T_C_KQ::get_i(l0);
+                    const int col = wmma_c_swapped ? T_C_KQ::get_i(l0) : T_C_KQ::get_j(l0);
+                    const int i = (i0 + row) / 2;
+                    const int j = ((threadIdx.y / np)*cols_per_warp + col) / ncols2;
 
                     const float2 tmp = __half22float2(((const half2 *)tile_mask)[j*(nbatch_fa/2 + 4) + i]);
                     KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 0] += slope*tmp.x;
@@ -644,7 +655,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
 #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::J + T_C_KQ::get_j(l) < k_VKQ_sup) {
+                const int row = wmma_c_swapped ? T_C_KQ::get_j(l) : T_C_KQ::get_i(l);
+                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::J + row < k_VKQ_sup) {
 #if defined(AMD_WMMA_AVAILABLE)
                     constexpr int KQ_idx = 0;
 #else
@@ -682,7 +694,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
 #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::J + T_C_KQ::get_j(l) < k_VKQ_sup) {
+                const int row = wmma_c_swapped ? T_C_KQ::get_j(l) : T_C_KQ::get_i(l);
+                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::J + row < k_VKQ_sup) {
 #if defined(AMD_WMMA_AVAILABLE)
                     constexpr int KQ_idx = 0;
 #else
