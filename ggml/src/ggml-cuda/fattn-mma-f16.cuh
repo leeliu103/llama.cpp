@@ -500,8 +500,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     } else {
                         // Wide version of KQ_C is column-major
 #if defined(AMD_WMMA_AVAILABLE)
-                        // RDNA matrix C is column-major.
-                        mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[k_KQ_0/T_A_KQ::J]);
+                        // RDNA4 transposed WMMA swaps A/B; keep dot layouts aligned to Gluon.
+                        mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[k_KQ_0/T_A_KQ::J], K_A);
 #else
                         // swap A and B for CUDA.
                         mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[k_KQ_0/T_A_KQ::J], K_A);
@@ -526,8 +526,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     } else {
                         // Wide version of KQ_C is column-major
 #if defined(AMD_WMMA_AVAILABLE)
-                        // RDNA matrix C is column-major.
-                        mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[0]);
+                        // RDNA4 transposed WMMA swaps A/B; keep dot layouts aligned to Gluon.
+                        mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
 #else
                         // swap A and B for CUDA.
                         mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
@@ -844,8 +844,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 } else {
                     // Wide version of VKQ_C is column-major.
 #if defined(AMD_WMMA_AVAILABLE)
-                    // RDNA matrix C is column-major.
-                    mma(VKQ_C[i_VKQ_0/i0_stride], A, B[k00/(np*T_A_VKQ::J)]);
+                    // RDNA4 transposed WMMA swaps A/B; keep dot layouts aligned to Gluon.
+                    mma(VKQ_C[i_VKQ_0/i0_stride], B[k00/(np*T_A_VKQ::J)], A);
 #else
                     // swap A and B for CUDA.
                     mma(VKQ_C[i_VKQ_0/i0_stride], B[k00/(np*T_A_VKQ::J)], A);
@@ -903,12 +903,12 @@ template<> struct mma_tile_sizes<8> {
 };
 #elif defined(AMD_WMMA_AVAILABLE)
 template<int ncols> struct mma_tile_sizes {
-    using T_A_KQ  = tile<16,  8, half2>; // row-major
-    using T_B_KQ  = tile<16,  8, half2>; // column-major
-    using T_C_KQ  = tile<16, 16, float>; // column-major
-    using T_A_VKQ = tile<16,  8, half2>; // row-major
-    using T_B_VKQ = tile<16,  8, half2>; // column-major
-    using T_C_VKQ = tile<16,  8, half2>; // column-major
+    using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_J_MAJOR>; // dot-1 (K)
+    using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>; // dot-0 (Q)
+    using T_C_KQ  = tile<16, 16, float>;                      // column-major
+    using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_J_MAJOR>; // dot-1 (V)
+    using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>; // dot-0 (P)
+    using T_C_VKQ = tile<16,  8, half2>;                      // column-major
 };
 #else // Volta
 template<int ncols> struct mma_tile_sizes {

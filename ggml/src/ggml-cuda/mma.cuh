@@ -660,13 +660,23 @@ namespace ggml_cuda_mma {
     }
 #endif // defined(TURING_MMA_AVAILABLE)
 
-    static __device__ __forceinline__ void make_identity_mat(tile<16, 8, half2> & t) {
+    template <data_layout dl>
+    static __device__ __forceinline__ void make_identity_mat(tile<16, 8, half2, dl> & t) {
 #if defined(RDNA4)
-        const int row = t.get_i(0);
-        const int left_right = t.get_j(0) / 4;
-        const int up_down = row / 8;
-        const int idx = row % 8;
-        reinterpret_cast<half*>(t.x)[idx] = left_right == up_down ? 1.0f : 0.0f;
+        constexpr bool i_major = is_i_major(dl);
+#pragma unroll
+        for (int l = 0; l < t.ne; ++l) {
+            const int row = i_major ? t.get_i(l) : t.get_j(l);
+            const int col_pair = i_major ? t.get_j(l) : t.get_i(l);
+            const int col0 = 2 * col_pair;
+            if (row == col0) {
+                t.x[l] = make_half2(1.0f, 0.0f);
+            } else if (row == col0 + 1) {
+                t.x[l] = make_half2(0.0f, 1.0f);
+            } else {
+                t.x[l] = make_half2(0.0f, 0.0f);
+            }
+        }
 #else
         GGML_UNUSED_VARS(t);
         NO_DEVICE_CODE;
@@ -884,8 +894,9 @@ namespace ggml_cuda_mma {
 #endif // TURING_MMA_AVAILABLE
     }
 
+    template <data_layout dl_d, data_layout dl_a, data_layout dl_b>
     static __device__ __forceinline__ void mma(
-            tile<16, 8, half2> & D, const tile<16, 8, half2> & A, const tile<16, 8, half2> & B) {
+            tile<16, 8, half2, dl_d> & D, const tile<16, 8, half2, dl_a> & A, const tile<16, 8, half2, dl_b> & B) {
 #ifdef TURING_MMA_AVAILABLE
         const int * Axi = (const int *) A.x;
         const int * Bxi = (const int *) B.x;
@@ -1006,9 +1017,9 @@ namespace ggml_cuda_mma {
 #endif // AMPERE_MMA_AVAILABLE
     }
 
-    template <data_layout dl_ab, data_layout dl_d>
+    template <data_layout dl_a, data_layout dl_b, data_layout dl_d>
     static __device__ __forceinline__ void mma(
-            tile<16, 16, float, dl_d> & D, const tile<16, 8, half2, dl_ab> & A, const tile<16, 8, half2, dl_ab> & B) {
+            tile<16, 16, float, dl_d> & D, const tile<16, 8, half2, dl_a> & A, const tile<16, 8, half2, dl_b> & B) {
 #ifdef TURING_MMA_AVAILABLE
         const int * Axi = (const int *) A.x;
         const int * Bxi = (const int *) B.x;
