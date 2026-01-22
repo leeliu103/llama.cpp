@@ -278,6 +278,16 @@ static __device__ __forceinline__ void ggml_cuda_fattn_load_ldmatrix_swizzle(
 #if defined(AMD_WMMA_AVAILABLE)
     constexpr int swizzle_span = swizzle_vec * swizzle_max_phase;
     constexpr bool swizzle_enabled = (swizzle_vec != 0) && (swizzle_max_phase != 1) && (stride_tile >= swizzle_span);
+    if constexpr (!pack_rows && swap_ij && TileT::I == 16 && TileT::J == 8 &&
+                  sizeof(t.x) <= ggml_cuda_get_max_cpy_bytes() && (swizzle_vec % 4 == 0) && (stride_tile % 4 == 0)) {
+        // After swap_ij, rows are contiguous per lane; XOR swizzle keeps 4-wide blocks contiguous.
+        const int row = TileT::get_j(0);
+        const int col_base = TileT::get_i(0) + col_offset;
+        const int col_sw = swizzle_enabled ?
+            ggml_cuda_fattn_swizzle_col<swizzle_vec, swizzle_per_phase, swizzle_max_phase>(row, col_base) : col_base;
+        ggml_cuda_memcpy_1<sizeof(t.x)>(t.x, xs0 + row*stride + col_sw);
+        return;
+    }
     if constexpr (pack_rows) {
 #pragma unroll
         for (int l = 0; l < t.ne; ++l) {
