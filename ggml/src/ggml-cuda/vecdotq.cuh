@@ -28,6 +28,65 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
+#if defined(GGML_USE_HIP)
+static __device__ __forceinline__ uint8_t ggml_cuda_ld_nc_u8(const void * ptr) {
+#if __has_builtin(__builtin_nontemporal_load)
+    return __builtin_nontemporal_load((const uint8_t *) ptr);
+#else
+    return *(const uint8_t *) ptr;
+#endif
+}
+
+static __device__ __forceinline__ uint16_t ggml_cuda_ld_nc_u16(const void * ptr) {
+#if __has_builtin(__builtin_nontemporal_load)
+    return __builtin_nontemporal_load((const uint16_t *) ptr);
+#else
+    return *(const uint16_t *) ptr;
+#endif
+}
+
+static __device__ __forceinline__ uint32_t ggml_cuda_ld_nc_u32(const void * ptr) {
+#if __has_builtin(__builtin_nontemporal_load)
+    return __builtin_nontemporal_load((const uint32_t *) ptr);
+#else
+    return *(const uint32_t *) ptr;
+#endif
+}
+
+static __device__ __forceinline__ ggml_half ggml_cuda_half_from_bits(const uint16_t v) {
+    ggml_half h;
+    reinterpret_cast<uint16_t &>(h) = v;
+    return h;
+}
+
+static __device__ __forceinline__ ggml_half ggml_cuda_ld_nc_f16(const void * ptr) {
+    return ggml_cuda_half_from_bits(ggml_cuda_ld_nc_u16(ptr));
+}
+
+static __device__ __forceinline__ int get_int_b1_nt(const void * x, const int & i32) {
+    const uint8_t * x8 = (const uint8_t *) x;
+
+    int x32  = ggml_cuda_ld_nc_u8(x8 + 4*i32 + 0) <<  0;
+    x32     |= ggml_cuda_ld_nc_u8(x8 + 4*i32 + 1) <<  8;
+    x32     |= ggml_cuda_ld_nc_u8(x8 + 4*i32 + 2) << 16;
+    x32     |= ggml_cuda_ld_nc_u8(x8 + 4*i32 + 3) << 24;
+
+    return x32;
+}
+
+static __device__ __forceinline__ int get_int_b2_nt(const void * x, const int & i32) {
+    const uint8_t * x8 = (const uint8_t *) x;
+
+    const uint16_t lo = ggml_cuda_ld_nc_u16(x8 + 4*i32 + 0);
+    const uint16_t hi = ggml_cuda_ld_nc_u16(x8 + 4*i32 + 2);
+    return (int) ((uint32_t) lo | ((uint32_t) hi << 16));
+}
+
+static __device__ __forceinline__ int get_int_b4_nt(const void * x, const int & i32) {
+    return (int) ggml_cuda_ld_nc_u32((const uint8_t *) x + 4*i32);
+}
+#endif // GGML_USE_HIP
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
@@ -312,6 +371,30 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
     return d * sumi;
 }
+
+#if defined(GGML_USE_HIP)
+static __device__ __forceinline__ float vec_dot_mxfp4_q8_1_nt(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp4 * bq4 = (const block_mxfp4 *) vbq + kbx;
+
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumi = 0;
+    const uint8_t e = ggml_cuda_ld_nc_u8(&bq4->e);
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = get_int_b1_nt(bq4->qs, iqs + l);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+
+    const float d = ggml_cuda_e8m0_to_fp32(e) * 0.5f * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+#endif // GGML_USE_HIP
 
 #define VDR_Q2_K_Q8_1_MMVQ 1
 #define VDR_Q2_K_Q8_1_MMQ  4
@@ -721,6 +804,26 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
 
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
 }
+
+#if defined(GGML_USE_HIP)
+static __device__ __forceinline__ float vec_dot_q8_0_q8_1_nt(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
+
+    int v[VDR_Q8_0_Q8_1_MMVQ];
+    int u[VDR_Q8_0_Q8_1_MMVQ];
+
+#pragma unroll
+    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+        v[i] = get_int_b2_nt(bq8_0->qs, iqs + i);
+        u[i] = get_int_b4(bq8_1->qs, iqs + i);
+    }
+
+    const float d = __half2float(ggml_cuda_ld_nc_f16(&bq8_0->d));
+    return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, d, __low2half(bq8_1->ds));
+}
+#endif // GGML_USE_HIP
 
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
