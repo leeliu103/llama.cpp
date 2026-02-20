@@ -223,23 +223,111 @@ static __global__ void mul_mat_vec_q(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    if constexpr (type == GGML_TYPE_MXFP4 && ncols_dst == 1 && nwarps == 1 && rows_per_cuda_block == 1) {
+        // Special LDS preload path for the fixed 2880 case, single-warp block and single output column.
+        // A (MXFP4): 90 blocks * 17 bytes = 1530 bytes -> round to 1536 (96 * 16B).
+        // B (Q8_1): ne10_padded = 3072 elems -> 96 blocks -> 96 * 36 = 3456 bytes (216 * 16B).
+        assert(ncols_x == 2880);
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+            __shared__ __align__(16) uint8_t sh_a[96 * 16];
+            __shared__ __align__(16) uint8_t sh_b[96 * sizeof(block_q8_1)];
+            __shared__ __align__(16) uint8_t sh_gate[96 * 16];
 
-        // x block quant index when casting the quants to int
-        const int kqs = vdr * (tid % (qi/vdr));
+            const int lane = threadIdx.x;
+
+            const uint8_t * a_g = (const uint8_t *) vx + (size_t) kbx_offset * sizeof(block_mxfp4);
+            const uint8_t * b_g = (const uint8_t *) y;
+            const uint8_t * g_g = use_gate ? ((const uint8_t *) vgate + (size_t) kbx_offset * sizeof(block_mxfp4)) : nullptr;
+
+            // A preload: 96 chunks -> exactly 3 loads per lane, no divergence.
+#pragma unroll
+            for (int c = lane; c < 96; c += warp_size) {
+                reinterpret_cast<int4 *>(sh_a)[c] = reinterpret_cast<const int4 *>(a_g)[c];
+            }
+
+            // Gate preload: same layout/size as A. Only if gate is active.
+            if (use_gate) {
+#pragma unroll
+                for (int c = lane; c < 96; c += warp_size) {
+                    reinterpret_cast<int4 *>(sh_gate)[c] = reinterpret_cast<const int4 *>(g_g)[c];
+                }
+            }
+
+            // B preload: 216 chunks -> 6 loads per lane + 24 lanes do 1 extra.
+#pragma unroll
+            for (int c = lane; c < 216; c += warp_size) {
+                reinterpret_cast<int4 *>(sh_b)[c] = reinterpret_cast<const int4 *>(b_g)[c];
+            }
+
+            __syncthreads();
+
+            const block_mxfp4 * a_lds = (const block_mxfp4 *) sh_a;
+            const block_q8_1 * b_lds = (const block_q8_1 *) sh_b;
+            const block_mxfp4 * g_lds = use_gate ? (const block_mxfp4 *) sh_gate : nullptr;
+
+            for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+                const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+                const int kqs = vdr * (tid % (qi/vdr));
 
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+                for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        const block_mxfp4 * bq4 = a_lds + i*stride_row_x + kbx;
+                        const block_q8_1 * bq8 = b_lds + j*stride_col_y + kby;
+                        const int * q8 = (const int *) bq8->qs + kqs;
+
+                        int sumi = 0;
+#pragma unroll
+                        for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+                            const int aux_q4 = get_int_b1(bq4->qs, kqs + l);
+                            const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+
+                            sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+                            sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+                        }
+
+                        const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8->ds);
+                        tmp[j][i] += d * sumi;
+
+                        if constexpr (has_fusion) {
+                            if (use_gate) {
+                                const block_mxfp4 * gq4 = g_lds + i*stride_row_x + kbx;
+                                int sumi_g = 0;
+#pragma unroll
+                                for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+                                    const int aux_q4 = get_int_b1(gq4->qs, kqs + l);
+                                    const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+
+                                    sumi_g = ggml_cuda_dp4a(v.x, q8[l + 0], sumi_g);
+                                    sumi_g = ggml_cuda_dp4a(v.y, q8[l + 4], sumi_g);
+                                }
+
+                                const float dg = ggml_cuda_e8m0_to_fp32(gq4->e) * 0.5f * __low2float(bq8->ds);
+                                tmp_gate[j][i] += dg * sumi_g;
+                            }
+                        }
+                    }
+                }
+            }
+    } else {
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+
+            // x block quant index when casting the quants to int
+            const int kqs = vdr * (tid % (qi/vdr));
+
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
