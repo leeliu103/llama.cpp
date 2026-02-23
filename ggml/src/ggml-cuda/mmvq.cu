@@ -229,87 +229,119 @@ static __global__ void mul_mat_vec_q(
         // B (Q8_1): ne10_padded = 3072 elems -> 96 blocks -> 96 * 36 = 3456 bytes (216 * 16B).
         assert(ncols_x == 2880);
 
-            __shared__ __align__(16) uint8_t sh_a[96 * 16];
-            __shared__ __align__(16) uint8_t sh_b[96 * sizeof(block_q8_1)];
-            __shared__ __align__(16) uint8_t sh_gate[96 * 16];
+        __shared__ __align__(16) uint8_t sh_a[96 * 16];
+        __shared__ __align__(16) uint8_t sh_b[96 * sizeof(block_q8_1)];
+        __shared__ __align__(16) uint8_t sh_gate[96 * 16];
 
-            const int lane = threadIdx.x;
+        const int lane = threadIdx.x;
 
-            const uint8_t * a_g = (const uint8_t *) vx + (size_t) kbx_offset * sizeof(block_mxfp4);
-            const uint8_t * b_g = (const uint8_t *) y;
-            const uint8_t * g_g = use_gate ? ((const uint8_t *) vgate + (size_t) kbx_offset * sizeof(block_mxfp4)) : nullptr;
+        const uint8_t * a_g = (const uint8_t *) vx + (size_t) kbx_offset * sizeof(block_mxfp4);
+        const uint8_t * b_g = (const uint8_t *) y;
+        const uint8_t * g_g = use_gate ? ((const uint8_t *) vgate + (size_t) kbx_offset * sizeof(block_mxfp4)) : nullptr;
 
-            // A preload: 96 chunks -> exactly 3 loads per lane, no divergence.
+        // Register-staged preload: issue all global loads first, then LDS stores.
+        using v4i = int __attribute__((ext_vector_type(4), aligned(1)));
+        const v4i * a4 = reinterpret_cast<const v4i *>(a_g);
+        const v4i * b4 = reinterpret_cast<const v4i *>(b_g);
+        const v4i * g4 = reinterpret_cast<const v4i *>(g_g);
+
+        const v4i a0 = a4[lane + warp_size*0];
+        const v4i a1 = a4[lane + warp_size*1];
+        const v4i a2 = a4[lane + warp_size*2];
+
+        v4i g0, g1, g2;
+        if (use_gate) {
+            g0 = g4[lane + warp_size*0];
+            g1 = g4[lane + warp_size*1];
+            g2 = g4[lane + warp_size*2];
+        }
+
+        const v4i b0  = b4[lane + warp_size*0];
+        const v4i b1  = b4[lane + warp_size*1];
+        const v4i b2  = b4[lane + warp_size*2];
+        const v4i b3  = b4[lane + warp_size*3];
+        const v4i b4v = b4[lane + warp_size*4];
+        const v4i b5  = b4[lane + warp_size*5];
+        v4i b6;
+        if (lane < 24) {
+            b6 = b4[lane + warp_size*6];
+        }
+
+        // Block VMEM reads from moving across; allow other instruction classes to pass.
+        // Mask = 0x7C6 (VALU|SALU|MMA|VMEM_WRITE|ALL_DS|DS_READ|DS_WRITE|TRANS).
+        //__builtin_amdgcn_sched_barrier(0x7C6);
+
+        reinterpret_cast<v4i *>(sh_a)[lane + warp_size*0] = a0;
+        reinterpret_cast<v4i *>(sh_a)[lane + warp_size*1] = a1;
+        reinterpret_cast<v4i *>(sh_a)[lane + warp_size*2] = a2;
+
+        if (use_gate) {
+            reinterpret_cast<v4i *>(sh_gate)[lane + warp_size*0] = g0;
+            reinterpret_cast<v4i *>(sh_gate)[lane + warp_size*1] = g1;
+            reinterpret_cast<v4i *>(sh_gate)[lane + warp_size*2] = g2;
+        }
+
+        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*0] = b0;
+        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*1] = b1;
+        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*2] = b2;
+        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*3] = b3;
+        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*4] = b4v;
+        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*5] = b5;
+        if (lane < 24) {
+            reinterpret_cast<v4i *>(sh_b)[lane + warp_size*6] = b6;
+        }
+
+        __syncthreads();
+
+        const block_mxfp4 * a_lds = (const block_mxfp4 *) sh_a;
+        const block_q8_1 * b_lds = (const block_q8_1 *) sh_b;
+        const block_mxfp4 * g_lds = use_gate ? (const block_mxfp4 *) sh_gate : nullptr;
+
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+            const int kqs = vdr * (tid % (qi/vdr));
+
 #pragma unroll
-            for (int c = lane; c < 96; c += warp_size) {
-                reinterpret_cast<int4 *>(sh_a)[c] = reinterpret_cast<const int4 *>(a_g)[c];
-            }
-
-            // Gate preload: same layout/size as A. Only if gate is active.
-            if (use_gate) {
+            for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-                for (int c = lane; c < 96; c += warp_size) {
-                    reinterpret_cast<int4 *>(sh_gate)[c] = reinterpret_cast<const int4 *>(g_g)[c];
-                }
-            }
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    const block_mxfp4 * bq4 = a_lds + i*stride_row_x + kbx;
+                    const block_q8_1 * bq8 = b_lds + j*stride_col_y + kby;
+                    const int * q8 = (const int *) bq8->qs + kqs;
 
-            // B preload: 216 chunks -> 6 loads per lane + 24 lanes do 1 extra.
+                    int sumi = 0;
 #pragma unroll
-            for (int c = lane; c < 216; c += warp_size) {
-                reinterpret_cast<int4 *>(sh_b)[c] = reinterpret_cast<const int4 *>(b_g)[c];
-            }
+                    for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+                        const int aux_q4 = get_int_b1(bq4->qs, kqs + l);
+                        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
 
-            __syncthreads();
+                        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+                        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+                    }
 
-            const block_mxfp4 * a_lds = (const block_mxfp4 *) sh_a;
-            const block_q8_1 * b_lds = (const block_q8_1 *) sh_b;
-            const block_mxfp4 * g_lds = use_gate ? (const block_mxfp4 *) sh_gate : nullptr;
+                    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8->ds);
+                    tmp[j][i] += d * sumi;
 
-            for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-                const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
-                const int kqs = vdr * (tid % (qi/vdr));
-
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            const block_mxfp4 * gq4 = g_lds + i*stride_row_x + kbx;
+                            int sumi_g = 0;
 #pragma unroll
-                for (int j = 0; j < ncols_dst; ++j) {
-#pragma unroll
-                    for (int i = 0; i < rows_per_cuda_block; ++i) {
-                        const block_mxfp4 * bq4 = a_lds + i*stride_row_x + kbx;
-                        const block_q8_1 * bq8 = b_lds + j*stride_col_y + kby;
-                        const int * q8 = (const int *) bq8->qs + kqs;
+                            for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+                                const int aux_q4 = get_int_b1(gq4->qs, kqs + l);
+                                const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
 
-                        int sumi = 0;
-#pragma unroll
-                        for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
-                            const int aux_q4 = get_int_b1(bq4->qs, kqs + l);
-                            const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
-
-                            sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
-                            sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
-                        }
-
-                        const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8->ds);
-                        tmp[j][i] += d * sumi;
-
-                        if constexpr (has_fusion) {
-                            if (use_gate) {
-                                const block_mxfp4 * gq4 = g_lds + i*stride_row_x + kbx;
-                                int sumi_g = 0;
-#pragma unroll
-                                for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
-                                    const int aux_q4 = get_int_b1(gq4->qs, kqs + l);
-                                    const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
-
-                                    sumi_g = ggml_cuda_dp4a(v.x, q8[l + 0], sumi_g);
-                                    sumi_g = ggml_cuda_dp4a(v.y, q8[l + 4], sumi_g);
-                                }
-
-                                const float dg = ggml_cuda_e8m0_to_fp32(gq4->e) * 0.5f * __low2float(bq8->ds);
-                                tmp_gate[j][i] += dg * sumi_g;
+                                sumi_g = ggml_cuda_dp4a(v.x, q8[l + 0], sumi_g);
+                                sumi_g = ggml_cuda_dp4a(v.y, q8[l + 4], sumi_g);
                             }
+
+                            const float dg = ggml_cuda_e8m0_to_fp32(gq4->e) * 0.5f * __low2float(bq8->ds);
+                            tmp_gate[j][i] += dg * sumi_g;
                         }
                     }
                 }
             }
+        }
     } else {
         for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
             const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
