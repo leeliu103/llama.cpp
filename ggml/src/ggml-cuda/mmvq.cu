@@ -305,38 +305,15 @@ static __global__ void mul_mat_vec_q(
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    const block_mxfp4 * bq4 = a_lds + i*stride_row_x + kbx;
+                    const block_mxfp4 * a_row = a_lds + i*stride_row_x;
                     const block_q8_1 * bq8 = b_lds + j*stride_col_y + kby;
-                    const int * q8 = (const int *) bq8->qs + kqs;
 
-                    int sumi = 0;
-#pragma unroll
-                    for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
-                        const int aux_q4 = get_int_b1(bq4->qs, kqs + l);
-                        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
-
-                        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
-                        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
-                    }
-
-                    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8->ds);
-                    tmp[j][i] += d * sumi;
+                    tmp[j][i] += vec_dot_q_cuda(a_row, bq8, kbx, kqs);
 
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            const block_mxfp4 * gq4 = g_lds + i*stride_row_x + kbx;
-                            int sumi_g = 0;
-#pragma unroll
-                            for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
-                                const int aux_q4 = get_int_b1(gq4->qs, kqs + l);
-                                const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
-
-                                sumi_g = ggml_cuda_dp4a(v.x, q8[l + 0], sumi_g);
-                                sumi_g = ggml_cuda_dp4a(v.y, q8[l + 4], sumi_g);
-                            }
-
-                            const float dg = ggml_cuda_e8m0_to_fp32(gq4->e) * 0.5f * __low2float(bq8->ds);
-                            tmp_gate[j][i] += dg * sumi_g;
+                            const block_mxfp4 * g_row = g_lds + i*stride_row_x;
+                            tmp_gate[j][i] += vec_dot_q_cuda(g_row, bq8, kbx, kqs);
                         }
                     }
                 }
