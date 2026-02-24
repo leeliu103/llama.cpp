@@ -57,6 +57,28 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
+static __device__ __forceinline__ float vec_dot_mxfp4_q8_1_lds(
+    const int * __restrict__ qs_lds, const uint32_t * __restrict__ e_lds,
+    const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    constexpr int qs_stride = QK_MXFP4 / 8; // 4 int32 per block
+    const int * q4 = qs_lds + kbx * qs_stride;
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = q4[iqs + l];
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+
+    const float d = ggml_cuda_e8m0_to_fp32((uint8_t) e_lds[kbx]) * 0.5f * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
     MMVQ_PARAMETERS_GCN,
@@ -225,13 +247,31 @@ static __global__ void mul_mat_vec_q(
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
     if constexpr (type == GGML_TYPE_MXFP4 && ncols_dst == 1 && nwarps == 1 && rows_per_cuda_block == 1) {
         // Special LDS preload path for the fixed 2880 case, single-warp block and single output column.
-        // A (MXFP4): 90 blocks * 17 bytes = 1530 bytes -> round to 1536 (96 * 16B).
+        // A (MXFP4): 90 blocks * 17 bytes = 1530 bytes.
         // B (Q8_1): ne10_padded = 3072 elems -> 96 blocks -> 96 * 36 = 3456 bytes (216 * 16B).
+        //
+        // Cache-line aligned preload:
+        //   The global address a_g = vx + kbx_offset * 17 is generally NOT aligned to
+        //   128-byte cache lines (1530 mod 128 = 122). Misaligned v4i loads cause each
+        //   512B wavefront chunk to span 5 cache lines instead of 4 (~20% overhead).
+        //   Fix: align the load base address DOWN to a 128-byte boundary. Load up to
+        //   127 extra prefix bytes into LDS raw buffer, then repack with adjusted offset.
+        //   Max load = 1530 + 127 = 1657 bytes = ceil(1657/16) = 104 v4i words.
+        //   With 32 threads: 4 iterations (vs 3 before), but perfect cache line alignment.
         assert(ncols_x == 2880);
 
-        __shared__ __align__(16) uint8_t sh_a[96 * 16];
-        __shared__ __align__(16) uint8_t sh_b[96 * sizeof(block_q8_1)];
-        __shared__ __align__(16) uint8_t sh_gate[96 * 16];
+        constexpr int mxfp4_blocks = 2880 / QK_MXFP4; // 90
+        constexpr int qs_per_block = QK_MXFP4 / 8;     // 4 int32 per block
+        constexpr int raw_aligned_words = 128;          // 128 v4i = 2048 bytes max (>= 1530+127)
+
+        // Raw buffer for cache-line-aligned VMEM preload (reused for A then gate)
+        __shared__ __align__(16) uint8_t  sh_raw[raw_aligned_words * 16];           // 2048 bytes
+        // Restructured LDS layout: aligned qs + separate exponents
+        __shared__ __align__(16) int      sh_a_qs[mxfp4_blocks * qs_per_block];    // 1440 bytes
+        __shared__ __align__(4)  uint32_t sh_a_e[mxfp4_blocks];                    // 360 bytes
+        __shared__ __align__(16) uint8_t  sh_b[96 * sizeof(block_q8_1)];           // 3456 bytes
+        __shared__ __align__(16) int      sh_gate_qs[mxfp4_blocks * qs_per_block]; // 1440 bytes
+        __shared__ __align__(4)  uint32_t sh_gate_e[mxfp4_blocks];                 // 360 bytes
 
         const int lane = threadIdx.x;
 
@@ -239,63 +279,103 @@ static __global__ void mul_mat_vec_q(
         const uint8_t * b_g = (const uint8_t *) y;
         const uint8_t * g_g = use_gate ? ((const uint8_t *) vgate + (size_t) kbx_offset * sizeof(block_mxfp4)) : nullptr;
 
-        // Register-staged preload: issue all global loads first, then LDS stores.
         using v4i = int __attribute__((ext_vector_type(4), aligned(1)));
-        const v4i * a4 = reinterpret_cast<const v4i *>(a_g);
-        const v4i * b4 = reinterpret_cast<const v4i *>(b_g);
-        const v4i * g4 = reinterpret_cast<const v4i *>(g_g);
 
-        const v4i a0 = a4[lane + warp_size*0];
-        const v4i a1 = a4[lane + warp_size*1];
-        const v4i a2 = a4[lane + warp_size*2];
+        // Helper: cache-line-aligned coalesced load from global into sh_raw, then repack.
+        // Aligns the load base address down to a 128-byte cache line boundary to ensure
+        // each wavefront v4i instruction hits exactly 4 cache lines (not 5).
+        // Single warp: no __syncthreads needed between LDS write and LDS read.
+        //
+        // Always loads 4 v4i words per thread (128 × 16B = 2048 bytes) from the aligned
+        // base. This covers the worst case: 127 prefix + 1530 data = 1657 bytes.
+        // The extra ~400 bytes loaded beyond the end of data are harmless reads into
+        // subsequent tensor rows (or padding).
+        auto load_and_repack_mxfp4 = [&](const uint8_t * src_g, int * dst_qs, uint32_t * dst_e) __device__ {
+            // Align base address down to 128-byte cache line boundary
+            const uintptr_t src_addr = reinterpret_cast<uintptr_t>(src_g);
+            const uintptr_t aligned_addr = src_addr & ~uintptr_t(127);
+            const int prefix_bytes = (int)(src_addr - aligned_addr); // 0..127
 
-        v4i g0, g1, g2;
+            // Phase 1: Coalesced 16-byte global loads from cache-line-aligned address → raw LDS
+            // Fixed 4 iterations → compiler can fully unroll
+            const v4i * src4 = reinterpret_cast<const v4i *>(aligned_addr);
+            const v4i r0 = src4[lane + warp_size*0];
+            const v4i r1 = src4[lane + warp_size*1];
+            const v4i r2 = src4[lane + warp_size*2];
+            const v4i r3 = src4[lane + warp_size*3];
+
+            reinterpret_cast<v4i *>(sh_raw)[lane + warp_size*0] = r0;
+            reinterpret_cast<v4i *>(sh_raw)[lane + warp_size*1] = r1;
+            reinterpret_cast<v4i *>(sh_raw)[lane + warp_size*2] = r2;
+            reinterpret_cast<v4i *>(sh_raw)[lane + warp_size*3] = r3;
+
+            // Phase 2: Repack from raw (17-byte stride) to structured (aligned int32 qs + uint32 e)
+            // Offset into sh_raw where the actual MXFP4 data starts (accounting for alignment prefix)
+            const uint8_t * raw_base = sh_raw + prefix_bytes;
+
+            // Within a single warp, LDS writes above are visible to all lanes without sync.
+            for (int blk = lane; blk < mxfp4_blocks; blk += warp_size) {
+                const uint8_t * blk_ptr = raw_base + blk * 17;
+
+                // Extract exponent (1 byte at offset 0)
+                dst_e[blk] = blk_ptr[0];
+
+                // Extract 4 aligned int32 quants from bytes [1..16]
+                const uint8_t * qs_src = blk_ptr + 1;
+#pragma unroll
+                for (int i = 0; i < qs_per_block; ++i) {
+                    int val;
+                    __builtin_memcpy(&val, qs_src + 4*i, 4);
+                    dst_qs[blk * qs_per_block + i] = val;
+                }
+            }
+        };
+
+        // --- Load and repack A ---
+        load_and_repack_mxfp4(a_g, sh_a_qs, sh_a_e);
+
+        // --- Load and repack gate (reuses sh_raw) ---
         if (use_gate) {
-            g0 = g4[lane + warp_size*0];
-            g1 = g4[lane + warp_size*1];
-            g2 = g4[lane + warp_size*2];
+            load_and_repack_mxfp4(g_g, sh_gate_qs, sh_gate_e);
         }
 
-        const v4i b0  = b4[lane + warp_size*0];
-        const v4i b1  = b4[lane + warp_size*1];
-        const v4i b2  = b4[lane + warp_size*2];
-        const v4i b3  = b4[lane + warp_size*3];
-        const v4i b4v = b4[lane + warp_size*4];
-        const v4i b5  = b4[lane + warp_size*5];
-        v4i b6;
-        if (lane < 24) {
-            b6 = b4[lane + warp_size*6];
-        }
+        // --- Load B (Q8_1) with coalesced v4i loads ---
+        {
+            const v4i * b4 = reinterpret_cast<const v4i *>(b_g);
 
-        // Block VMEM reads from moving across; allow other instruction classes to pass.
-        // Mask = 0x7C6 (VALU|SALU|MMA|VMEM_WRITE|ALL_DS|DS_READ|DS_WRITE|TRANS).
-        //__builtin_amdgcn_sched_barrier(0x7C6);
+            const v4i b0  = b4[lane + warp_size*0];
+            const v4i b1  = b4[lane + warp_size*1];
+            const v4i b2  = b4[lane + warp_size*2];
+            const v4i b3  = b4[lane + warp_size*3];
+            const v4i b4v = b4[lane + warp_size*4];
+            const v4i b5  = b4[lane + warp_size*5];
+            v4i b6;
+            if (lane < 24) {
+                b6 = b4[lane + warp_size*6];
+            }
 
-        reinterpret_cast<v4i *>(sh_a)[lane + warp_size*0] = a0;
-        reinterpret_cast<v4i *>(sh_a)[lane + warp_size*1] = a1;
-        reinterpret_cast<v4i *>(sh_a)[lane + warp_size*2] = a2;
-
-        if (use_gate) {
-            reinterpret_cast<v4i *>(sh_gate)[lane + warp_size*0] = g0;
-            reinterpret_cast<v4i *>(sh_gate)[lane + warp_size*1] = g1;
-            reinterpret_cast<v4i *>(sh_gate)[lane + warp_size*2] = g2;
-        }
-
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*0] = b0;
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*1] = b1;
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*2] = b2;
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*3] = b3;
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*4] = b4v;
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*5] = b5;
-        if (lane < 24) {
-            reinterpret_cast<v4i *>(sh_b)[lane + warp_size*6] = b6;
+            reinterpret_cast<v4i *>(sh_b)[lane + warp_size*0] = b0;
+            reinterpret_cast<v4i *>(sh_b)[lane + warp_size*1] = b1;
+            reinterpret_cast<v4i *>(sh_b)[lane + warp_size*2] = b2;
+            reinterpret_cast<v4i *>(sh_b)[lane + warp_size*3] = b3;
+            reinterpret_cast<v4i *>(sh_b)[lane + warp_size*4] = b4v;
+            reinterpret_cast<v4i *>(sh_b)[lane + warp_size*5] = b5;
+            if (lane < 24) {
+                reinterpret_cast<v4i *>(sh_b)[lane + warp_size*6] = b6;
+            }
         }
 
         __syncthreads();
 
-        const block_mxfp4 * a_lds = (const block_mxfp4 *) sh_a;
         const block_q8_1 * b_lds = (const block_q8_1 *) sh_b;
-        const block_mxfp4 * g_lds = use_gate ? (const block_mxfp4 *) sh_gate : nullptr;
+        const int * a_qs_lds = sh_a_qs;
+        const uint32_t * a_e_lds = sh_a_e;
+        const int * g_qs_lds = sh_gate_qs;
+        const uint32_t * g_e_lds = sh_gate_e;
+        if constexpr (!has_fusion) {
+            (void) g_qs_lds;
+            (void) g_e_lds;
+        }
 
         for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
             const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -305,15 +385,13 @@ static __global__ void mul_mat_vec_q(
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    const block_mxfp4 * a_row = a_lds + i*stride_row_x;
                     const block_q8_1 * bq8 = b_lds + j*stride_col_y + kby;
 
-                    tmp[j][i] += vec_dot_q_cuda(a_row, bq8, kbx, kqs);
+                    tmp[j][i] += vec_dot_mxfp4_q8_1_lds(a_qs_lds, a_e_lds, bq8, kbx, kqs);
 
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            const block_mxfp4 * g_row = g_lds + i*stride_row_x;
-                            tmp_gate[j][i] += vec_dot_q_cuda(g_row, bq8, kbx, kqs);
+                            tmp_gate[j][i] += vec_dot_mxfp4_q8_1_lds(g_qs_lds, g_e_lds, bq8, kbx, kqs);
                         }
                     }
                 }
