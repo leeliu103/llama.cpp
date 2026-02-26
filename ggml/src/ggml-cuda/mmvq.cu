@@ -225,13 +225,16 @@ static __global__ void mul_mat_vec_q(
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
     if constexpr (type == GGML_TYPE_MXFP4 && ncols_dst == 1 && nwarps == 1 && rows_per_cuda_block == 1) {
         // Special LDS preload path for the fixed 2880 case, single-warp block and single output column.
-        // A (MXFP4): 90 blocks * 17 bytes = 1530 bytes -> round to 1536 (96 * 16B).
+        // A (MXFP4): 90 blocks * 17 bytes = 1530 bytes.
+        // Use fixed 4x16B*warp_size loads to allow cache-line alignment and full unrolling.
         // B (Q8_1): ne10_padded = 3072 elems -> 96 blocks -> 96 * 36 = 3456 bytes (216 * 16B).
         assert(ncols_x == 2880);
 
-        __shared__ __align__(16) uint8_t sh_a[96 * 16];
-        __shared__ __align__(16) uint8_t sh_b[96 * sizeof(block_q8_1)];
-        __shared__ __align__(16) uint8_t sh_gate[96 * 16];
+        constexpr int a_ld_iters = 4;
+        constexpr int a_ld_bytes = a_ld_iters * warp_size * 16;
+        __shared__ __align__(16) uint8_t sh_a[a_ld_bytes];
+        //__shared__ __align__(16) uint8_t sh_b[96 * sizeof(block_q8_1)];
+        __shared__ __align__(16) uint8_t sh_gate[a_ld_bytes];
 
         const int lane = threadIdx.x;
 
@@ -240,32 +243,48 @@ static __global__ void mul_mat_vec_q(
         const uint8_t * g_g = use_gate ? ((const uint8_t *) vgate + (size_t) kbx_offset * sizeof(block_mxfp4)) : nullptr;
 
         // Register-staged preload: issue all global loads first, then LDS stores.
-        using v4i = int __attribute__((ext_vector_type(4), aligned(1)));
-        const v4i * a4 = reinterpret_cast<const v4i *>(a_g);
+        using v4i = int __attribute__((ext_vector_type(4), aligned(16)));
+
+        // Align A/G base address down to 128-byte cache line boundary.
+        const uintptr_t a_addr = reinterpret_cast<uintptr_t>(a_g);
+        const int a_prefix = (int)(a_addr & 127u); // 0..127
+        const uint8_t * a_aligned_g = a_g - a_prefix;
+
+        int g_prefix = 0;
+        const uint8_t * g_aligned_g = nullptr;
+        if (use_gate) {
+            const uintptr_t g_addr = reinterpret_cast<uintptr_t>(g_g);
+            g_prefix = (int)(g_addr & 127u); // 0..127
+            g_aligned_g = g_g - g_prefix;
+        }
+
+        const v4i * a4 = reinterpret_cast<const v4i *>(a_aligned_g);
         const v4i * b4 = reinterpret_cast<const v4i *>(b_g);
-        const v4i * g4 = reinterpret_cast<const v4i *>(g_g);
+        const v4i * g4 = use_gate ? reinterpret_cast<const v4i *>(g_aligned_g) : nullptr;
 
         const v4i a0 = a4[lane + warp_size*0];
         const v4i a1 = a4[lane + warp_size*1];
         const v4i a2 = a4[lane + warp_size*2];
+        const v4i a3 = a4[lane + warp_size*3];
 
-        v4i g0, g1, g2;
+        v4i g0, g1, g2, g3;
         if (use_gate) {
             g0 = g4[lane + warp_size*0];
             g1 = g4[lane + warp_size*1];
             g2 = g4[lane + warp_size*2];
+            g3 = g4[lane + warp_size*3];
         }
 
-        const v4i b0  = b4[lane + warp_size*0];
-        const v4i b1  = b4[lane + warp_size*1];
-        const v4i b2  = b4[lane + warp_size*2];
-        const v4i b3  = b4[lane + warp_size*3];
-        const v4i b4v = b4[lane + warp_size*4];
-        const v4i b5  = b4[lane + warp_size*5];
-        v4i b6;
-        if (lane < 24) {
-            b6 = b4[lane + warp_size*6];
-        }
+        // const v4i b0  = b4[lane + warp_size*0];
+        // const v4i b1  = b4[lane + warp_size*1];
+        // const v4i b2  = b4[lane + warp_size*2];
+        // const v4i b3  = b4[lane + warp_size*3];
+        // const v4i b4v = b4[lane + warp_size*4];
+        // const v4i b5  = b4[lane + warp_size*5];
+        // v4i b6;
+        // if (lane < 24) {
+        //     b6 = b4[lane + warp_size*6];
+        // }
 
         // Block VMEM reads from moving across; allow other instruction classes to pass.
         // Mask = 0x7C6 (VALU|SALU|MMA|VMEM_WRITE|ALL_DS|DS_READ|DS_WRITE|TRANS).
@@ -274,28 +293,30 @@ static __global__ void mul_mat_vec_q(
         reinterpret_cast<v4i *>(sh_a)[lane + warp_size*0] = a0;
         reinterpret_cast<v4i *>(sh_a)[lane + warp_size*1] = a1;
         reinterpret_cast<v4i *>(sh_a)[lane + warp_size*2] = a2;
+        reinterpret_cast<v4i *>(sh_a)[lane + warp_size*3] = a3;
 
         if (use_gate) {
             reinterpret_cast<v4i *>(sh_gate)[lane + warp_size*0] = g0;
             reinterpret_cast<v4i *>(sh_gate)[lane + warp_size*1] = g1;
             reinterpret_cast<v4i *>(sh_gate)[lane + warp_size*2] = g2;
+            reinterpret_cast<v4i *>(sh_gate)[lane + warp_size*3] = g3;
         }
 
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*0] = b0;
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*1] = b1;
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*2] = b2;
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*3] = b3;
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*4] = b4v;
-        reinterpret_cast<v4i *>(sh_b)[lane + warp_size*5] = b5;
-        if (lane < 24) {
-            reinterpret_cast<v4i *>(sh_b)[lane + warp_size*6] = b6;
-        }
+        // reinterpret_cast<v4i *>(sh_b)[lane + warp_size*0] = b0;
+        // reinterpret_cast<v4i *>(sh_b)[lane + warp_size*1] = b1;
+        // reinterpret_cast<v4i *>(sh_b)[lane + warp_size*2] = b2;
+        // reinterpret_cast<v4i *>(sh_b)[lane + warp_size*3] = b3;
+        // reinterpret_cast<v4i *>(sh_b)[lane + warp_size*4] = b4v;
+        // reinterpret_cast<v4i *>(sh_b)[lane + warp_size*5] = b5;
+        // if (lane < 24) {
+        //     reinterpret_cast<v4i *>(sh_b)[lane + warp_size*6] = b6;
+        // }
 
         __syncthreads();
 
-        const block_mxfp4 * a_lds = (const block_mxfp4 *) sh_a;
-        const block_q8_1 * b_lds = (const block_q8_1 *) sh_b;
-        const block_mxfp4 * g_lds = use_gate ? (const block_mxfp4 *) sh_gate : nullptr;
+        const block_mxfp4 * a_lds = (const block_mxfp4 *) (sh_a + a_prefix);
+        //const block_q8_1 * b_lds = (const block_q8_1 *) sh_b;
+        const block_mxfp4 * g_lds = use_gate ? (const block_mxfp4 *) (sh_gate + g_prefix) : nullptr;
 
         for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
             const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -306,14 +327,14 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
                     const block_mxfp4 * a_row = a_lds + i*stride_row_x;
-                    const block_q8_1 * bq8 = b_lds + j*stride_col_y + kby;
+                    //const block_q8_1 * bq8 = b_lds + j*stride_col_y + kby;
 
-                    tmp[j][i] += vec_dot_q_cuda(a_row, bq8, kbx, kqs);
+                    tmp[j][i] += vec_dot_q_cuda(a_row, &y[j*stride_col_y + kby], kbx, kqs);
 
                     if constexpr (has_fusion) {
                         if (use_gate) {
                             const block_mxfp4 * g_row = g_lds + i*stride_row_x;
-                            tmp_gate[j][i] += vec_dot_q_cuda(g_row, bq8, kbx, kqs);
+                            tmp_gate[j][i] += vec_dot_q_cuda(g_row, &y[j*stride_col_y + kby], kbx, kqs);
                         }
                     }
                 }
