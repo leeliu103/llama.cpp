@@ -33,6 +33,60 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
     }
 }
 
+// Local copy to allow direct calls in the MXFP4 single-warp fast path.
+static_assert(VDR_MXFP4_Q8_1_MMVQ == 2, "mxfp4 mmvq buffer assumes vdr=2");
+
+struct mxfp4_q8_1_mmvq_buf_mxfp4 {
+    int q4_0;
+    int q4_1;
+    uint8_t e;
+};
+
+struct mxfp4_q8_1_mmvq_buf_q8_1 {
+    int q8_0;
+    int q8_1;
+    int q8_2;
+    int q8_3;
+    half2 ds;
+};
+
+static __device__ __forceinline__ void mxfp4_q8_1_mmvq_load_mxfp4(
+    const void * __restrict__ vbq, const int & kbx, const int & iqs, mxfp4_q8_1_mmvq_buf_mxfp4 & out) {
+
+    const block_mxfp4 * bq4 = (const block_mxfp4 *) vbq + kbx;
+
+    out.q4_0 = get_int_b1(bq4->qs, iqs + 0);
+    out.q4_1 = get_int_b1(bq4->qs, iqs + 1);
+    out.e = bq4->e;
+}
+
+static __device__ __forceinline__ void mxfp4_q8_1_mmvq_load_q8_1(
+    const block_q8_1 * __restrict__ bq8_1, const int & iqs, mxfp4_q8_1_mmvq_buf_q8_1 & out) {
+
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    out.q8_0 = q8[0];
+    out.q8_1 = q8[4];
+    out.q8_2 = q8[1];
+    out.q8_3 = q8[5];
+    out.ds = bq8_1->ds;
+}
+
+static __device__ __forceinline__ float mxfp4_q8_1_mmvq_compute(
+    const mxfp4_q8_1_mmvq_buf_mxfp4 & a, const mxfp4_q8_1_mmvq_buf_q8_1 & b) {
+
+    int sumi = 0;
+    const int2 v0 = get_int_from_table_16(a.q4_0, kvalues_mxfp4);
+    const int2 v1 = get_int_from_table_16(a.q4_1, kvalues_mxfp4);
+    sumi = ggml_cuda_dp4a(v0.x, b.q8_0, sumi);
+    sumi = ggml_cuda_dp4a(v0.y, b.q8_1, sumi);
+    sumi = ggml_cuda_dp4a(v1.x, b.q8_2, sumi);
+    sumi = ggml_cuda_dp4a(v1.y, b.q8_3, sumi);
+
+    const float d = ggml_cuda_e8m0_to_fp32(a.e) * 0.5f * __low2float(b.ds);
+    return d * sumi;
+}
+
 static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
@@ -297,25 +351,94 @@ static __global__ void mul_mat_vec_q(
         const block_q8_1 * b_lds = (const block_q8_1 *) sh_b;
         const block_mxfp4 * g_lds = use_gate ? (const block_mxfp4 *) sh_gate : nullptr;
 
-        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-            const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
-            const int kqs = vdr * (tid % (qi/vdr));
+        const block_mxfp4 * a_row = a_lds;
+        const block_mxfp4 * g_row = g_lds;
+        const int kqs = vdr * (tid % (qi/vdr));
+        const int kbx0 = tid / (qi/vdr);
+        const int kbx1 = kbx0 + blocks_per_iter;
+        const int kbx2 = kbx1 + blocks_per_iter;
+        const int kbx3 = kbx2 + blocks_per_iter;
+        const int kbx4 = kbx3 + blocks_per_iter;
+        const int kbx5 = kbx4 + blocks_per_iter;
+        const bool has_k5 = kbx5 < blocks_per_row_x;
 
-#pragma unroll
-            for (int j = 0; j < ncols_dst; ++j) {
-#pragma unroll
-                for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    const block_mxfp4 * a_row = a_lds + i*stride_row_x;
-                    const block_q8_1 * bq8 = b_lds + j*stride_col_y + kby;
+        const int kby0 = kbx0 * (qk/QK8_1); // y block index that aligns with kbx
+        const int kby1 = kbx1 * (qk/QK8_1);
+        const int kby2 = kbx2 * (qk/QK8_1);
+        const int kby3 = kbx3 * (qk/QK8_1);
+        const int kby4 = kbx4 * (qk/QK8_1);
+        const int kby5 = kbx5 * (qk/QK8_1);
 
-                    tmp[j][i] += vec_dot_q_cuda(a_row, bq8, kbx, kqs);
+        mxfp4_q8_1_mmvq_buf_mxfp4 a_buf0;
+        mxfp4_q8_1_mmvq_buf_mxfp4 a_buf1;
+        mxfp4_q8_1_mmvq_buf_mxfp4 a_buf2;
+        mxfp4_q8_1_mmvq_buf_mxfp4 a_buf3;
+        mxfp4_q8_1_mmvq_buf_mxfp4 a_buf4;
+        mxfp4_q8_1_mmvq_buf_mxfp4 a_buf5;
+        mxfp4_q8_1_mmvq_buf_q8_1 b_buf0;
+        mxfp4_q8_1_mmvq_buf_q8_1 b_buf1;
+        mxfp4_q8_1_mmvq_buf_q8_1 b_buf2;
+        mxfp4_q8_1_mmvq_buf_q8_1 b_buf3;
+        mxfp4_q8_1_mmvq_buf_q8_1 b_buf4;
+        mxfp4_q8_1_mmvq_buf_q8_1 b_buf5;
+        mxfp4_q8_1_mmvq_buf_mxfp4 g_buf0;
+        mxfp4_q8_1_mmvq_buf_mxfp4 g_buf1;
+        mxfp4_q8_1_mmvq_buf_mxfp4 g_buf2;
+        mxfp4_q8_1_mmvq_buf_mxfp4 g_buf3;
+        mxfp4_q8_1_mmvq_buf_mxfp4 g_buf4;
+        mxfp4_q8_1_mmvq_buf_mxfp4 g_buf5;
 
-                    if constexpr (has_fusion) {
-                        if (use_gate) {
-                            const block_mxfp4 * g_row = g_lds + i*stride_row_x;
-                            tmp_gate[j][i] += vec_dot_q_cuda(g_row, bq8, kbx, kqs);
-                        }
-                    }
+        mxfp4_q8_1_mmvq_load_q8_1(b_lds + kby0, kqs, b_buf0);
+        mxfp4_q8_1_mmvq_load_q8_1(b_lds + kby1, kqs, b_buf1);
+        mxfp4_q8_1_mmvq_load_q8_1(b_lds + kby2, kqs, b_buf2);
+        mxfp4_q8_1_mmvq_load_q8_1(b_lds + kby3, kqs, b_buf3);
+        mxfp4_q8_1_mmvq_load_q8_1(b_lds + kby4, kqs, b_buf4);
+        if (has_k5) {
+            mxfp4_q8_1_mmvq_load_q8_1(b_lds + kby5, kqs, b_buf5);
+        }
+
+        mxfp4_q8_1_mmvq_load_mxfp4(a_row, kbx0, kqs, a_buf0);
+        mxfp4_q8_1_mmvq_load_mxfp4(a_row, kbx1, kqs, a_buf1);
+        mxfp4_q8_1_mmvq_load_mxfp4(a_row, kbx2, kqs, a_buf2);
+        mxfp4_q8_1_mmvq_load_mxfp4(a_row, kbx3, kqs, a_buf3);
+        mxfp4_q8_1_mmvq_load_mxfp4(a_row, kbx4, kqs, a_buf4);
+        if (has_k5) {
+            mxfp4_q8_1_mmvq_load_mxfp4(a_row, kbx5, kqs, a_buf5);
+        }
+
+        if constexpr (has_fusion) {
+            if (use_gate) {
+                mxfp4_q8_1_mmvq_load_mxfp4(g_row, kbx0, kqs, g_buf0);
+                mxfp4_q8_1_mmvq_load_mxfp4(g_row, kbx1, kqs, g_buf1);
+                mxfp4_q8_1_mmvq_load_mxfp4(g_row, kbx2, kqs, g_buf2);
+                mxfp4_q8_1_mmvq_load_mxfp4(g_row, kbx3, kqs, g_buf3);
+                mxfp4_q8_1_mmvq_load_mxfp4(g_row, kbx4, kqs, g_buf4);
+                if (has_k5) {
+                    mxfp4_q8_1_mmvq_load_mxfp4(g_row, kbx5, kqs, g_buf5);
+                }
+            }
+        }
+
+        __builtin_amdgcn_sched_barrier(0x7C6 & ~0x0180);
+
+        tmp[0][0] += mxfp4_q8_1_mmvq_compute(a_buf0, b_buf0);
+        tmp[0][0] += mxfp4_q8_1_mmvq_compute(a_buf1, b_buf1);
+        tmp[0][0] += mxfp4_q8_1_mmvq_compute(a_buf2, b_buf2);
+        tmp[0][0] += mxfp4_q8_1_mmvq_compute(a_buf3, b_buf3);
+        tmp[0][0] += mxfp4_q8_1_mmvq_compute(a_buf4, b_buf4);
+        if (has_k5) {
+            tmp[0][0] += mxfp4_q8_1_mmvq_compute(a_buf5, b_buf5);
+        }
+
+        if constexpr (has_fusion) {
+            if (use_gate) {
+                tmp_gate[0][0] += mxfp4_q8_1_mmvq_compute(g_buf0, b_buf0);
+                tmp_gate[0][0] += mxfp4_q8_1_mmvq_compute(g_buf1, b_buf1);
+                tmp_gate[0][0] += mxfp4_q8_1_mmvq_compute(g_buf2, b_buf2);
+                tmp_gate[0][0] += mxfp4_q8_1_mmvq_compute(g_buf3, b_buf3);
+                tmp_gate[0][0] += mxfp4_q8_1_mmvq_compute(g_buf4, b_buf4);
+                if (has_k5) {
+                    tmp_gate[0][0] += mxfp4_q8_1_mmvq_compute(g_buf5, b_buf5);
                 }
             }
         }
