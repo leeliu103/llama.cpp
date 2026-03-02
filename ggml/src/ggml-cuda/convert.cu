@@ -539,8 +539,9 @@ void convert_block_mxfp4_aos_to_soa(
 
     const block_mxfp4 * src = (const block_mxfp4 *) src_aos;
     uint8_t * dst = (uint8_t *) dst_soa;
-    uint8_t * dst_e = dst;
-    uint8_t * dst_q = dst + nblocks;
+    const int64_t qbytes = nblocks * (QK_MXFP4 / 2);
+    uint8_t * dst_q = dst;
+    uint8_t * dst_e = dst + qbytes;
 
     constexpr int nth = 256;
     const int nbl = (nblocks + nth - 1) / nth;
@@ -557,8 +558,9 @@ void convert_block_mxfp4_soa_to_aos(
     }
 
     const uint8_t * src = (const uint8_t *) src_soa;
-    const uint8_t * src_e = src;
-    const uint8_t * src_q = src + nblocks;
+    const int64_t qbytes = nblocks * (QK_MXFP4 / 2);
+    const uint8_t * src_q = src;
+    const uint8_t * src_e = src + qbytes;
     block_mxfp4 * dst = (block_mxfp4 *) dst_aos;
 
     constexpr int nth = 256;
