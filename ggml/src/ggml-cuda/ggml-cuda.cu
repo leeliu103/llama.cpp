@@ -628,12 +628,35 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+
+    if (tensor->type == GGML_TYPE_MXFP4) {
+        // PoC: overwrite MXFP4 device storage to SoA on upload.
+        GGML_ASSERT(offset == 0);
+        GGML_ASSERT(size == ggml_nbytes(tensor));
+
+        void * tmp_src = nullptr;
+        CUDA_CHECK(ggml_cuda_device_malloc(&tmp_src, size, ctx->device));
+        CUDA_CHECK(cudaMemcpyAsync(tmp_src, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+
+        const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+        convert_block_mxfp4_aos_to_soa(tmp_src, tensor->data, nblocks, cudaStreamPerThread);
+        CUDA_CHECK(cudaGetLastError());
+
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        CUDA_CHECK(cudaFree(tmp_src));
+        return;
+    }
+
     CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+
+    if (tensor->type == GGML_TYPE_MXFP4) {
+        GGML_ABORT("MXFP4 overwrite PoC: SoA->AoS restore path not implemented");
+    }
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *)tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));

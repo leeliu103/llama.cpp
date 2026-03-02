@@ -486,6 +486,37 @@ static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_
     }
 }
 
+static __global__ void kernel_convert_block_mxfp4_aos_to_soa(
+        const block_mxfp4 * src,
+        uint8_t * dst_e,
+        uint8_t * dst_q,
+        int64_t nblocks) {
+    // PoC scaffold: conversion body intentionally left empty.
+    GGML_UNUSED(src);
+    GGML_UNUSED(dst_e);
+    GGML_UNUSED(dst_q);
+    GGML_UNUSED(nblocks);
+}
+
+void convert_block_mxfp4_aos_to_soa(
+        const void * src_aos,
+        void * dst_soa,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    if (nblocks == 0) {
+        return;
+    }
+
+    const block_mxfp4 * src = (const block_mxfp4 *) src_aos;
+    uint8_t * dst = (uint8_t *) dst_soa;
+    uint8_t * dst_e = dst;
+    uint8_t * dst_q = dst + nblocks;
+
+    constexpr int nth = 256;
+    const int nbl = (nblocks + nth - 1) / nth;
+    kernel_convert_block_mxfp4_aos_to_soa<<<nbl, nth, 0, stream>>>(src, dst_e, dst_q, nblocks);
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
