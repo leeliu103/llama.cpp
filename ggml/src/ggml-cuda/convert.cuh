@@ -37,6 +37,12 @@ void convert_block_mxfp4_aos_to_soa(
         int64_t nblocks,
         cudaStream_t stream);
 
+void convert_block_mxfp4_soa_to_aos(
+        const void * src_soa,
+        void * dst_aos,
+        int64_t nblocks,
+        cudaStream_t stream);
+
 template<typename dst_t, typename src_t>
  __host__ __device__ inline dst_t ggml_cuda_cast(src_t x) {
     if constexpr (std::is_same_v<dst_t, src_t>) {
