@@ -229,12 +229,12 @@ static __global__ void mul_mat_vec_q(
     const uint8_t * vg_e = nullptr;
     const uint8_t * vg_q = nullptr;
     if constexpr (type == GGML_TYPE_MXFP4) {
-        vx_e = (const uint8_t *) vx;
-        vx_q = vx_e + mxfp4_q_offset;
+        vx_q = (const uint8_t *) vx;
+        vx_e = vx_q + mxfp4_q_offset;
         if constexpr (has_fusion) {
             if (use_gate) {
-                vg_e = (const uint8_t *) vgate;
-                vg_q = vg_e + mxfp4_q_offset;
+                vg_q = (const uint8_t *) vgate;
+                vg_e = vg_q + mxfp4_q_offset;
             }
         }
     } else {
@@ -779,7 +779,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
     const uint64_t mxfp4_q_offset_u64 = src0->type == GGML_TYPE_MXFP4
-        ? (uint64_t) ggml_nelements(src0) / ggml_blck_size(src0->type)
+        ? ((uint64_t) ggml_nelements(src0) / ggml_blck_size(src0->type)) * (QK_MXFP4 / 2)
         : 0;
     GGML_ASSERT(mxfp4_q_offset_u64 <= UINT32_MAX);
     const uint32_t mxfp4_q_offset = (uint32_t) mxfp4_q_offset_u64;
