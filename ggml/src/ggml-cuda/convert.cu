@@ -491,11 +491,41 @@ static __global__ void kernel_convert_block_mxfp4_aos_to_soa(
         uint8_t * dst_e,
         uint8_t * dst_q,
         int64_t nblocks) {
-    // PoC scaffold: conversion body intentionally left empty.
-    GGML_UNUSED(src);
-    GGML_UNUSED(dst_e);
-    GGML_UNUSED(dst_q);
-    GGML_UNUSED(nblocks);
+    const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+
+    const block_mxfp4 b = src[ib];
+    dst_e[ib] = b.e;
+
+    uint8_t * q = dst_q + ib * (QK_MXFP4 / 2);
+#pragma unroll
+    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+        q[i] = b.qs[i];
+    }
+}
+
+static __global__ void kernel_convert_block_mxfp4_soa_to_aos(
+        const uint8_t * src_e,
+        const uint8_t * src_q,
+        block_mxfp4 * dst,
+        int64_t nblocks) {
+    const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+
+    block_mxfp4 b;
+    b.e = src_e[ib];
+
+    const uint8_t * q = src_q + ib * (QK_MXFP4 / 2);
+#pragma unroll
+    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+        b.qs[i] = q[i];
+    }
+
+    dst[ib] = b;
 }
 
 void convert_block_mxfp4_aos_to_soa(
@@ -515,6 +545,25 @@ void convert_block_mxfp4_aos_to_soa(
     constexpr int nth = 256;
     const int nbl = (nblocks + nth - 1) / nth;
     kernel_convert_block_mxfp4_aos_to_soa<<<nbl, nth, 0, stream>>>(src, dst_e, dst_q, nblocks);
+}
+
+void convert_block_mxfp4_soa_to_aos(
+        const void * src_soa,
+        void * dst_aos,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    if (nblocks == 0) {
+        return;
+    }
+
+    const uint8_t * src = (const uint8_t *) src_soa;
+    const uint8_t * src_e = src;
+    const uint8_t * src_q = src + nblocks;
+    block_mxfp4 * dst = (block_mxfp4 *) dst_aos;
+
+    constexpr int nth = 256;
+    const int nbl = (nblocks + nth - 1) / nth;
+    kernel_convert_block_mxfp4_soa_to_aos<<<nbl, nth, 0, stream>>>(src_e, src_q, dst, nblocks);
 }
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
