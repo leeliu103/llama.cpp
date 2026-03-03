@@ -104,6 +104,11 @@ void ggml_cuda_mul_mat_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const uint64_t mxfp4_q_offset_u64 = src0->type == GGML_TYPE_MXFP4
+        ? ((uint64_t) ggml_nelements(src0) / ggml_blck_size(src0->type)) * (QK_MXFP4 / 2)
+        : 0;
+    GGML_ASSERT(mxfp4_q_offset_u64 <= UINT32_MAX);
+    const uint32_t mxfp4_q_offset = (uint32_t) mxfp4_q_offset_u64;
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s1  =  dst->nb[1] / ts_dst;
@@ -152,7 +157,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1};
+            use_stream_k, ne1, mxfp4_q_offset};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -212,7 +217,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        use_stream_k, ne12, mxfp4_q_offset};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -236,6 +241,11 @@ void ggml_cuda_op_mul_mat_q(
 
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
+    const uint64_t mxfp4_q_offset_u64 = src0->type == GGML_TYPE_MXFP4
+        ? ((uint64_t) ggml_nelements(src0) / ggml_blck_size(src0->type)) * (QK_MXFP4 / 2)
+        : 0;
+    GGML_ASSERT(mxfp4_q_offset_u64 <= UINT32_MAX);
+    const uint32_t mxfp4_q_offset = (uint32_t) mxfp4_q_offset_u64;
 
     // the main device has a larger memory buffer to hold the results from all GPUs
     // nrows_dst == nrows of the matrix that the kernel writes into
@@ -252,7 +262,7 @@ void ggml_cuda_op_mul_mat_q(
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
-        use_stream_k, src1_ncols};
+        use_stream_k, src1_ncols, mxfp4_q_offset};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 
