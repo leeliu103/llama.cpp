@@ -57,12 +57,15 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
-static __device__ __forceinline__ float vec_dot_mxfp4_q8_1_soa(
+static __device__ __forceinline__ float vec_dot_mxfp4_soa_q8_1_x4(
         const uint8_t * __restrict__ vx_e,
         const uint8_t * __restrict__ vx_q,
-        const block_q8_1 * __restrict__ bq8_1,
-        const int & kbx, const int & iqs) {
-    const int * q8 = (const int *) bq8_1->qs + iqs;
+        const block_q8_1_x4 * __restrict__ yx4,
+        const int & kby, const int & kbx, const int & iqs) {
+    const int block_outer = kby >> 2;
+    const int block_inner = kby & 3;
+    const block_q8_1_x4 * by = yx4 + block_outer;
+    const int * q8 = (const int *) by->qs + block_inner * 8 + iqs;
     const uint8_t * q4 = vx_q + (int64_t) kbx*(QK_MXFP4/2);
 
     int sumi = 0;
@@ -74,7 +77,7 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1_soa(
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
     }
 
-    const float d = ggml_cuda_e8m0_to_fp32(vx_e[kbx]) * 0.5f * __low2float(bq8_1->ds);
+    const float d = ggml_cuda_e8m0_to_fp32(vx_e[kbx]) * 0.5f * __low2float(by->ds[block_inner]);
     return d * sumi;
 }
 
@@ -274,9 +277,18 @@ static __global__ void mul_mat_vec_q(
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
-    const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    if constexpr (is_multi_token_id) {
-        y += token_idx*stride_col_y;
+    const block_q8_1 * y = nullptr;
+    const block_q8_1_x4 * yx4 = nullptr;
+    if constexpr (type == GGML_TYPE_MXFP4) {
+        yx4 = ((const block_q8_1_x4 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+        if constexpr (is_multi_token_id) {
+            yx4 += token_idx*stride_col_y;
+        }
+    } else {
+        y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+        if constexpr (is_multi_token_id) {
+            y += token_idx*stride_col_y;
+        }
     }
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
@@ -291,18 +303,21 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 const int kbx_x = kbx_offset + i*stride_row_x + kbx;
-                const block_q8_1 * yb = &y[j*stride_col_y + kby];
 
                 if constexpr (type == GGML_TYPE_MXFP4) {
-                    tmp[j][i] += vec_dot_mxfp4_q8_1_soa(vx_e, vx_q, yb, kbx_x, kqs);
+                    const block_q8_1_x4 * yb_x4 = &yx4[j*stride_col_y];
+                    tmp[j][i] += vec_dot_mxfp4_soa_q8_1_x4(vx_e, vx_q, yb_x4, kby, kbx_x, kqs);
                 } else {
+                    const block_q8_1 * yb = &y[j*stride_col_y + kby];
                     tmp[j][i] += vec_dot_q_cuda(vx, yb, kbx_x, kqs);
                 }
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         if constexpr (type == GGML_TYPE_MXFP4) {
-                            tmp_gate[j][i] += vec_dot_mxfp4_q8_1_soa(vg_e, vg_q, yb, kbx_x, kqs);
+                            const block_q8_1_x4 * yb_x4 = &yx4[j*stride_col_y];
+                            tmp_gate[j][i] += vec_dot_mxfp4_soa_q8_1_x4(vg_e, vg_q, yb_x4, kby, kbx_x, kqs);
                         } else {
+                            const block_q8_1 * yb = &y[j*stride_col_y + kby];
                             tmp_gate[j][i] += vec_dot_q_cuda(vgate, yb, kbx_x, kqs);
                         }
                     }
@@ -754,11 +769,17 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        if (src0->type == GGML_TYPE_MXFP4) {
+            quantize_row_q8_1_x4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        } else {
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
-    const int64_t s11 = ne10_padded / QK8_1;
+    const int64_t s11 = src0->type == GGML_TYPE_MXFP4
+        ? (ne10_padded / (4 * QK8_1))
+        : (ne10_padded / QK8_1);
     const int64_t s1  =  dst->nb[1] / ts_dst;
     const int64_t s02 = src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;
