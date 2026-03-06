@@ -1369,6 +1369,30 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
 
+    struct ggml_cuda_mmvq_cache {
+        void * ptr = nullptr;
+        size_t size = 0;
+        const ggml_tensor * src1 = nullptr;
+        ggml_type src0_type = GGML_TYPE_COUNT;
+        int64_t ne10 = 0, ne11 = 0, ne12 = 0, ne13 = 0;
+        int64_t nb10 = 0, nb11 = 0, nb12 = 0, nb13 = 0;
+        int64_t ne10_padded = 0;
+        int device = -1;
+        bool valid = false;
+
+        void reset_key() {
+            src1 = nullptr;
+            src0_type = GGML_TYPE_COUNT;
+            ne10 = ne11 = ne12 = ne13 = 0;
+            nb10 = nb11 = nb12 = nb13 = 0;
+            ne10_padded = 0;
+            device = -1;
+            valid = false;
+        }
+    };
+
+    ggml_cuda_mmvq_cache mmvq_cache[GGML_CUDA_MAX_STREAMS];
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
