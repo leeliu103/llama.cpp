@@ -699,60 +699,47 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     void * src1_q8_1_ptr = nullptr;
-    ggml_cuda_pool_alloc<char> src1_q8_1;
     const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
 
-    if (!ids) {
-        auto & cache = ctx.mmvq_cache[ctx.curr_stream_no];
-        const bool cache_hit =
-            cache.valid &&
-            cache.ptr != nullptr &&
-            cache.size >= nbytes_src1_q8_1 &&
-            cache.src1 == src1 &&
-            cache.src0_type == src0->type &&
-            cache.ne10 == ne10 && cache.ne11 == ne11 &&
-            cache.ne12 == ne12 && cache.ne13 == ne13 &&
-            cache.nb10 == src1->nb[0] && cache.nb11 == src1->nb[1] &&
-            cache.nb12 == src1->nb[2] && cache.nb13 == src1->nb[3] &&
-            cache.ne10_padded == ne10_padded &&
-            cache.device == ctx.device;
+    auto & cache = ctx.mmvq_cache[ctx.curr_stream_no];
+    const bool cache_hit =
+        cache.valid &&
+        cache.ptr != nullptr &&
+        cache.size >= nbytes_src1_q8_1 &&
+        cache.src1 == src1 &&
+        cache.src0_type == src0->type &&
+        cache.ne10 == ne10 && cache.ne11 == ne11 &&
+        cache.ne12 == ne12 && cache.ne13 == ne13 &&
+        cache.nb10 == src1->nb[0] && cache.nb11 == src1->nb[1] &&
+        cache.nb12 == src1->nb[2] && cache.nb13 == src1->nb[3] &&
+        cache.ne10_padded == ne10_padded &&
+        cache.device == ctx.device;
 
-        if (!cache_hit) {
-            if (cache.ptr == nullptr || cache.size < nbytes_src1_q8_1) {
-                if (cache.ptr != nullptr) {
-                    CUDA_CHECK(cudaFree(cache.ptr));
-                }
-                CUDA_CHECK(cudaMalloc(&cache.ptr, nbytes_src1_q8_1));
-                cache.size = nbytes_src1_q8_1;
+    if (!cache_hit) {
+        if (cache.ptr == nullptr || cache.size < nbytes_src1_q8_1) {
+            if (cache.ptr != nullptr) {
+                CUDA_CHECK(cudaFree(cache.ptr));
             }
-
-            const int64_t s11 = src1->nb[1] / ts_src1;
-            const int64_t s12 = src1->nb[2] / ts_src1;
-            const int64_t s13 = src1->nb[3] / ts_src1;
-            quantize_row_q8_1_cuda(src1_d, nullptr, cache.ptr, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-
-            cache.src1 = src1;
-            cache.src0_type = src0->type;
-            cache.ne10 = ne10; cache.ne11 = ne11;
-            cache.ne12 = ne12; cache.ne13 = ne13;
-            cache.nb10 = src1->nb[0]; cache.nb11 = src1->nb[1];
-            cache.nb12 = src1->nb[2]; cache.nb13 = src1->nb[3];
-            cache.ne10_padded = ne10_padded;
-            cache.device = ctx.device;
-            cache.valid = true;
+            CUDA_CHECK(cudaMalloc(&cache.ptr, nbytes_src1_q8_1));
+            cache.size = nbytes_src1_q8_1;
         }
 
-        src1_q8_1_ptr = cache.ptr;
-    } else {
-        src1_q8_1.alloc(ctx.pool(), nbytes_src1_q8_1);
-        {
-            const int64_t s11 = src1->nb[1] / ts_src1;
-            const int64_t s12 = src1->nb[2] / ts_src1;
-            const int64_t s13 = src1->nb[3] / ts_src1;
-            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-        }
-        src1_q8_1_ptr = src1_q8_1.get();
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+        quantize_row_q8_1_cuda(src1_d, nullptr, cache.ptr, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+
+        cache.src1 = src1;
+        cache.src0_type = src0->type;
+        cache.ne10 = ne10; cache.ne11 = ne11;
+        cache.ne12 = ne12; cache.ne13 = ne13;
+        cache.nb10 = src1->nb[0]; cache.nb11 = src1->nb[1];
+        cache.nb12 = src1->nb[2]; cache.nb13 = src1->nb[3];
+        cache.ne10_padded = ne10_padded;
+        cache.device = ctx.device;
+        cache.valid = true;
     }
+    src1_q8_1_ptr = cache.ptr;
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
