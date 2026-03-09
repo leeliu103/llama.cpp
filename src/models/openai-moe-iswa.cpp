@@ -35,22 +35,33 @@ llm_build_openai_moe_iswa::llm_build_openai_moe_iswa(const llama_model & model, 
                 ggml_tensor * qkv_cur = ggml_mul_mat(ctx0, model.layers[il].wqkv, cur);
                 cb(qkv_cur, "wqkv", il);
 
+                if (model.layers[il].bqkv) {
+                    qkv_cur = ggml_add(ctx0, qkv_cur, model.layers[il].bqkv);
+                    cb(qkv_cur, "bqkv", il);
+                }
+
                 const size_t type_size = ggml_type_size(qkv_cur->type);
                 const int64_t n_embd_q = model.layers[il].wq->ne[1];
                 const int64_t n_embd_k = model.layers[il].wk->ne[1];
                 const int64_t n_embd_v = model.layers[il].wv->ne[1];
 
-                ggml_tensor * Qcur_2d = ggml_view_2d(ctx0, qkv_cur, n_embd_q, n_tokens, qkv_cur->nb[1], 0);
-                ggml_tensor * Kcur_2d = ggml_view_2d(ctx0, qkv_cur, n_embd_k, n_tokens, qkv_cur->nb[1], n_embd_q * type_size);
-                ggml_tensor * Vcur_2d = ggml_view_2d(ctx0, qkv_cur, n_embd_v, n_tokens, qkv_cur->nb[1], (n_embd_q + n_embd_k) * type_size);
+                if (model.layers[il].bqkv) {
+                    Qcur = ggml_view_3d(ctx0, qkv_cur, n_rot, n_head,    n_tokens, n_rot * type_size, qkv_cur->nb[1], 0);
+                    Kcur = ggml_view_3d(ctx0, qkv_cur, n_rot, n_head_kv, n_tokens, n_rot * type_size, qkv_cur->nb[1], n_embd_q * type_size);
+                    Vcur = ggml_view_3d(ctx0, qkv_cur, n_rot, n_head_kv, n_tokens, n_rot * type_size, qkv_cur->nb[1], (n_embd_q + n_embd_k) * type_size);
+                } else {
+                    ggml_tensor * Qcur_2d = ggml_view_2d(ctx0, qkv_cur, n_embd_q, n_tokens, qkv_cur->nb[1], 0);
+                    ggml_tensor * Kcur_2d = ggml_view_2d(ctx0, qkv_cur, n_embd_k, n_tokens, qkv_cur->nb[1], n_embd_q * type_size);
+                    ggml_tensor * Vcur_2d = ggml_view_2d(ctx0, qkv_cur, n_embd_v, n_tokens, qkv_cur->nb[1], (n_embd_q + n_embd_k) * type_size);
 
-                Qcur_2d = model.layers[il].bq ? ggml_add(ctx0, Qcur_2d, model.layers[il].bq) : ggml_cont(ctx0, Qcur_2d);
-                Kcur_2d = model.layers[il].bk ? ggml_add(ctx0, Kcur_2d, model.layers[il].bk) : ggml_cont(ctx0, Kcur_2d);
-                Vcur_2d = model.layers[il].bv ? ggml_add(ctx0, Vcur_2d, model.layers[il].bv) : ggml_cont(ctx0, Vcur_2d);
+                    Qcur_2d = model.layers[il].bq ? ggml_add(ctx0, Qcur_2d, model.layers[il].bq) : ggml_cont(ctx0, Qcur_2d);
+                    Kcur_2d = model.layers[il].bk ? ggml_add(ctx0, Kcur_2d, model.layers[il].bk) : ggml_cont(ctx0, Kcur_2d);
+                    Vcur_2d = model.layers[il].bv ? ggml_add(ctx0, Vcur_2d, model.layers[il].bv) : ggml_cont(ctx0, Vcur_2d);
 
-                Qcur = ggml_reshape_3d(ctx0, Qcur_2d, n_rot, n_head,    n_tokens);
-                Kcur = ggml_reshape_3d(ctx0, Kcur_2d, n_rot, n_head_kv, n_tokens);
-                Vcur = ggml_reshape_3d(ctx0, Vcur_2d, n_rot, n_head_kv, n_tokens);
+                    Qcur = ggml_reshape_3d(ctx0, Qcur_2d, n_rot, n_head,    n_tokens);
+                    Kcur = ggml_reshape_3d(ctx0, Kcur_2d, n_rot, n_head_kv, n_tokens);
+                    Vcur = ggml_reshape_3d(ctx0, Vcur_2d, n_rot, n_head_kv, n_tokens);
+                }
 
                 cb(Qcur, "Qcur", il);
                 cb(Kcur, "Kcur", il);
