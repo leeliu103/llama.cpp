@@ -7856,6 +7856,116 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+#if defined(GGML_USE_HIP)
+    // Fuse GPT-OSS/OpenAI-MoE full-attention Q/K/V weights into a single QKV tensor.
+    // This reduces three decode-time matmuls to one on the HIP path.
+    if (arch == LLM_ARCH_OPENAI_MOE) {
+        uint32_t n_fused = 0;
+
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            auto & layer = layers[il];
+
+            if (layer.wqkv || !layer.wq || !layer.wk || !layer.wv) {
+                continue;
+            }
+
+            if (layer.wq->type != layer.wk->type || layer.wq->type != layer.wv->type) {
+                LLAMA_LOG_WARN("%s: layer %u: QKV type mismatch, skipping fusion\n", __func__, il);
+                continue;
+            }
+
+            if (layer.wq->ne[0] != layer.wk->ne[0] || layer.wq->ne[0] != layer.wv->ne[0]) {
+                LLAMA_LOG_WARN("%s: layer %u: QKV inner-dimension mismatch, skipping fusion\n", __func__, il);
+                continue;
+            }
+
+            ggml_backend_buffer_type_t buft_q = ggml_backend_buffer_get_type(layer.wq->buffer);
+            ggml_backend_buffer_type_t buft_k = ggml_backend_buffer_get_type(layer.wk->buffer);
+            ggml_backend_buffer_type_t buft_v = ggml_backend_buffer_get_type(layer.wv->buffer);
+
+            if (buft_q != buft_k || buft_q != buft_v) {
+                LLAMA_LOG_WARN("%s: layer %u: QKV buffer type mismatch, skipping fusion\n", __func__, il);
+                continue;
+            }
+
+            const int64_t n_embd     = layer.wq->ne[0];
+            const int64_t n_out_q    = layer.wq->ne[1];
+            const int64_t n_out_k    = layer.wk->ne[1];
+            const int64_t n_out_v    = layer.wv->ne[1];
+            const int64_t n_out_qkv  = n_out_q + n_out_k + n_out_v;
+            const ggml_type wtype    = layer.wq->type;
+            const size_t row_size    = ggml_row_size(wtype, n_embd);
+            const size_t qkv_nbytes  = row_size * n_out_qkv;
+
+            std::vector<uint8_t> qkv_host(qkv_nbytes);
+
+            ggml_backend_tensor_get(layer.wq, qkv_host.data(), 0, row_size * n_out_q);
+            ggml_backend_tensor_get(layer.wk, qkv_host.data() + row_size * n_out_q, 0, row_size * n_out_k);
+            ggml_backend_tensor_get(layer.wv, qkv_host.data() + row_size * (n_out_q + n_out_k), 0, row_size * n_out_v);
+
+            ggml_init_params ctx_qkv_params = {
+                /*.mem_size   =*/ ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx_qkv = ggml_init(ctx_qkv_params);
+            if (ctx_qkv == nullptr) {
+                LLAMA_LOG_WARN("%s: layer %u: failed to create QKV context, skipping fusion\n", __func__, il);
+                continue;
+            }
+
+            ggml_tensor * wqkv = ggml_new_tensor_2d(ctx_qkv, wtype, n_embd, n_out_qkv);
+            if (wqkv == nullptr) {
+                ggml_free(ctx_qkv);
+                LLAMA_LOG_WARN("%s: layer %u: failed to create fused QKV tensor, skipping fusion\n", __func__, il);
+                continue;
+            }
+
+            ggml_set_name(wqkv, format("blk.%u.attn_qkv.weight", il).c_str());
+
+            const size_t qkv_alloc_size = ggml_backend_buft_get_alloc_size(buft_q, wqkv);
+            ggml_backend_buffer_t qkv_buf = ggml_backend_buft_alloc_buffer(buft_q, qkv_alloc_size);
+            if (qkv_buf == nullptr) {
+                ggml_free(ctx_qkv);
+                LLAMA_LOG_WARN("%s: layer %u: failed to allocate fused QKV buffer, skipping fusion\n", __func__, il);
+                continue;
+            }
+
+            ggml_backend_tensor_alloc(qkv_buf, wqkv, ggml_backend_buffer_get_base(qkv_buf));
+            ggml_backend_tensor_set(wqkv, qkv_host.data(), 0, qkv_nbytes);
+            ggml_backend_buffer_set_usage(qkv_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            if (use_mlock && ggml_backend_buffer_is_host(qkv_buf)) {
+                pimpl->mlock_bufs.emplace_back(new llama_mlock);
+                auto & mlock_buf = pimpl->mlock_bufs.back();
+                mlock_buf->init   (ggml_backend_buffer_get_base(qkv_buf));
+                mlock_buf->grow_to(ggml_backend_buffer_get_size(qkv_buf));
+            }
+
+            layer.wqkv = wqkv;
+            pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(ctx_qkv), std::vector<ggml_backend_buffer_ptr>());
+            pimpl->ctxs_bufs.back().second.emplace_back(qkv_buf);
+            tensors_by_name.emplace_back(ggml_get_name(wqkv), wqkv);
+            n_fused++;
+
+            if (n_fused == 1) {
+                LLAMA_LOG_INFO(
+                    "%s: GPT-OSS fused QKV: Q[%lld,%lld] + K[%lld,%lld] + V[%lld,%lld] -> QKV[%lld,%lld] (%s)\n",
+                    __func__,
+                    (long long) n_embd, (long long) n_out_q,
+                    (long long) n_embd, (long long) n_out_k,
+                    (long long) n_embd, (long long) n_out_v,
+                    (long long) n_embd, (long long) n_out_qkv,
+                    ggml_type_name(wtype));
+            }
+        }
+
+        if (n_fused > 0) {
+            LLAMA_LOG_INFO("%s: fused GPT-OSS QKV weights for %u layers\n", __func__, n_fused);
+        }
+    }
+#endif // GGML_USE_HIP
+
     return true;
 }
 
