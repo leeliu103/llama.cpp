@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 
 #include "llama-impl.h"
+#include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 
@@ -891,6 +892,72 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     }
 }
 
+static ggml_tensor *& llm_proj_group_member_ref(llm_proj_group_output & output, llm_proj_member member) {
+    switch (member) {
+        case LLM_PROJ_Q:    return output.q;
+        case LLM_PROJ_K:    return output.k;
+        case LLM_PROJ_V:    return output.v;
+        case LLM_PROJ_GATE: return output.gate;
+        case LLM_PROJ_MEMBER_COUNT: break;
+    }
+
+    GGML_ABORT("invalid projection member");
+}
+
+static ggml_tensor * llm_proj_group_member_ptr(const llm_proj_group_output & output, llm_proj_member member) {
+    switch (member) {
+        case LLM_PROJ_Q:    return output.q;
+        case LLM_PROJ_K:    return output.k;
+        case LLM_PROJ_V:    return output.v;
+        case LLM_PROJ_GATE: return output.gate;
+        case LLM_PROJ_MEMBER_COUNT: break;
+    }
+
+    GGML_ABORT("invalid projection member");
+}
+
+static const char * llm_proj_group_member_name(llm_proj_member member) {
+    switch (member) {
+        case LLM_PROJ_Q:    return "Qcur";
+        case LLM_PROJ_K:    return "Kcur";
+        case LLM_PROJ_V:    return "Vcur";
+        case LLM_PROJ_GATE: return "gate";
+        case LLM_PROJ_MEMBER_COUNT: break;
+    }
+
+    GGML_ABORT("invalid projection member");
+}
+
+static const char * llm_proj_group_fused_name(const llm_proj_group & group) {
+    switch (group.source) {
+        case LLM_PROJ_SOURCE_SELF_ATTN:
+            return group.has_member(LLM_PROJ_GATE) ? "wqkv_gate" : "wqkv";
+        case LLM_PROJ_SOURCE_CROSS_Q:
+            return "wq_cross";
+        case LLM_PROJ_SOURCE_CROSS_KV:
+            return group.has_member(LLM_PROJ_Q) ? "wqkv_cross" : "wkv_cross";
+        case LLM_PROJ_SOURCE_COUNT:
+            break;
+    }
+
+    GGML_ABORT("invalid projection source");
+}
+
+static const char * llm_proj_group_fused_bias_name(const llm_proj_group & group) {
+    switch (group.source) {
+        case LLM_PROJ_SOURCE_SELF_ATTN:
+            return "bqkv";
+        case LLM_PROJ_SOURCE_CROSS_Q:
+            return "bq_cross";
+        case LLM_PROJ_SOURCE_CROSS_KV:
+            return "bkv_cross";
+        case LLM_PROJ_SOURCE_COUNT:
+            break;
+    }
+
+    GGML_ABORT("invalid projection source");
+}
+
 ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
@@ -921,6 +988,97 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     }
 
     return res;
+}
+
+llm_proj_group_output llm_graph_context::build_proj_group(
+        const llm_proj_group & group,
+              ggml_tensor     * input,
+              int               il) const {
+    llm_proj_group_output output;
+
+    const bool has_lora = loras != nullptr && !loras->empty();
+    const bool use_fused = group.can_use_fused() && (!group.disable_fused_with_lora || !has_lora);
+
+    if (use_fused) {
+        ggml_tensor * fused = build_lora_mm(group.fused_weight, input);
+        cb(fused, llm_proj_group_fused_name(group), il);
+
+        if (group.fused_bias) {
+            fused = ggml_add(ctx0, fused, group.fused_bias);
+            cb(fused, llm_proj_group_fused_bias_name(group), il);
+        }
+
+        output.fused = fused;
+
+        for (uint32_t idx = 0; idx < LLM_PROJ_MEMBER_COUNT; ++idx) {
+            const auto member = static_cast<llm_proj_member>(idx);
+            if (!group.has_member(member)) {
+                continue;
+            }
+
+            ggml_tensor * cur = ggml_view_2d(
+                    ctx0,
+                    fused,
+                    group.widths[idx],
+                    n_tokens,
+                    fused->nb[1],
+                    group.offsets[idx] * ggml_element_size(fused));
+            cb(cur, llm_proj_group_member_name(member), il);
+
+            if (!group.fused_bias && group.biases[idx]) {
+                cur = ggml_add(ctx0, cur, group.biases[idx]);
+                cb(cur, llm_proj_group_member_name(member), il);
+            }
+
+            llm_proj_group_member_ref(output, member) = cur;
+        }
+
+        return output;
+    }
+
+    for (uint32_t idx = 0; idx < LLM_PROJ_MEMBER_COUNT; ++idx) {
+        const auto member = static_cast<llm_proj_member>(idx);
+        if (!group.has_member(member)) {
+            continue;
+        }
+
+        ggml_tensor * cur = build_lora_mm(group.weights[idx], input);
+        cb(cur, llm_proj_group_member_name(member), il);
+
+        if (group.biases[idx]) {
+            cur = ggml_add(ctx0, cur, group.biases[idx]);
+            cb(cur, llm_proj_group_member_name(member), il);
+        }
+
+        llm_proj_group_member_ref(output, member) = cur;
+    }
+
+    return output;
+}
+
+ggml_tensor * llm_graph_context::build_proj_reshape_3d(
+        const llm_proj_group        & group,
+        const llm_proj_group_output & output,
+              llm_proj_member         member,
+              int64_t                 ne0,
+              int64_t                 ne1,
+              int64_t                 ne2) const {
+    ggml_tensor * cur = llm_proj_group_member_ptr(output, member);
+    GGML_ASSERT(cur != nullptr);
+
+    if (output.fused != nullptr && cur->view_src == output.fused) {
+        return ggml_view_3d(
+                ctx0,
+                output.fused,
+                ne0,
+                ne1,
+                ne2,
+                ne0 * ggml_element_size(output.fused),
+                output.fused->nb[1],
+                group.offsets[static_cast<size_t>(member)] * ggml_element_size(output.fused));
+    }
+
+    return ggml_reshape_3d(ctx0, cur, ne0, ne1, ne2);
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm_id(

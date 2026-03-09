@@ -16,6 +16,9 @@ struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
+enum llm_proj_member : uint32_t;
+struct llm_proj_group;
+
 struct llama_cparams;
 
 struct llama_memory_context_i;
@@ -697,6 +700,14 @@ using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 // used in build_rs to properly order writes and avoid unnecessary copies
 using llm_graph_get_rows_fn = std::function<ggml_tensor * (ggml_context *, ggml_tensor * states, ggml_tensor * ids)>;
 
+struct llm_proj_group_output {
+    ggml_tensor * fused = nullptr;
+    ggml_tensor * q     = nullptr;
+    ggml_tensor * k     = nullptr;
+    ggml_tensor * v     = nullptr;
+    ggml_tensor * gate  = nullptr;
+};
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -768,6 +779,19 @@ struct llm_graph_context {
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur) const;
+
+    llm_proj_group_output build_proj_group(
+            const llm_proj_group & group,
+                  ggml_tensor     * input,
+                  int               il) const;
+
+    ggml_tensor * build_proj_reshape_3d(
+            const llm_proj_group        & group,
+            const llm_proj_group_output & output,
+                  llm_proj_member         member,
+                  int64_t                 ne0,
+                  int64_t                 ne1,
+                  int64_t                 ne2) const;
 
     // do mat_mul_id, while optionally apply lora
     ggml_tensor * build_lora_mm_id(

@@ -6800,23 +6800,49 @@ struct test_llama : public test_llm {
 
             // self-attention
             {
-                ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd);
-                ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd_gqa());
-                ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd_gqa());
+                struct ggml_tensor * Qcur;
+                struct ggml_tensor * Kcur;
+                struct ggml_tensor * Vcur;
 
-                // compute Q and K and RoPE them
-                struct ggml_tensor * Qcur = ggml_mul_mat(ctx, wq, cur);
-                struct ggml_tensor * Kcur = ggml_mul_mat(ctx, wk, cur);
-                struct ggml_tensor * Vcur = ggml_mul_mat(ctx, wv, cur);
+                if (fused) {
+                    ggml_tensor * wqkv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd + 2*hp.n_embd_gqa());
+                    ggml_tensor * qkv = ggml_mul_mat(ctx, wqkv, cur);
+
+                    Qcur = ggml_view_3d(ctx, qkv,
+                            hp.n_embd_head, hp.n_head, hp.n_tokens,
+                            hp.n_embd_head*sizeof(float), qkv->nb[1],
+                            0);
+                    Kcur = ggml_view_3d(ctx, qkv,
+                            hp.n_embd_head, hp.n_head_kv, hp.n_tokens,
+                            hp.n_embd_head*sizeof(float), qkv->nb[1],
+                            hp.n_embd*sizeof(float));
+                    Vcur = ggml_view_3d(ctx, qkv,
+                            hp.n_embd_head, hp.n_head_kv, hp.n_tokens,
+                            hp.n_embd_head*sizeof(float), qkv->nb[1],
+                            (hp.n_embd + hp.n_embd_gqa())*sizeof(float));
+                } else {
+                    ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd);
+                    ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd_gqa());
+                    ggml_tensor * wv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd_gqa());
+
+                    // compute Q and K and RoPE them
+                    Qcur = ggml_mul_mat(ctx, wq, cur);
+                    Kcur = ggml_mul_mat(ctx, wk, cur);
+                    Vcur = ggml_mul_mat(ctx, wv, cur);
+
+                    Qcur = ggml_reshape_3d(ctx, Qcur, hp.n_embd_head, hp.n_head,    hp.n_tokens);
+                    Kcur = ggml_reshape_3d(ctx, Kcur, hp.n_embd_head, hp.n_head_kv, hp.n_tokens);
+                    Vcur = ggml_reshape_3d(ctx, Vcur, hp.n_embd_head, hp.n_head_kv, hp.n_tokens);
+                }
 
                 Qcur = ggml_rope_ext(
-                    ctx, ggml_reshape_3d(ctx, Qcur, hp.n_embd_head, hp.n_head,    hp.n_tokens), inp_pos, nullptr,
+                    ctx, Qcur, inp_pos, nullptr,
                     hp.n_rot, 0, hp.n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
 
                 Kcur = ggml_rope_ext(
-                    ctx, ggml_reshape_3d(ctx, Kcur, hp.n_embd_head, hp.n_head_kv, hp.n_tokens), inp_pos, nullptr,
+                    ctx, Kcur, inp_pos, nullptr,
                     hp.n_rot, 0, hp.n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );

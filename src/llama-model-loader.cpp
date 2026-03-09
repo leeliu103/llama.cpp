@@ -12,6 +12,83 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+static std::array<int64_t, GGML_MAX_DIMS> llama_dims_from_list(const std::initializer_list<int64_t> & ne) {
+    std::array<int64_t, GGML_MAX_DIMS> dims;
+    dims.fill(1);
+
+    size_t i = 0;
+    for (int64_t dim : ne) {
+        if (i >= GGML_MAX_DIMS) {
+            break;
+        }
+        dims[i++] = dim;
+    }
+
+    return dims;
+}
+
+static ggml_context * llama_new_meta_ctx() {
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    return ggml_init(params);
+}
+
+static struct ggml_tensor * llama_create_meta_tensor(
+        ggml_context * ctx,
+        ggml_type type,
+        const std::array<int64_t, GGML_MAX_DIMS> & dims) {
+    return ggml_new_tensor(ctx, type, GGML_MAX_DIMS, dims.data());
+}
+
+static void llama_materialize_weight_data(
+        const llama_model_loader & ml,
+        const llama_model_loader::llama_tensor_weight & weight,
+        void * dst,
+        size_t dst_size) {
+    const size_t nbytes = ggml_nbytes(weight.tensor);
+    if (dst_size < nbytes) {
+        throw std::runtime_error(format("%s: destination buffer for tensor '%s' is too small", __func__, ggml_get_name(weight.tensor)));
+    }
+
+    if (weight.is_file_backed()) {
+        if (ml.use_mmap) {
+            const auto & mapping = ml.mappings.at(weight.idx);
+            memcpy(dst, (const uint8_t *) mapping->addr() + weight.offs, nbytes);
+        } else {
+            GGML_ASSERT(weight.idx < ml.files.size());
+            const auto & file = ml.files.at(weight.idx);
+            file->seek(weight.offs, SEEK_SET);
+            file->read_raw(dst, nbytes);
+        }
+
+        if (ml.check_tensors && !ggml_validate_row_data(weight.tensor->type, dst, nbytes)) {
+            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(weight.tensor)));
+        }
+        return;
+    }
+
+    size_t offset = 0;
+    for (const std::string & src_name : weight.src_names) {
+        const auto & src = ml.require_weight(src_name.c_str());
+        const size_t src_nbytes = ggml_nbytes(src.tensor);
+
+        if (offset + src_nbytes > nbytes) {
+            throw std::runtime_error(format("%s: synthetic tensor '%s' overflows its destination buffer", __func__, ggml_get_name(weight.tensor)));
+        }
+
+        llama_materialize_weight_data(ml, src, (uint8_t *) dst + offset, src_nbytes);
+        offset += src_nbytes;
+    }
+
+    if (offset != nbytes) {
+        throw std::runtime_error(format("%s: synthetic tensor '%s' populated %zu bytes but expected %zu", __func__, ggml_get_name(weight.tensor), offset, nbytes));
+    }
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -838,6 +915,98 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
     return cur;
 }
 
+struct ggml_tensor * llama_model_loader::register_concat_rows(
+        const std::string & name,
+        const std::initializer_list<int64_t> & ne,
+        const std::vector<std::string> & src_names) {
+    if (src_names.empty()) {
+        throw std::runtime_error(format("%s: synthetic tensor '%s' has no sources", __func__, name.c_str()));
+    }
+
+    if (weights_map.find(name) != weights_map.end()) {
+        throw std::runtime_error(format("%s: tensor '%s' is already registered", __func__, name.c_str()));
+    }
+
+    const auto dims = llama_dims_from_list(ne);
+    const struct ggml_tensor * first = require_tensor_meta(src_names.front());
+    int64_t rows_total = 0;
+
+    for (const std::string & src_name : src_names) {
+        const struct ggml_tensor * src = require_tensor_meta(src_name);
+        if (src->type != first->type) {
+            throw std::runtime_error(format("%s: concat rows tensor '%s' mixes %s and %s", __func__, name.c_str(), ggml_type_name(first->type), ggml_type_name(src->type)));
+        }
+        if (src->ne[0] != dims[0] || src->ne[2] != dims[2] || src->ne[3] != dims[3]) {
+            throw std::runtime_error(format("%s: concat rows tensor '%s' got incompatible shape from '%s'", __func__, name.c_str(), src_name.c_str()));
+        }
+        rows_total += src->ne[1];
+    }
+
+    if (rows_total != dims[1]) {
+        throw std::runtime_error(format("%s: concat rows tensor '%s' expected %lld rows but got %lld", __func__, name.c_str(), (long long) dims[1], (long long) rows_total));
+    }
+
+    ggml_context * ctx = llama_new_meta_ctx();
+    if (!ctx) {
+        throw std::runtime_error(format("%s: failed to allocate metadata context for '%s'", __func__, name.c_str()));
+    }
+    contexts.emplace_back(ctx);
+
+    ggml_tensor * tensor = llama_create_meta_tensor(ctx, first->type, dims);
+    ggml_set_name(tensor, name.c_str());
+
+    weights_map.emplace(name, llama_tensor_weight(LLAMA_TENSOR_SOURCE_CONCAT_ROWS, tensor, src_names));
+    n_tensors++;
+
+    return tensor;
+}
+
+struct ggml_tensor * llama_model_loader::register_concat_vector(
+        const std::string & name,
+        const std::initializer_list<int64_t> & ne,
+        const std::vector<std::string> & src_names) {
+    if (src_names.empty()) {
+        throw std::runtime_error(format("%s: synthetic tensor '%s' has no sources", __func__, name.c_str()));
+    }
+
+    if (weights_map.find(name) != weights_map.end()) {
+        throw std::runtime_error(format("%s: tensor '%s' is already registered", __func__, name.c_str()));
+    }
+
+    const auto dims = llama_dims_from_list(ne);
+    const struct ggml_tensor * first = require_tensor_meta(src_names.front());
+    int64_t width_total = 0;
+
+    for (const std::string & src_name : src_names) {
+        const struct ggml_tensor * src = require_tensor_meta(src_name);
+        if (src->type != first->type) {
+            throw std::runtime_error(format("%s: concat vector tensor '%s' mixes %s and %s", __func__, name.c_str(), ggml_type_name(first->type), ggml_type_name(src->type)));
+        }
+        if (src->ne[1] != 1 || src->ne[2] != 1 || src->ne[3] != 1) {
+            throw std::runtime_error(format("%s: concat vector tensor '%s' got non-vector source '%s'", __func__, name.c_str(), src_name.c_str()));
+        }
+        width_total += src->ne[0];
+    }
+
+    if (width_total != dims[0] || dims[1] != 1 || dims[2] != 1 || dims[3] != 1) {
+        throw std::runtime_error(format("%s: concat vector tensor '%s' has incompatible destination shape", __func__, name.c_str()));
+    }
+
+    ggml_context * ctx = llama_new_meta_ctx();
+    if (!ctx) {
+        throw std::runtime_error(format("%s: failed to allocate metadata context for '%s'", __func__, name.c_str()));
+    }
+    contexts.emplace_back(ctx);
+
+    ggml_tensor * tensor = llama_create_meta_tensor(ctx, first->type, dims);
+    ggml_set_name(tensor, name.c_str());
+
+    weights_map.emplace(name, llama_tensor_weight(LLAMA_TENSOR_SOURCE_CONCAT_VECTOR, tensor, src_names));
+    n_tensors++;
+
+    return tensor;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(struct ggml_context * ctx, const std::string & name, const std::initializer_list<int64_t> & ne, int flags) {
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, name.c_str());
     const struct ggml_tensor * cur = check_tensor_dims(name, ne, !(flags & TENSOR_NOT_REQUIRED));
@@ -937,7 +1106,7 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     *addr = mapping->addr();
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
-        if (!weight || weight->idx != idx) {
+        if (!weight || !weight->is_file_backed() || weight->idx != idx) {
             continue;
         }
         *first = std::min(*first, weight->offs);
@@ -947,25 +1116,20 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
-
-    if (use_mmap) {
-        const auto & mapping = mappings.at(w.idx);
-        if (cur->data == nullptr) {
-            cur->data = (uint8_t *)mapping->addr() + w.offs;
-        } else {
-            memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, ggml_nbytes(cur));
+    if (cur->data == nullptr) {
+        if (!w.is_file_backed() || !use_mmap) {
+            throw std::runtime_error(format("%s: tensor '%s' has no destination buffer", __func__, ggml_get_name(cur)));
         }
-    } else {
-        GGML_ASSERT(cur->data != nullptr);
-        GGML_ASSERT(w.idx < files.size());
-        const auto & file = files.at(w.idx);
-        file->seek(w.offs, SEEK_SET);
-        file->read_raw(cur->data, ggml_nbytes(cur));
+
+        const auto & mapping = mappings.at(w.idx);
+        cur->data = (uint8_t *) mapping->addr() + w.offs;
+        if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
+            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+        }
+        return;
     }
 
-    if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
-        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
-    }
+    llama_materialize_weight_data(*this, w, cur->data, ggml_nbytes(cur));
 }
 
 bool llama_model_loader::load_all_data(
@@ -1091,6 +1255,25 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (weight->is_synthetic()) {
+            void * dst = nullptr;
+            if (cur->data != nullptr && ggml_backend_buffer_is_host(cur->buffer)) {
+                dst = cur->data;
+            } else {
+                read_buf.resize(n_size);
+                dst = read_buf.data();
+            }
+
+            llama_materialize_weight_data(*this, *weight, dst, n_size);
+
+            if (dst != cur->data) {
+                ggml_backend_tensor_set(cur, dst, 0, n_size);
+            }
+
+            size_done += n_size;
+            continue;
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1244,6 +1427,17 @@ bool llama_model_loader::load_all_data(
     }
 
     return true;
+}
+
+bool llama_model_loader::ctx_has_synthetic_tensors(const struct ggml_context * ctx) const {
+    for (ggml_tensor * cur = ggml_get_first_tensor(const_cast<ggml_context *>(ctx)); cur != nullptr; cur = ggml_get_next_tensor(const_cast<ggml_context *>(ctx), cur)) {
+        const auto * weight = get_weight(ggml_get_name(cur));
+        if (weight && weight->is_synthetic()) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 std::string llama_model_loader::ftype_name() const {

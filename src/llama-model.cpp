@@ -2775,6 +2775,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     int max_n_tensors = ml.n_tensors;
     max_n_tensors += 1;         // duplicated output tensor
     max_n_tensors += n_layer*2; // duplicated rope freq tensors
+    max_n_tensors += n_layer*2; // synthetic fused projection tensors
     const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -2989,6 +2990,75 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
             }
         };
+
+        auto create_attn_proj_group = [&](llama_layer & layer, int bid, bool enable_fusion) {
+            auto & group = layer.proj_group(LLM_PROJ_SOURCE_SELF_ATTN);
+            group.clear(LLM_PROJ_SOURCE_SELF_ATTN);
+
+            const int64_t q_width = layer.wq ? layer.wq->ne[1] : 0;
+            const int64_t k_width = layer.wk ? layer.wk->ne[1] : 0;
+            const int64_t v_width = layer.wv ? layer.wv->ne[1] : 0;
+
+            group.set_member(LLM_PROJ_Q, layer.wq, layer.bq, q_width, 0);
+            group.set_member(LLM_PROJ_K, layer.wk, layer.bk, k_width, q_width);
+            group.set_member(LLM_PROJ_V, layer.wv, layer.bv, v_width, q_width + k_width);
+            group.disable_fused_with_lora = true;
+
+            if (!enable_fusion || layer.wq == nullptr || layer.wk == nullptr || layer.wv == nullptr) {
+                return;
+            }
+
+            const bool same_type =
+                    layer.wq->type == layer.wk->type &&
+                    layer.wq->type == layer.wv->type;
+            const bool same_input_width =
+                    layer.wq->ne[0] == layer.wk->ne[0] &&
+                    layer.wq->ne[0] == layer.wv->ne[0];
+
+            if (!same_type || !same_input_width) {
+                return;
+            }
+
+            group.eligible = true;
+
+            const int64_t total_width = q_width + k_width + v_width;
+
+            if (layer.wqkv == nullptr) {
+                const auto fused_weight_name = tn(LLM_TENSOR_ATTN_QKV, "weight", bid);
+                ml.register_concat_rows(
+                        fused_weight_name.str(),
+                        { layer.wq->ne[0], total_width },
+                        {
+                            tn(LLM_TENSOR_ATTN_Q, "weight", bid).str(),
+                            tn(LLM_TENSOR_ATTN_K, "weight", bid).str(),
+                            tn(LLM_TENSOR_ATTN_V, "weight", bid).str(),
+                        });
+                layer.wqkv = create_tensor(fused_weight_name, { layer.wq->ne[0], total_width }, 0);
+            }
+            group.fused_weight = layer.wqkv;
+
+            const bool has_all_biases =
+                    layer.bq != nullptr &&
+                    layer.bk != nullptr &&
+                    layer.bv != nullptr;
+            const bool same_bias_type =
+                    !has_all_biases ||
+                    (layer.bq->type == layer.bk->type && layer.bq->type == layer.bv->type);
+
+            if (has_all_biases && same_bias_type && layer.bqkv == nullptr) {
+                const auto fused_bias_name = tn(LLM_TENSOR_ATTN_QKV, "bias", bid);
+                ml.register_concat_vector(
+                        fused_bias_name.str(),
+                        { total_width },
+                        {
+                            tn(LLM_TENSOR_ATTN_Q, "bias", bid).str(),
+                            tn(LLM_TENSOR_ATTN_K, "bias", bid).str(),
+                            tn(LLM_TENSOR_ATTN_V, "bias", bid).str(),
+                        });
+                layer.bqkv = create_tensor(fused_bias_name, { total_width }, 0);
+            }
+            group.fused_bias = has_all_biases && same_bias_type ? layer.bqkv : nullptr;
+        };
         switch (arch) {
             case LLM_ARCH_LLAMA:
             case LLM_ARCH_REFACT:
@@ -3024,6 +3094,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa}, TENSOR_NOT_REQUIRED);
                         layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa}, TENSOR_NOT_REQUIRED);
                         layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd},     TENSOR_NOT_REQUIRED);
+
+                        create_attn_proj_group(layer, i, arch == LLM_ARCH_LLAMA || arch == LLM_ARCH_LLAMA_EMBED);
 
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
@@ -4960,6 +5032,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_qo_dim},   TENSOR_NOT_REQUIRED);
                         layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_kv_dim},   TENSOR_NOT_REQUIRED);
                         layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_kv_dim},   TENSOR_NOT_REQUIRED);
+
+                        create_attn_proj_group(layer, i, true);
 
                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
                         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
@@ -6943,6 +7017,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_head_kv * n_rot}, 0);
                         layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, 0);
 
+                        create_attn_proj_group(layer, i, true);
+
                         layer.ffn_gate_inp_b  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "bias", i), {n_expert}, 0);
                         layer.ffn_gate_exps_b = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "bias", i), {n_ff_exp, n_expert}, 0);
                         layer.ffn_down_exps_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "bias", i), {  n_embd, n_expert}, 0);
@@ -7752,7 +7828,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !ml.ctx_has_synthetic_tensors(ctx)) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
