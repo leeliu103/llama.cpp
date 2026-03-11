@@ -6,6 +6,12 @@
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
+#if defined(GGML_USE_HIP)
+#define GGML_CUDA_MEMCPY_DEFAULT hipMemcpyDefault
+#else
+#define GGML_CUDA_MEMCPY_DEFAULT cudaMemcpyDefault
+#endif
+
 static ggml_cuda_quant_layout ggml_cuda_make_identity_quant_layout(uint16_t block_size) {
     ggml_cuda_quant_layout layout = {};
     layout.block_size = block_size;
@@ -630,7 +636,7 @@ void ggml_cuda_convert_quant_block_aos_to_soa(
     GGML_ASSERT(ggml_cuda_get_quant_layout(type, &layout));
 
     if (layout.nsegments == 1 && layout.segment_src_offset[0] == 0 && layout.segment_size[0] == layout.block_size) {
-        CUDA_CHECK(cudaMemcpyAsync(dst_soa, src_aos, (size_t) nblocks * layout.block_size, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(dst_soa, src_aos, (size_t) nblocks * layout.block_size, GGML_CUDA_MEMCPY_DEFAULT, stream));
         return;
     }
 
@@ -654,7 +660,7 @@ void ggml_cuda_convert_quant_block_soa_to_aos(
     GGML_ASSERT(ggml_cuda_get_quant_layout(type, &layout));
 
     if (layout.nsegments == 1 && layout.segment_src_offset[0] == 0 && layout.segment_size[0] == layout.block_size) {
-        CUDA_CHECK(cudaMemcpyAsync(dst_aos, src_soa, (size_t) nblocks * layout.block_size, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(dst_aos, src_soa, (size_t) nblocks * layout.block_size, GGML_CUDA_MEMCPY_DEFAULT, stream));
         return;
     }
 
