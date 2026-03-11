@@ -437,6 +437,102 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+template <ggml_type type, bool has_bias>
+__launch_bounds__(calc_nwarps(1, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_reduce(
+        const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_col_dst, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t n_expert_used, const uint32_t ids_stride, const uint32_t x_bias_stride_channel,
+        const uint32_t mxfp4_q_offset) {
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int nwarps = calc_nwarps(1, table_id);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    GGML_UNUSED(nchannels_y);
+
+    const int tid = warp_size*threadIdx.y + threadIdx.x;
+    const int row = blockIdx.x;
+    const uint32_t token_idx = blockIdx.z;
+    const int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    const uint8_t * vx_e = nullptr;
+    const uint8_t * vx_q = nullptr;
+    if constexpr (type == GGML_TYPE_MXFP4) {
+        vx_q = (const uint8_t *) vx;
+        vx_e = vx_q + mxfp4_q_offset;
+    } else {
+        GGML_UNUSED(mxfp4_q_offset);
+    }
+
+    const float * x_bias = has_bias ? (const float *) fusion.x_bias : nullptr;
+    const float * x_scale = (const float *) fusion.x_scale;
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][warp_size];
+    float accum = 0.0f;
+
+    for (uint32_t expert_slot = 0; expert_slot < n_expert_used; ++expert_slot) {
+        const uint32_t channel_x = ids[expert_slot + token_idx*ids_stride];
+        const uint32_t channel_y = expert_slot;
+
+        float tmp = 0.0f;
+
+        const block_q8_1 * y = nullptr;
+        const block_q8_1_x4 * yx4 = nullptr;
+        if constexpr (type == GGML_TYPE_MXFP4) {
+            yx4 = ((const block_q8_1_x4 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+        } else {
+            y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+        }
+
+        const int kbx_offset = channel_x*stride_channel_x + row*stride_row_x;
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (tid % (qi/vdr));
+
+            if constexpr (type == GGML_TYPE_MXFP4) {
+                tmp += vec_dot_mxfp4_soa_q8_1_x4(vx_e, vx_q, yx4, kby, kbx_offset + kbx, kqs);
+            } else {
+                tmp += vec_dot_q_cuda(vx, &y[kby], kbx_offset + kbx, kqs);
+            }
+        }
+
+        if (threadIdx.y > 0) {
+            tmp_shared[threadIdx.y - 1][threadIdx.x] = tmp;
+        }
+        __syncthreads();
+
+        if (threadIdx.y == 0) {
+#pragma unroll
+            for (int l = 0; l < nwarps - 1; ++l) {
+                tmp += tmp_shared[l][threadIdx.x];
+            }
+
+            tmp = warp_reduce_sum<warp_size>(tmp);
+
+            if (threadIdx.x == 0) {
+                float value = tmp;
+                if constexpr (has_bias) {
+                    value += x_bias[channel_x*x_bias_stride_channel + row];
+                }
+                value *= x_scale[token_idx*fusion.x_scale_stride_col + expert_slot*fusion.x_scale_stride_channel];
+                accum += value;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (threadIdx.y == 0 && threadIdx.x == 0) {
+        dst[token_idx*stride_col_dst + row] = accum;
+    }
+}
+
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id) {
@@ -444,6 +540,34 @@ static std::pair<dim3, dim3> calc_launch_params(
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, calc_nwarps(ncols_dst, table_id), 1);
     return {block_nums, block_dims};
+}
+
+template <ggml_type type>
+static void launch_mul_mat_vec_q_moe_reduce(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int n_tokens, const int stride_row_x, const int stride_col_y,
+        const int stride_col_dst, const int stride_channel_x, const int stride_channel_y, const int n_expert_used,
+        const int ids_stride, const int x_bias_stride_channel, const uint32_t mxfp4_q_offset, cudaStream_t stream) {
+
+    GGML_ASSERT(fusion.x_scale != nullptr);
+
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
+    const auto dims = calc_launch_params(1, nrows_x, 1, n_tokens, warp_size, table_id);
+
+    if (fusion.x_bias != nullptr) {
+        mul_mat_vec_q_moe_reduce<type, true><<<dims.first, dims.second, 0, stream>>>(
+            vx, vy, ids, fusion, dst, ncols_x, n_expert_used, stride_row_x, stride_col_y,
+            stride_col_dst, stride_channel_x, stride_channel_y, n_expert_used, ids_stride,
+            x_bias_stride_channel, mxfp4_q_offset);
+        return;
+    }
+
+    mul_mat_vec_q_moe_reduce<type, false><<<dims.first, dims.second, 0, stream>>>(
+        vx, vy, ids, fusion, dst, ncols_x, n_expert_used, stride_row_x, stride_col_y,
+        stride_col_dst, stride_channel_x, stride_channel_y, n_expert_used, ids_stride,
+        x_bias_stride_channel, mxfp4_q_offset);
 }
 
 template<ggml_type type, int c_ncols_dst, bool is_multi_token_id = false>
@@ -847,6 +971,164 @@ void ggml_cuda_mul_mat_vec_q(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, mxfp4_q_offset, stream);
+}
+
+void ggml_cuda_mul_mat_vec_q_moe_reduce(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(        ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(fusion && fusion->x_scale);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    cudaStream_t stream = ctx.stream();
+
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    GGML_ASSERT(nb00 == ts_src0);
+    GGML_ASSERT(nb10 == ts_src1);
+    GGML_ASSERT(nb0  == ts_dst);
+    GGML_ASSERT(ids->nb[0] == ggml_type_size(ids->type));
+    GGML_ASSERT(ne11 == ids->ne[0]);
+    GGML_ASSERT(ne12 == ids->ne[1]);
+    GGML_ASSERT(ne0 == ne01);
+    GGML_ASSERT(ne1 == ids->ne[1]);
+    GGML_ASSERT(ne2 == 1 && ne3 == 1);
+    GGML_ASSERT(ne12 <= MMVQ_MMID_MAX_BATCH_SIZE);
+
+    const float   * src1_d = (const float   *) src1->data;
+    const int32_t *  ids_d = (const int32_t *) ids->data;
+    float         *  dst_d = (float         *) dst->data;
+
+    ggml_cuda_mm_fusion_args_device fusion_local{};
+
+    if (fusion->x_bias) {
+        GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
+        GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
+        GGML_ASSERT(fusion->x_bias->ne[1] == src0->ne[2]);
+        fusion_local.x_bias = fusion->x_bias->data;
+    }
+
+    GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(fusion->x_scale->nb[0] == sizeof(float));
+    GGML_ASSERT(fusion->x_scale->ne[0] == 1);
+    GGML_ASSERT(fusion->x_scale->ne[1] == ids->ne[0]);
+    GGML_ASSERT(fusion->x_scale->ne[2] == ids->ne[1]);
+    GGML_ASSERT(fusion->x_scale->ne[3] == ids->ne[2]);
+    fusion_local.x_scale = fusion->x_scale->data;
+    fusion_local.x_scale_stride_col     = fusion->x_scale->nb[2] / sizeof(float);
+    fusion_local.x_scale_stride_channel = fusion->x_scale->nb[1] / sizeof(float);
+    fusion_local.x_scale_stride_sample  = fusion->x_scale->nb[3] / sizeof(float);
+
+    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        const size_t size_data  = ggml_nbytes(src0);
+        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+        if (size_alloc > size_data) {
+            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+            GGML_ASSERT(!src0->view_src);
+            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+        }
+    }
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    {
+        const int64_t s11_src1 = src1->nb[1] / ts_src1;
+        const int64_t s12_src1 = src1->nb[2] / ts_src1;
+        const int64_t s13_src1 = src1->nb[3] / ts_src1;
+        if (src0->type == GGML_TYPE_MXFP4) {
+            quantize_row_q8_1_x4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11_src1, s12_src1, s13_src1, ne10_padded, ne11, ne12, ne13, stream);
+        } else {
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11_src1, s12_src1, s13_src1, ne10_padded, ne11, ne12, ne13, stream);
+        }
+    }
+
+    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s11 = src0->type == GGML_TYPE_MXFP4
+        ? (ne10_padded / (4 * QK8_1))
+        : (ne10_padded / QK8_1);
+    const int64_t s12 = ne11*s11;
+    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s1  = dst->nb[1] / ts_dst;
+
+    const int64_t ids_stride = ids->nb[1] / ggml_type_size(ids->type);
+    const uint64_t mxfp4_q_offset_u64 = src0->type == GGML_TYPE_MXFP4
+        ? ((uint64_t) ggml_nelements(src0) / ggml_blck_size(src0->type)) * (QK_MXFP4 / 2)
+        : 0;
+    GGML_ASSERT(mxfp4_q_offset_u64 <= UINT32_MAX);
+    const uint32_t mxfp4_q_offset = (uint32_t) mxfp4_q_offset_u64;
+
+    const uint32_t x_bias_stride_channel = fusion->x_bias ? fusion->x_bias->nb[1] / sizeof(float) : 0;
+
+    switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_Q4_0>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_Q4_1:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_Q4_1>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_Q5_0:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_Q5_0>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_Q5_1:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_Q5_1>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_Q8_0>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_MXFP4:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_MXFP4>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_Q2_K:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_Q2_K>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_Q3_K:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_Q3_K>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_Q4_K:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_Q4_K>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_Q5_K:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_Q5_K>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_Q6_K>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_IQ2_XXS>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_IQ2_XS>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_IQ2_S:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_IQ2_S>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_IQ3_XXS>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_IQ1_S:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_IQ1_S>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_IQ1_M:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_IQ1_M>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_IQ4_NL>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_IQ4_XS>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        case GGML_TYPE_IQ3_S:
+            launch_mul_mat_vec_q_moe_reduce<GGML_TYPE_IQ3_S>(src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, mxfp4_q_offset, stream);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

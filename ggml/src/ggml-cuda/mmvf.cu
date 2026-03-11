@@ -386,6 +386,104 @@ static __global__ void mul_mat_vec_f(
     }
 }
 
+template <typename T, int block_size, bool has_bias>
+static __global__ void mul_mat_vec_f_moe_reduce(
+        const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
+        const int ncols2, const int stride_row, const int stride_col_y2, const int stride_col_dst,
+        const int stride_channel_x, const int stride_channel_y, const int n_expert_used,
+        const int ids_stride, const int x_bias_stride_channel) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int token_idx = blockIdx.z;
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    extern __shared__ char data_mmv[];
+    float * buf_iw = (float *) data_mmv;
+
+    const float * x_bias = has_bias ? static_cast<const float *>(fusion.x_bias) : nullptr;
+    const float * x_scale = static_cast<const float *>(fusion.x_scale);
+
+    float accum = 0.0f;
+
+    for (int expert_slot = 0; expert_slot < n_expert_used; ++expert_slot) {
+        const int channel_x = ids[expert_slot + token_idx*ids_stride];
+        const int channel_y = expert_slot;
+
+        const T * x_row = x + channel_x*stride_channel_x + row*stride_row;
+        const float2 * y2 = (const float2 *) (y + channel_y*stride_channel_y + token_idx*stride_col_y2*2);
+
+        float sumf = 0.0f;
+
+        if constexpr (std::is_same_v<T, float>) {
+            const float2 * x2 = (const float2 *) x_row;
+            for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+                const float2 tmpx = x2[col2];
+                const float2 tmpy = y2[col2];
+                ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+                ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+            }
+        } else if constexpr (std::is_same_v<T, half>) {
+            const half2 * x2 = (const half2 *) x_row;
+            for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+                const float2 tmpx = __half22float2(x2[col2]);
+                const float2 tmpy = y2[col2];
+                ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+                ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+            }
+        } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
+#if defined(GGML_USE_HIP)
+            const int * x2 = (const int *) x_row;
+            for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+                const int tmpx = x2[col2];
+                const float2 tmpy = y2[col2];
+                const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
+                const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
+                ggml_cuda_mad(sumf, tmpx0, tmpy.x);
+                ggml_cuda_mad(sumf, tmpx1, tmpy.y);
+            }
+#else
+            const nv_bfloat162 * x2 = (const nv_bfloat162 *) x_row;
+            for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+                const nv_bfloat162 tmpx = x2[col2];
+                const float2 tmpy = y2[col2];
+                ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+                ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+            }
+#endif
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+
+        sumf = warp_reduce_sum<warp_size>(sumf);
+
+        if (block_size > warp_size) {
+            buf_iw[tid/warp_size] = sumf;
+            __syncthreads();
+
+            if (tid < warp_size) {
+                sumf = buf_iw[tid];
+                sumf = warp_reduce_sum<warp_size>(sumf);
+            }
+
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            float value = sumf;
+            if constexpr (has_bias) {
+                value += x_bias[channel_x*x_bias_stride_channel + row];
+            }
+            value *= x_scale[token_idx*fusion.x_scale_stride_col + expert_slot*fusion.x_scale_stride_channel];
+            accum += value;
+        }
+    }
+
+    if (tid == 0) {
+        dst[token_idx*stride_col_dst + row] = accum;
+    }
+}
+
 template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
 static void mul_mat_vec_f_switch_fusion(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -413,6 +511,34 @@ static void mul_mat_vec_f_switch_fusion(
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 
+}
+
+template<typename T, int block_size>
+static void launch_mul_mat_vec_f_moe_reduce_cuda(
+        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const int64_t ncols, const int64_t nrows, const int64_t n_tokens, const int64_t stride_row, const int64_t stride_col_y,
+        const int64_t stride_col_dst, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t n_expert_used,
+        const int64_t ids_stride, const int x_bias_stride_channel, cudaStream_t stream) {
+    GGML_ASSERT(ncols % 2 == 0);
+    GGML_ASSERT(stride_row % 2 == 0);
+    GGML_ASSERT(stride_col_y % 2 == 0);
+    GGML_ASSERT(fusion.x_scale != nullptr);
+
+    const dim3 block_nums(nrows, 1, n_tokens);
+    const dim3 block_dims(block_size, 1, 1);
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int nbytes_shared = block_size > warp_size ? warp_size*sizeof(float) : 0;
+
+    if (fusion.x_bias != nullptr) {
+        mul_mat_vec_f_moe_reduce<T, block_size, true><<<block_nums, block_dims, nbytes_shared, stream>>>(
+            x, y, ids, fusion, dst, ncols/2, stride_row, stride_col_y/2, stride_col_dst, stride_channel_x, stride_channel_y,
+            n_expert_used, ids_stride, x_bias_stride_channel);
+        return;
+    }
+
+    mul_mat_vec_f_moe_reduce<T, block_size, false><<<block_nums, block_dims, nbytes_shared, stream>>>(
+        x, y, ids, fusion, dst, ncols/2, stride_row, stride_col_y/2, stride_col_dst, stride_channel_x, stride_channel_y,
+        n_expert_used, ids_stride, x_bias_stride_channel);
 }
 
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
@@ -740,6 +866,128 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
+        } break;
+        default:
+            GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
+    }
+}
+
+void ggml_cuda_mul_mat_vec_f_moe_reduce(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion) {
+    GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(        ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(fusion && fusion->x_scale);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    GGML_ASSERT(nb00 == ts_src0);
+    GGML_ASSERT(nb10 == ts_src1);
+    GGML_ASSERT(ids->nb[0] == ggml_type_size(ids->type));
+    GGML_ASSERT(nb0 == ts_dst);
+    GGML_ASSERT(ne11 == ids->ne[0]);
+    GGML_ASSERT(ne12 == ids->ne[1]);
+    GGML_ASSERT(ne0 == ne01);
+    GGML_ASSERT(ne1 == ids->ne[1]);
+    GGML_ASSERT(ne2 == 1 && ne3 == 1);
+    GGML_ASSERT(ne12 <= MMVF_MAX_BATCH_SIZE);
+
+    const float   * src1_d =       (const float   *) src1->data;
+    const int32_t *  ids_d =       (const int32_t *)  ids->data;
+    float         *  dst_d =       (float         *)  dst->data;
+
+    ggml_cuda_mm_fusion_args_device fusion_local{};
+
+    if (fusion->x_bias) {
+        GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
+        GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
+        GGML_ASSERT(fusion->x_bias->ne[1] == src0->ne[2]);
+        fusion_local.x_bias = fusion->x_bias->data;
+    }
+
+    GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(fusion->x_scale->nb[0] == sizeof(float));
+    GGML_ASSERT(fusion->x_scale->ne[0] == 1);
+    GGML_ASSERT(fusion->x_scale->ne[1] == ids->ne[0]);
+    GGML_ASSERT(fusion->x_scale->ne[2] == ids->ne[1]);
+    GGML_ASSERT(fusion->x_scale->ne[3] == ids->ne[2]);
+    fusion_local.x_scale = fusion->x_scale->data;
+    fusion_local.x_scale_stride_col     = fusion->x_scale->nb[2] / sizeof(float);
+    fusion_local.x_scale_stride_channel = fusion->x_scale->nb[1] / sizeof(float);
+    fusion_local.x_scale_stride_sample  = fusion->x_scale->nb[3] / sizeof(float);
+
+    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s11 = src1->nb[1] / ts_src1;
+    const int64_t s1  =  dst->nb[1] / ts_dst;
+    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s12 = src1->nb[2] / ts_src1;
+
+    const int64_t ids_stride = ids->nb[1] / ggml_type_size(ids->type);
+    const int x_bias_stride_channel = fusion->x_bias ? fusion->x_bias->nb[1] / sizeof(float) : 0;
+
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    int64_t block_size_best = warp_size;
+    int64_t niter_best      = (ne00 + 2*warp_size - 1) / (2*warp_size);
+    int64_t max_block_size  = 256;
+    if (ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
+        max_block_size = 128;
+    }
+    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
+        const int64_t niter = (ne00 + 2*block_size - 1) / (2*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+
+    switch (src0->type) {
+        case GGML_TYPE_F32: {
+            const float * src0_d = (const float *) src0->data;
+            switch (block_size_best) {
+                case  32: launch_mul_mat_vec_f_moe_reduce_cuda<float,  32>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case  64: launch_mul_mat_vec_f_moe_reduce_cuda<float,  64>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case  96: launch_mul_mat_vec_f_moe_reduce_cuda<float,  96>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 128: launch_mul_mat_vec_f_moe_reduce_cuda<float, 128>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 160: launch_mul_mat_vec_f_moe_reduce_cuda<float, 160>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 192: launch_mul_mat_vec_f_moe_reduce_cuda<float, 192>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 224: launch_mul_mat_vec_f_moe_reduce_cuda<float, 224>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 256: launch_mul_mat_vec_f_moe_reduce_cuda<float, 256>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                default: GGML_ABORT("fatal error");
+            }
+        } break;
+        case GGML_TYPE_F16: {
+            const half * src0_d = (const half *) src0->data;
+            switch (block_size_best) {
+                case  32: launch_mul_mat_vec_f_moe_reduce_cuda<half,  32>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case  64: launch_mul_mat_vec_f_moe_reduce_cuda<half,  64>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case  96: launch_mul_mat_vec_f_moe_reduce_cuda<half,  96>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 128: launch_mul_mat_vec_f_moe_reduce_cuda<half, 128>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 160: launch_mul_mat_vec_f_moe_reduce_cuda<half, 160>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 192: launch_mul_mat_vec_f_moe_reduce_cuda<half, 192>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 224: launch_mul_mat_vec_f_moe_reduce_cuda<half, 224>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 256: launch_mul_mat_vec_f_moe_reduce_cuda<half, 256>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                default: GGML_ABORT("fatal error");
+            }
+        } break;
+        case GGML_TYPE_BF16: {
+            const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0->data;
+            switch (block_size_best) {
+                case  32: launch_mul_mat_vec_f_moe_reduce_cuda<nv_bfloat16,  32>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case  64: launch_mul_mat_vec_f_moe_reduce_cuda<nv_bfloat16,  64>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case  96: launch_mul_mat_vec_f_moe_reduce_cuda<nv_bfloat16,  96>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 128: launch_mul_mat_vec_f_moe_reduce_cuda<nv_bfloat16, 128>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 160: launch_mul_mat_vec_f_moe_reduce_cuda<nv_bfloat16, 160>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 192: launch_mul_mat_vec_f_moe_reduce_cuda<nv_bfloat16, 192>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 224: launch_mul_mat_vec_f_moe_reduce_cuda<nv_bfloat16, 224>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                case 256: launch_mul_mat_vec_f_moe_reduce_cuda<nv_bfloat16, 256>(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ne12, s01, s12, s1, s02, s11, ne11, ids_stride, x_bias_stride_channel, ctx.stream()); break;
+                default: GGML_ABORT("fatal error");
+            }
         } break;
         default:
             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
