@@ -629,8 +629,8 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
 
-    if (tensor->type == GGML_TYPE_MXFP4) {
-        // PoC: overwrite MXFP4 device storage to SoA on upload.
+    if (ggml_cuda_quant_layout_is_split(tensor->type)) {
+        // Split quant layouts require full-tensor upload before AoS -> SoA conversion.
         GGML_ASSERT(offset == 0);
         GGML_ASSERT(size == ggml_nbytes(tensor));
 
@@ -639,7 +639,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         CUDA_CHECK(cudaMemcpyAsync(tmp_src, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
 
         const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
-        convert_block_mxfp4_aos_to_soa(tmp_src, tensor->data, nblocks, cudaStreamPerThread);
+        ggml_cuda_convert_quant_block_aos_to_soa(tensor->type, tmp_src, tensor->data, nblocks, cudaStreamPerThread);
         CUDA_CHECK(cudaGetLastError());
 
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -654,7 +654,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
-    if (tensor->type == GGML_TYPE_MXFP4) {
+    if (ggml_cuda_quant_layout_is_split(tensor->type)) {
         ggml_cuda_set_device(ctx->device);
 
         const size_t nbytes = ggml_nbytes(tensor);
@@ -664,7 +664,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         CUDA_CHECK(ggml_cuda_device_malloc(&tmp_dst, nbytes, ctx->device));
 
         const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
-        convert_block_mxfp4_soa_to_aos(tensor->data, tmp_dst, nblocks, cudaStreamPerThread);
+        ggml_cuda_convert_quant_block_soa_to_aos(tensor->type, tensor->data, tmp_dst, nblocks, cudaStreamPerThread);
         CUDA_CHECK(cudaGetLastError());
 
         CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tmp_dst + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));

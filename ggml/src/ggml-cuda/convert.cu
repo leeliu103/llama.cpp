@@ -1,9 +1,91 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
 
+#include <cstddef>
 #include <cstdint>
 
 #define CUDA_Q8_0_NE_ALIGN 2048
+
+static ggml_cuda_quant_layout ggml_cuda_make_identity_quant_layout(uint16_t block_size) {
+    ggml_cuda_quant_layout layout = {};
+    layout.block_size = block_size;
+    layout.nsegments = 1;
+    layout.segment_src_offset[0] = 0;
+    layout.segment_size[0] = block_size;
+    return layout;
+}
+
+static ggml_cuda_quant_layout ggml_cuda_make_mxfp4_quant_layout(void) {
+    ggml_cuda_quant_layout layout = {};
+    layout.block_size = sizeof(block_mxfp4);
+    layout.nsegments = 2;
+    // Keep SoA order identical to the current MMVQ/MMQ expectation: q plane first, e plane second.
+    layout.segment_src_offset[0] = offsetof(block_mxfp4, qs);
+    layout.segment_size[0] = QK_MXFP4 / 2;
+    layout.segment_src_offset[1] = offsetof(block_mxfp4, e);
+    layout.segment_size[1] = sizeof(uint8_t);
+    return layout;
+}
+
+bool ggml_cuda_get_quant_layout(ggml_type type, ggml_cuda_quant_layout * layout) {
+    if (layout == nullptr) {
+        return false;
+    }
+
+    switch (type) {
+        case GGML_TYPE_Q4_0:    *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_q4_0));    return true;
+        case GGML_TYPE_Q4_1:    *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_q4_1));    return true;
+        case GGML_TYPE_Q5_0:    *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_q5_0));    return true;
+        case GGML_TYPE_Q5_1:    *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_q5_1));    return true;
+        case GGML_TYPE_Q8_0:    *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_q8_0));    return true;
+        case GGML_TYPE_MXFP4:   *layout = ggml_cuda_make_mxfp4_quant_layout();                          return true;
+        case GGML_TYPE_Q2_K:    *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_q2_K));    return true;
+        case GGML_TYPE_Q3_K:    *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_q3_K));    return true;
+        case GGML_TYPE_Q4_K:    *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_q4_K));    return true;
+        case GGML_TYPE_Q5_K:    *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_q5_K));    return true;
+        case GGML_TYPE_Q6_K:    *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_q6_K));    return true;
+        case GGML_TYPE_IQ2_XXS: *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_iq2_xxs)); return true;
+        case GGML_TYPE_IQ2_XS:  *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_iq2_xs));  return true;
+        case GGML_TYPE_IQ2_S:   *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_iq2_s));   return true;
+        case GGML_TYPE_IQ3_XXS: *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_iq3_xxs)); return true;
+        case GGML_TYPE_IQ3_S:   *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_iq3_s));   return true;
+        case GGML_TYPE_IQ1_S:   *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_iq1_s));   return true;
+        case GGML_TYPE_IQ1_M:   *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_iq1_m));   return true;
+        case GGML_TYPE_IQ4_NL:  *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_iq4_nl));  return true;
+        case GGML_TYPE_IQ4_XS:  *layout = ggml_cuda_make_identity_quant_layout(sizeof(block_iq4_xs));  return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_cuda_quant_layout_is_split(ggml_type type) {
+    ggml_cuda_quant_layout layout = {};
+    return ggml_cuda_get_quant_layout(type, &layout) && layout.nsegments > 1;
+}
+
+uint64_t ggml_cuda_quant_layout_get_segment_offset(ggml_type type, int64_t nelements, int segment) {
+    ggml_cuda_quant_layout layout = {};
+    if (!ggml_cuda_get_quant_layout(type, &layout)) {
+        return 0;
+    }
+
+    GGML_ASSERT(segment >= 0);
+    GGML_ASSERT(segment <= layout.nsegments);
+    if (segment == 0) {
+        return 0;
+    }
+
+    const int64_t blck_size = ggml_blck_size(type);
+    GGML_ASSERT(blck_size > 0);
+    GGML_ASSERT(nelements % blck_size == 0);
+    const uint64_t nblocks = (uint64_t) (nelements / blck_size);
+
+    uint64_t per_block_offset = 0;
+    for (int i = 0; i < segment; ++i) {
+        per_block_offset += layout.segment_size[i];
+    }
+    return nblocks * per_block_offset;
+}
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y,
@@ -486,49 +568,56 @@ static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_
     }
 }
 
-static __global__ void kernel_convert_block_mxfp4_aos_to_soa(
-        const block_mxfp4 * src,
-        uint8_t * dst_e,
-        uint8_t * dst_q,
-        int64_t nblocks) {
+static __global__ void kernel_convert_quant_block_aos_to_soa(
+        const uint8_t * src_aos,
+        uint8_t * dst_soa,
+        int64_t nblocks,
+        ggml_cuda_quant_layout layout) {
     const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (ib >= nblocks) {
         return;
     }
 
-    const block_mxfp4 b = src[ib];
-    dst_e[ib] = b.e;
-
-    uint8_t * q = dst_q + ib * (QK_MXFP4 / 2);
-#pragma unroll
-    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
-        q[i] = b.qs[i];
+    const uint8_t * src_block = src_aos + ib * layout.block_size;
+    int64_t segment_offset = 0;
+    for (int s = 0; s < layout.nsegments; ++s) {
+        const uint16_t segment_size = layout.segment_size[s];
+        const uint16_t src_offset = layout.segment_src_offset[s];
+        const uint8_t * src = src_block + src_offset;
+        uint8_t * dst = dst_soa + segment_offset * nblocks + ib * segment_size;
+        for (int i = 0; i < segment_size; ++i) {
+            dst[i] = src[i];
+        }
+        segment_offset += segment_size;
     }
 }
 
-static __global__ void kernel_convert_block_mxfp4_soa_to_aos(
-        const uint8_t * src_e,
-        const uint8_t * src_q,
-        block_mxfp4 * dst,
-        int64_t nblocks) {
+static __global__ void kernel_convert_quant_block_soa_to_aos(
+        const uint8_t * src_soa,
+        uint8_t * dst_aos,
+        int64_t nblocks,
+        ggml_cuda_quant_layout layout) {
     const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (ib >= nblocks) {
         return;
     }
 
-    block_mxfp4 b;
-    b.e = src_e[ib];
-
-    const uint8_t * q = src_q + ib * (QK_MXFP4 / 2);
-#pragma unroll
-    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
-        b.qs[i] = q[i];
+    uint8_t * dst_block = dst_aos + ib * layout.block_size;
+    int64_t segment_offset = 0;
+    for (int s = 0; s < layout.nsegments; ++s) {
+        const uint16_t segment_size = layout.segment_size[s];
+        const uint16_t dst_offset = layout.segment_src_offset[s];
+        const uint8_t * src = src_soa + segment_offset * nblocks + ib * segment_size;
+        uint8_t * dst = dst_block + dst_offset;
+        for (int i = 0; i < segment_size; ++i) {
+            dst[i] = src[i];
+        }
+        segment_offset += segment_size;
     }
-
-    dst[ib] = b;
 }
 
-void convert_block_mxfp4_aos_to_soa(
+void ggml_cuda_convert_quant_block_aos_to_soa(
+        ggml_type type,
         const void * src_aos,
         void * dst_soa,
         int64_t nblocks,
@@ -537,18 +626,22 @@ void convert_block_mxfp4_aos_to_soa(
         return;
     }
 
-    const block_mxfp4 * src = (const block_mxfp4 *) src_aos;
-    uint8_t * dst = (uint8_t *) dst_soa;
-    const int64_t qbytes = nblocks * (QK_MXFP4 / 2);
-    uint8_t * dst_q = dst;
-    uint8_t * dst_e = dst + qbytes;
+    ggml_cuda_quant_layout layout = {};
+    GGML_ASSERT(ggml_cuda_get_quant_layout(type, &layout));
+
+    if (layout.nsegments == 1 && layout.segment_src_offset[0] == 0 && layout.segment_size[0] == layout.block_size) {
+        CUDA_CHECK(cudaMemcpyAsync(dst_soa, src_aos, (size_t) nblocks * layout.block_size, cudaMemcpyDeviceToDevice, stream));
+        return;
+    }
 
     constexpr int nth = 256;
     const int nbl = (nblocks + nth - 1) / nth;
-    kernel_convert_block_mxfp4_aos_to_soa<<<nbl, nth, 0, stream>>>(src, dst_e, dst_q, nblocks);
+    kernel_convert_quant_block_aos_to_soa<<<nbl, nth, 0, stream>>>(
+            (const uint8_t *) src_aos, (uint8_t *) dst_soa, nblocks, layout);
 }
 
-void convert_block_mxfp4_soa_to_aos(
+void ggml_cuda_convert_quant_block_soa_to_aos(
+        ggml_type type,
         const void * src_soa,
         void * dst_aos,
         int64_t nblocks,
@@ -557,15 +650,34 @@ void convert_block_mxfp4_soa_to_aos(
         return;
     }
 
-    const uint8_t * src = (const uint8_t *) src_soa;
-    const int64_t qbytes = nblocks * (QK_MXFP4 / 2);
-    const uint8_t * src_q = src;
-    const uint8_t * src_e = src + qbytes;
-    block_mxfp4 * dst = (block_mxfp4 *) dst_aos;
+    ggml_cuda_quant_layout layout = {};
+    GGML_ASSERT(ggml_cuda_get_quant_layout(type, &layout));
+
+    if (layout.nsegments == 1 && layout.segment_src_offset[0] == 0 && layout.segment_size[0] == layout.block_size) {
+        CUDA_CHECK(cudaMemcpyAsync(dst_aos, src_soa, (size_t) nblocks * layout.block_size, cudaMemcpyDeviceToDevice, stream));
+        return;
+    }
 
     constexpr int nth = 256;
     const int nbl = (nblocks + nth - 1) / nth;
-    kernel_convert_block_mxfp4_soa_to_aos<<<nbl, nth, 0, stream>>>(src_e, src_q, dst, nblocks);
+    kernel_convert_quant_block_soa_to_aos<<<nbl, nth, 0, stream>>>(
+            (const uint8_t *) src_soa, (uint8_t *) dst_aos, nblocks, layout);
+}
+
+void convert_block_mxfp4_aos_to_soa(
+        const void * src_aos,
+        void * dst_soa,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    ggml_cuda_convert_quant_block_aos_to_soa(GGML_TYPE_MXFP4, src_aos, dst_soa, nblocks, stream);
+}
+
+void convert_block_mxfp4_soa_to_aos(
+        const void * src_soa,
+        void * dst_aos,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    ggml_cuda_convert_quant_block_soa_to_aos(GGML_TYPE_MXFP4, src_soa, dst_aos, nblocks, stream);
 }
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>

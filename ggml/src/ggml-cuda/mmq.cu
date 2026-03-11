@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "convert.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
@@ -104,9 +105,7 @@ void ggml_cuda_mul_mat_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    const uint64_t mxfp4_q_offset_u64 = src0->type == GGML_TYPE_MXFP4
-        ? ((uint64_t) ggml_nelements(src0) / ggml_blck_size(src0->type)) * (QK_MXFP4 / 2)
-        : 0;
+    const uint64_t mxfp4_q_offset_u64 = ggml_cuda_quant_layout_get_segment_offset(src0->type, ggml_nelements(src0), 1);
     GGML_ASSERT(mxfp4_q_offset_u64 <= UINT32_MAX);
     const uint32_t mxfp4_q_offset = (uint32_t) mxfp4_q_offset_u64;
 
@@ -241,9 +240,7 @@ void ggml_cuda_op_mul_mat_q(
 
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
-    const uint64_t mxfp4_q_offset_u64 = src0->type == GGML_TYPE_MXFP4
-        ? ((uint64_t) ggml_nelements(src0) / ggml_blck_size(src0->type)) * (QK_MXFP4 / 2)
-        : 0;
+    const uint64_t mxfp4_q_offset_u64 = ggml_cuda_quant_layout_get_segment_offset(src0->type, ggml_nelements(src0), 1);
     GGML_ASSERT(mxfp4_q_offset_u64 <= UINT32_MAX);
     const uint32_t mxfp4_q_offset = (uint32_t) mxfp4_q_offset_u64;
 

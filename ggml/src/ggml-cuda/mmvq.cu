@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "convert.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -799,9 +800,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
-    const uint64_t mxfp4_q_offset_u64 = src0->type == GGML_TYPE_MXFP4
-        ? ((uint64_t) ggml_nelements(src0) / ggml_blck_size(src0->type)) * (QK_MXFP4 / 2)
-        : 0;
+    const uint64_t mxfp4_q_offset_u64 = ggml_cuda_quant_layout_get_segment_offset(src0->type, ggml_nelements(src0), 1);
     GGML_ASSERT(mxfp4_q_offset_u64 <= UINT32_MAX);
     const uint32_t mxfp4_q_offset = (uint32_t) mxfp4_q_offset_u64;
 
