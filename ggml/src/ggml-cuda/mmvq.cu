@@ -211,18 +211,22 @@ static __global__ void mul_mat_vec_q(
 
     bool use_gate = false;
     bool use_bias = false;
+    bool use_scale = false;
     bool use_gate_bias = false;
     const void * vgate = nullptr;
     const float * x_bias = nullptr;
+    const float * x_scale = nullptr;
     const float * gate_bias = nullptr;
     ggml_glu_op active_glu;
 
     if constexpr (has_fusion) {
         use_gate      = fusion.gate      != nullptr;
         use_bias      = fusion.x_bias    != nullptr;
+        use_scale     = fusion.x_scale   != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
         vgate         = fusion.gate;
         x_bias        = (const float *) fusion.x_bias;
+        x_scale       = (const float *) fusion.x_scale;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
     }
@@ -246,6 +250,7 @@ static __global__ void mul_mat_vec_q(
 
 
     float x_biases[ncols_dst]    = { 0.0f };
+    float x_scales[ncols_dst]    = { 1.0f };
     float gate_biases[ncols_dst] = { 0.0f };
     if constexpr (has_fusion) {
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
@@ -258,6 +263,17 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
                     x_biases[j] = x_bias[j * stride_col_dst + threadIdx.x];
+                }
+            }
+        }
+        if (use_scale) {
+            x_scale = x_scale + sample_dst*fusion.x_scale_stride_sample + channel_dst*fusion.x_scale_stride_channel;
+            if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+                (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const uint32_t col_scale = is_multi_token_id ? token_idx : j;
+                    x_scales[j] = x_scale[col_scale * fusion.x_scale_stride_col];
                 }
             }
         }
@@ -408,13 +424,16 @@ static __global__ void mul_mat_vec_q(
                             break;
                     }
                 }
+                if (use_scale) {
+                    result *= x_scales[j];
+                }
             }
             dst[j*stride_col_dst + threadIdx.x] = result;
         }
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, active_glu, gate_bias, x_bias, tmp_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_scale, use_gate_bias, active_glu, gate_bias, x_bias, x_scale, tmp_gate);
     }
 }
 
@@ -438,7 +457,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t ids_stride,
         const uint32_t mxfp4_q_offset, cudaStream_t stream) {
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.x_scale != nullptr || fusion.gate_bias != nullptr;
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             mul_mat_vec_q<type, c_ncols_dst, true, is_multi_token_id><<<block_nums, block_dims, nbytes_shared, stream>>>
@@ -479,7 +498,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
     const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.x_scale != nullptr || fusion.gate_bias != nullptr;
     const bool has_ids = ids != nullptr;
 
     if (has_ids && ncols_dst > 1) {
@@ -703,7 +722,7 @@ static void mul_mat_vec_q_switch_type(
 
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, bool allow_multi_token_mmid_fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -730,7 +749,7 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
-        GGML_ASSERT( !ids || dst->ne[2] == 1);
+        GGML_ASSERT( !ids || (allow_multi_token_mmid_fusion ? dst->ne[2] <= MMVQ_MMID_MAX_BATCH_SIZE : dst->ne[2] == 1));
         GGML_ASSERT(  ids || dst->ne[1] == 1);
 
         if (fusion->x_bias) {
@@ -738,6 +757,24 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
             fusion_local.x_bias = fusion->x_bias->data;
+        }
+        if (fusion->x_scale) {
+            GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
+            GGML_ASSERT(fusion->x_scale->nb[0] == sizeof(float));
+            GGML_ASSERT(fusion->x_scale->ne[0] == 1);
+            GGML_ASSERT(fusion->x_scale->ne[1] == dst->ne[1]);
+            GGML_ASSERT(fusion->x_scale->ne[2] == dst->ne[2]);
+            GGML_ASSERT(fusion->x_scale->ne[3] == dst->ne[3]);
+            fusion_local.x_scale = fusion->x_scale->data;
+            if (ids) {
+                fusion_local.x_scale_stride_col     = fusion->x_scale->nb[2] / sizeof(float);
+                fusion_local.x_scale_stride_channel = fusion->x_scale->nb[1] / sizeof(float);
+                fusion_local.x_scale_stride_sample  = fusion->x_scale->nb[3] / sizeof(float);
+            } else {
+                fusion_local.x_scale_stride_col     = fusion->x_scale->nb[1] / sizeof(float);
+                fusion_local.x_scale_stride_channel = fusion->x_scale->nb[2] / sizeof(float);
+                fusion_local.x_scale_stride_sample  = fusion->x_scale->nb[3] / sizeof(float);
+            }
         }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
