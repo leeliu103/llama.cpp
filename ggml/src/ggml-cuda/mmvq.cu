@@ -231,6 +231,10 @@ static __global__ void mul_mat_vec_q(
     const uint8_t * vx_q = nullptr;
     const uint8_t * vg_e = nullptr;
     const uint8_t * vg_q = nullptr;
+    const int8_t * vx_q8_q = nullptr;
+    const ggml_half * vx_q8_d = nullptr;
+    const int8_t * vg_q8_q = nullptr;
+    const ggml_half * vg_q8_d = nullptr;
     if constexpr (type == GGML_TYPE_MXFP4) {
         vx_q = (const uint8_t *) vx;
         vx_e = vx_q + mxfp4_q_offset;
@@ -238,6 +242,17 @@ static __global__ void mul_mat_vec_q(
             if (use_gate) {
                 vg_q = (const uint8_t *) vgate;
                 vg_e = vg_q + mxfp4_q_offset;
+            }
+        }
+    } else if constexpr (type == GGML_TYPE_Q8_0) {
+        if (mxfp4_q_offset != 0) {
+            vx_q8_q = (const int8_t *) vx;
+            vx_q8_d = (const ggml_half *) (((const char *) vx) + mxfp4_q_offset);
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    vg_q8_q = (const int8_t *) vgate;
+                    vg_q8_d = (const ggml_half *) (((const char *) vgate) + mxfp4_q_offset);
+                }
             }
         }
     } else {
@@ -307,6 +322,11 @@ static __global__ void mul_mat_vec_q(
                 if constexpr (type == GGML_TYPE_MXFP4) {
                     const block_q8_1_x4 * yb_x4 = &yx4[j*stride_col_y];
                     tmp[j][i] += vec_dot_mxfp4_soa_q8_1_x4(vx_e, vx_q, yb_x4, kby, kbx_x, kqs);
+                } else if constexpr (type == GGML_TYPE_Q8_0) {
+                    const block_q8_1 * yb = &y[j*stride_col_y + kby];
+                    tmp[j][i] += vx_q8_d
+                        ? vec_dot_q8_0_soa_q8_1(vx_q8_q, vx_q8_d, yb, kbx_x, kqs)
+                        : vec_dot_q_cuda(vx, yb, kbx_x, kqs);
                 } else {
                     const block_q8_1 * yb = &y[j*stride_col_y + kby];
                     tmp[j][i] += vec_dot_q_cuda(vx, yb, kbx_x, kqs);
@@ -316,6 +336,11 @@ static __global__ void mul_mat_vec_q(
                         if constexpr (type == GGML_TYPE_MXFP4) {
                             const block_q8_1_x4 * yb_x4 = &yx4[j*stride_col_y];
                             tmp_gate[j][i] += vec_dot_mxfp4_soa_q8_1_x4(vg_e, vg_q, yb_x4, kby, kbx_x, kqs);
+                        } else if constexpr (type == GGML_TYPE_Q8_0) {
+                            const block_q8_1 * yb = &y[j*stride_col_y + kby];
+                            tmp_gate[j][i] += vg_q8_d
+                                ? vec_dot_q8_0_soa_q8_1(vg_q8_q, vg_q8_d, yb, kbx_x, kqs)
+                                : vec_dot_q_cuda(vgate, yb, kbx_x, kqs);
                         } else {
                             const block_q8_1 * yb = &y[j*stride_col_y + kby];
                             tmp_gate[j][i] += vec_dot_q_cuda(vgate, yb, kbx_x, kqs);
@@ -799,9 +824,12 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+    const bool use_q8_0_soa = ggml_cuda_tensor_uses_q8_0_soa(src0);
     const uint64_t mxfp4_q_offset_u64 = src0->type == GGML_TYPE_MXFP4
         ? ((uint64_t) ggml_nelements(src0) / ggml_blck_size(src0->type)) * (QK_MXFP4 / 2)
-        : 0;
+        : use_q8_0_soa
+            ? (uint64_t) ggml_nelements(src0)
+            : 0;
     GGML_ASSERT(mxfp4_q_offset_u64 <= UINT32_MAX);
     const uint32_t mxfp4_q_offset = (uint32_t) mxfp4_q_offset_u64;
 
@@ -835,13 +863,14 @@ void ggml_cuda_op_mul_mat_vec_q(
     const int stride_row_x = ne00 / ggml_blck_size(src0->type);
     const int stride_col_y = src1_padded_row_size / QK8_1;
 
+    const bool use_q8_0_soa = ggml_cuda_tensor_uses_q8_0_soa(src0);
     GGML_ASSERT(src0->type != GGML_TYPE_MXFP4 && "MXFP4 SoA split helper not wired yet");
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
     mul_mat_vec_q_switch_type(
         src0_dd_i, src0->type, src1_ddq_i, nullptr, fusion_local, dst_dd_i, ne00, row_diff, src1_ncols, stride_row_x, stride_col_y, nrows_dst,
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
-        0 /* mxfp4_q_offset */, stream);
+        use_q8_0_soa ? (uint32_t) (row_diff * ne00) : 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }

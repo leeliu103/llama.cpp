@@ -568,6 +568,88 @@ void convert_block_mxfp4_soa_to_aos(
     kernel_convert_block_mxfp4_soa_to_aos<<<nbl, nth, 0, stream>>>(src_e, src_q, dst, nblocks);
 }
 
+static __global__ void kernel_convert_block_q8_0_aos_to_soa(
+        const block_q8_0 * src,
+        int8_t * dst_q,
+        ggml_half * dst_d,
+        int64_t nblocks) {
+    const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+
+    const block_q8_0 b = src[ib];
+    dst_d[ib] = b.d;
+
+    int8_t * q = dst_q + ib * QK8_0;
+#pragma unroll
+    for (int i = 0; i < QK8_0; ++i) {
+        q[i] = b.qs[i];
+    }
+}
+
+static __global__ void kernel_convert_block_q8_0_soa_to_aos(
+        const int8_t * src_q,
+        const ggml_half * src_d,
+        block_q8_0 * dst,
+        int64_t nblocks) {
+    const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+
+    block_q8_0 b;
+    b.d = src_d[ib];
+
+    const int8_t * q = src_q + ib * QK8_0;
+#pragma unroll
+    for (int i = 0; i < QK8_0; ++i) {
+        b.qs[i] = q[i];
+    }
+
+    dst[ib] = b;
+}
+
+void convert_block_q8_0_aos_to_soa(
+        const void * src_aos,
+        void * dst_soa,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    if (nblocks == 0) {
+        return;
+    }
+
+    const block_q8_0 * src = (const block_q8_0 *) src_aos;
+    char * dst = (char *) dst_soa;
+    const int64_t qbytes = nblocks * QK8_0;
+    int8_t * dst_q = (int8_t *) dst;
+    ggml_half * dst_d = (ggml_half *) (dst + qbytes);
+
+    constexpr int nth = 256;
+    const int nbl = (nblocks + nth - 1) / nth;
+    kernel_convert_block_q8_0_aos_to_soa<<<nbl, nth, 0, stream>>>(src, dst_q, dst_d, nblocks);
+}
+
+void convert_block_q8_0_soa_to_aos(
+        const void * src_soa,
+        void * dst_aos,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    if (nblocks == 0) {
+        return;
+    }
+
+    const char * src = (const char *) src_soa;
+    const int64_t qbytes = nblocks * QK8_0;
+    const int8_t * src_q = (const int8_t *) src;
+    const ggml_half * src_d = (const ggml_half *) (src + qbytes);
+    block_q8_0 * dst = (block_q8_0 *) dst_aos;
+
+    constexpr int nth = 256;
+    const int nbl = (nblocks + nth - 1) / nth;
+    kernel_convert_block_q8_0_soa_to_aos<<<nbl, nth, 0, stream>>>(src_q, src_d, dst, nblocks);
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,

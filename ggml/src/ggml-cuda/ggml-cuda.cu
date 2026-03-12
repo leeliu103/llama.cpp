@@ -590,6 +590,18 @@ static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_buffer_free_buffer;
 }
 
+bool ggml_cuda_tensor_uses_q8_0_soa(const ggml_tensor * tensor) {
+    return tensor != nullptr &&
+        tensor->buffer != nullptr &&
+        tensor->type == GGML_TYPE_Q8_0 &&
+        ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_buffer_is_cuda(tensor->buffer);
+}
+
+static bool ggml_backend_cuda_buffer_should_repack_q8_0(ggml_backend_buffer_t buffer, const ggml_tensor * tensor) {
+    return buffer == tensor->buffer && ggml_cuda_tensor_uses_q8_0_soa(tensor);
+}
+
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     return ctx->dev_ptr;
@@ -629,8 +641,8 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
 
-    if (tensor->type == GGML_TYPE_MXFP4) {
-        // PoC: overwrite MXFP4 device storage to SoA on upload.
+    const bool repack_q8_0 = ggml_backend_cuda_buffer_should_repack_q8_0(buffer, tensor);
+    if (tensor->type == GGML_TYPE_MXFP4 || repack_q8_0) {
         GGML_ASSERT(offset == 0);
         GGML_ASSERT(size == ggml_nbytes(tensor));
 
@@ -639,7 +651,11 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         CUDA_CHECK(cudaMemcpyAsync(tmp_src, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
 
         const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
-        convert_block_mxfp4_aos_to_soa(tmp_src, tensor->data, nblocks, cudaStreamPerThread);
+        if (tensor->type == GGML_TYPE_MXFP4) {
+            convert_block_mxfp4_aos_to_soa(tmp_src, tensor->data, nblocks, cudaStreamPerThread);
+        } else {
+            convert_block_q8_0_aos_to_soa(tmp_src, tensor->data, nblocks, cudaStreamPerThread);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -654,7 +670,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
-    if (tensor->type == GGML_TYPE_MXFP4) {
+    if (tensor->type == GGML_TYPE_MXFP4 || ggml_backend_cuda_buffer_should_repack_q8_0(buffer, tensor)) {
         ggml_cuda_set_device(ctx->device);
 
         const size_t nbytes = ggml_nbytes(tensor);
@@ -664,7 +680,11 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         CUDA_CHECK(ggml_cuda_device_malloc(&tmp_dst, nbytes, ctx->device));
 
         const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
-        convert_block_mxfp4_soa_to_aos(tensor->data, tmp_dst, nblocks, cudaStreamPerThread);
+        if (tensor->type == GGML_TYPE_MXFP4) {
+            convert_block_mxfp4_soa_to_aos(tensor->data, tmp_dst, nblocks, cudaStreamPerThread);
+        } else {
+            convert_block_q8_0_soa_to_aos(tensor->data, tmp_dst, nblocks, cudaStreamPerThread);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tmp_dst + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
@@ -2825,6 +2845,25 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (ggml_backend_cuda_buffer_should_repack_q8_0(buf, tensor)) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+
+        if (offset + size == ggml_nbytes(tensor)) {
+            void * tmp_dst = nullptr;
+            const size_t nbytes = ggml_nbytes(tensor);
+            CUDA_CHECK(ggml_cuda_device_malloc(&tmp_dst, nbytes, cuda_ctx->device));
+
+            const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+            convert_block_q8_0_aos_to_soa(tensor->data, tmp_dst, nblocks, cuda_ctx->stream());
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpyAsync(tensor->data, tmp_dst, nbytes, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+            CUDA_CHECK(cudaFree(tmp_dst));
+        }
+        return;
+    }
+
     CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -2833,6 +2872,24 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    if (ggml_backend_cuda_buffer_should_repack_q8_0(buf, tensor)) {
+        ggml_cuda_set_device(cuda_ctx->device);
+
+        const size_t nbytes = ggml_nbytes(tensor);
+        GGML_ASSERT(offset + size <= nbytes);
+
+        void * tmp_dst = nullptr;
+        CUDA_CHECK(ggml_cuda_device_malloc(&tmp_dst, nbytes, cuda_ctx->device));
+
+        const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+        convert_block_q8_0_soa_to_aos(tensor->data, tmp_dst, nblocks, cuda_ctx->stream());
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tmp_dst + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        CUDA_CHECK(cudaFree(tmp_dst));
+        return;
+    }
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *)tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }

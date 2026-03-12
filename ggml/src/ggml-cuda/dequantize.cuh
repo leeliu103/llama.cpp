@@ -75,3 +75,19 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.x *= d;
     v.y *= d;
 }
+
+static __device__ __forceinline__ void dequantize_q8_0_soa(
+        const int8_t * qs,
+        const ggml_half * ds,
+        const int64_t ib,
+        const int iqs,
+        float2 & v) {
+    const float d = ds[ib];
+    const int8_t * q = qs + ib * QK8_0 + iqs;
+
+    v.x = q[0];
+    v.y = q[1];
+
+    v.x *= d;
+    v.y *= d;
+}
