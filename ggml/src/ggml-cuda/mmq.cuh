@@ -3428,10 +3428,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int ITER_K          = get_iter_k(type);
     constexpr int blocks_per_iter = ITER_K / qk;
+    constexpr int sz              = sizeof(block_q8_1_mmq) / sizeof(int);
 
     float sum[mmq_x*mmq_y / (nwarps*warp_size)] = {0.0f};
-
-    constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, mxfp4_q_offset);
@@ -3440,8 +3439,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 #pragma unroll
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
+                const int j = l / MMQ_TILE_Y_K;
+                tile_y[l] = j <= tile_y_max_j ? by0[l] : 0;
             }
         }
 
@@ -3456,8 +3455,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 #pragma unroll
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
+                const int j = l / MMQ_TILE_Y_K;
+                tile_y[l] = j <= tile_y_max_j ? by0[l] : 0;
             }
         }
 
@@ -3565,7 +3564,8 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+                const int compact_j = jt*mmq_x + j;
+                ids_dst_shared[j] = compact_j < col_diff ? ids_dst[col_low + compact_j] : 0;
             }
             __syncthreads();
         }
@@ -3645,7 +3645,8 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+                const int compact_j = jt*mmq_x + j;
+                ids_dst_shared[j] = compact_j < col_diff ? ids_dst[col_low + compact_j] : 0;
             }
             __syncthreads();
         }
@@ -3862,7 +3863,8 @@ static __global__ void mul_mat_q_stream_k_fixup(const int32_t * ids_dst,
     const int col_diff = col_high - col_low;
 
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < mmq_x; j += nwarps*warp_size) {
-        ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+        const int compact_j = jt*mmq_x + j;
+        ids_dst_shared[j] = compact_j < col_diff ? ids_dst[col_low + compact_j] : 0;
     }
     __syncthreads();
 

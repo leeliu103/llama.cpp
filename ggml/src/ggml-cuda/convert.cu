@@ -486,6 +486,25 @@ static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_
     }
 }
 
+template<typename dst_t>
+static __global__ void dequantize_block_mxfp4_soa(const uint8_t * __restrict__ x_q,
+                                                  const uint8_t * __restrict__ x_e,
+                                                  dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+
+    const int64_t tid = threadIdx.x;
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    const int64_t block_idx = i*(QK_K/QK_MXFP4) + ib;
+    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const uint8_t * q4 = x_q + block_idx*(QK_MXFP4/2) + 4*il;
+    const float d = ggml_cuda_e8m0_to_fp32(x_e[block_idx]);
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = d * kvalues_mxfp4[q4[j] & 0xf]*0.5f;
+        y[j+16] = d * kvalues_mxfp4[q4[j] >>  4]*0.5f;
+    }
+}
+
 static __global__ void kernel_convert_block_mxfp4_aos_to_soa(
         const block_mxfp4 * src,
         uint8_t * dst_e,
@@ -696,7 +715,10 @@ static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t
 template<typename dst_t>
 static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
+    const int64_t nblocks = k / QK_MXFP4;
+    const uint8_t * x_q = (const uint8_t *) vx;
+    const uint8_t * x_e = x_q + nblocks*(QK_MXFP4/2);
+    dequantize_block_mxfp4_soa<<<nb, 32, 0, stream>>>(x_q, x_e, y);
 }
 
 template <typename src_t, typename dst_t>
