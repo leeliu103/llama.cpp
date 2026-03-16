@@ -3,6 +3,14 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+static uint32_t ggml_cuda_mxfp4_q_offset_2d(const int64_t ne00, const int64_t nrows) {
+    const uint64_t nblocks = (uint64_t) ne00 * (uint64_t) nrows / QK_MXFP4;
+    const uint64_t q_offset = nblocks * (QK_MXFP4 / 2);
+
+    GGML_ASSERT(q_offset <= UINT32_MAX);
+    return (uint32_t) q_offset;
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q4_0:
@@ -241,11 +249,9 @@ void ggml_cuda_op_mul_mat_q(
 
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
-    const uint64_t mxfp4_q_offset_u64 = src0->type == GGML_TYPE_MXFP4
-        ? ((uint64_t) ggml_nelements(src0) / ggml_blck_size(src0->type)) * (QK_MXFP4 / 2)
+    const uint32_t mxfp4_q_offset = src0->type == GGML_TYPE_MXFP4
+        ? ggml_cuda_mxfp4_q_offset_2d(ne00, row_high - row_low)
         : 0;
-    GGML_ASSERT(mxfp4_q_offset_u64 <= UINT32_MAX);
-    const uint32_t mxfp4_q_offset = (uint32_t) mxfp4_q_offset_u64;
 
     // the main device has a larger memory buffer to hold the results from all GPUs
     // nrows_dst == nrows of the matrix that the kernel writes into
@@ -304,10 +310,6 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     if (!mmq_supported) {
-        return false;
-    }
-
-    if (type == GGML_TYPE_MXFP4 && GGML_CUDA_CC_IS_AMD(cc)) {
         return false;
     }
 

@@ -743,6 +743,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
     const int kbx  = txi / QI_MXFP4;
     const int kqsx = txi % QI_MXFP4;
+    const int blocks_left = stride - kbx0 % stride;
     const uint8_t * x_q = (const uint8_t *) x;
     const uint8_t * x_e = x_q + mxfp4_q_offset;
 
@@ -754,12 +755,15 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             i = min(i, i_max);
         }
 
-        const int ib = kbx0 + i*stride + kbx;
-        const uint8_t * q = x_q + ib*(QK_MXFP4/2);
-
-        const int aux_q4 = get_int_b1(q, kqsx);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
         const int k0 = kbx * (2 * QI_MXFP4) + kqsx;
+        int2 v = make_int2(0, 0);
+
+        if (kbx < blocks_left) {
+            const int ib = kbx0 + i*stride + kbx;
+            const uint8_t * q = x_q + ib*(QK_MXFP4/2);
+            const int aux_q4 = get_int_b1(q, kqsx);
+            v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+        }
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_qs[i*MMQ_MMA_TILE_X_K_Q8_1 + k0 + 0]        = v.x;
@@ -782,13 +786,17 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             i = min(i, i_max);
         }
 
-        const int ib = kbx0 + i*stride + kbxd;
-        const uint8_t e = x_e[ib];
+        float d = 0.0f;
+
+        if (kbxd < blocks_left) {
+            const int ib = kbx0 + i*stride + kbxd;
+            d = ggml_cuda_e8m0_to_fp32(x_e[ib])*0.5f;
+        }
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i*MMQ_MMA_TILE_X_K_Q8_1                 + kbxd] = ggml_cuda_e8m0_to_fp32(e)*0.5f;
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_1                 + kbxd] = d;
 #else
-        x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = ggml_cuda_e8m0_to_fp32(e)*0.5f;
+        x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = d;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -809,6 +817,7 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restr
     const int txi = threadIdx.x;
     const uint8_t * x_q = (const uint8_t *) x;
     const uint8_t * x_e = x_q + mxfp4_q_offset;
+    const int blocks_left = stride - kbx0 % stride;
 
     constexpr int iter_k = get_iter_k(GGML_TYPE_MXFP4);
 
@@ -825,17 +834,27 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restr
             i = min(i, i_max);
         }
 
-        const int ib = kbx0 + i * stride + kbx;
-        const uint8_t * q = x_q + ib*(QK_MXFP4/2);
-
-        // quantize_mxfp4_mmq permutes nibbles to match the quantized format
         const int k0 = kbx * 4;
-        memcpy(x_qs + i * MMQ_MMA_TILE_X_K_FP4 + k0, q, 16);
+        if (kbx < blocks_left) {
+            const int ib = kbx0 + i * stride + kbx;
+            const uint8_t * q = x_q + ib*(QK_MXFP4/2);
+
+            // quantize_mxfp4_mmq permutes nibbles to match the quantized format
+            memcpy(x_qs + i * MMQ_MMA_TILE_X_K_FP4 + k0, q, 16);
+        } else {
+            memset(x_qs + i * MMQ_MMA_TILE_X_K_FP4 + k0, 0, 16);
+        }
 
         // Load E8M0 scales: pack 2 consecutive scales into one uint32
         if (kbx % 2 == 0) {
-            uint32_t e = x_e[ib];
-            e |= ((uint32_t) x_e[ib + 1] << 8);
+            uint32_t e = 0;
+            if (kbx < blocks_left) {
+                const int ib = kbx0 + i * stride + kbx;
+                e = x_e[ib];
+                if (kbx + 1 < blocks_left) {
+                    e |= ((uint32_t) x_e[ib + 1] << 8);
+                }
+            }
             x_sc[i * MMQ_MMA_TILE_X_K_FP4 + kbx / 2] = e;
         }
     }
