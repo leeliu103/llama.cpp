@@ -34,64 +34,31 @@ static __global__ void mm_ids_helper(
 
     extern __shared__ char data_mm_ids_helper[];
     mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
+    __shared__ int it_compact_shared;
 
-    int nex_prev   = 0; // Number of columns for experts with a lower index.
-    int it_compact = 0; // Running index for the compact slice of this expert.
+    if (threadIdx.x == 0) {
+        it_compact_shared = 0;
+    }
+    __syncthreads();
 
-    if constexpr (n_expert_used_template == 0) {
-        // Generic implementation:
-        for (int it = 0; it < n_tokens; ++it) {
-            int iex_used = -1; // The index at which the expert is used, if any.
-            for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
-                const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
-                if (expert_used == expert) {
-                    iex_used = iex;
-                }
-            }
+    int nex_prev = 0; // Number of compacted columns for experts with a lower index.
 
-            if (iex_used != -1) {
-                store[it_compact] = mm_ids_helper_store(it, iex_used);
-            }
+    // Record every matching expert slot; the same expert can appear multiple times for one token.
+    for (int idx = threadIdx.x; idx < n_tokens * n_expert_used; idx += warp_size) {
+        const int it = idx / n_expert_used;
+        const int iex = idx - it * n_expert_used;
+        const int expert_used = ids[it * si1 + iex];
 
-            if (warp_reduce_any<warp_size>(iex_used != -1)) {
-                it_compact++;
-            }
-        }
-    } else {
-        // Implementation optimized for specific numbers of experts used:
-        static_assert(n_expert_used == 6 || warp_size % n_expert_used == 0, "bad n_expert_used");
-        const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used; // Padded to next higher power of 2.
-        for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
-            const int it = it0 + threadIdx.x / neu_padded;
+        nex_prev += expert_used < expert;
 
-            const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
-            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
-                ids[it*si1 + iex] : INT_MAX;
-            const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
-
-            // Whether the threads at this token position have used the expert:
-            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
-
-            // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
-            int it_compact_add_lower = 0;
-#pragma unroll
-            for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
-                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
-                if (threadIdx.x >= static_cast<unsigned int>(offset)) {
-                    it_compact_add_lower += tmp;
-                }
-            }
-
-            if (iex_used != -1) {
-                store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
-            }
-
-            // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
-            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+        if (expert_used == expert) {
+            const int it_compact = atomicAdd(&it_compact_shared, 1);
+            store[it_compact] = mm_ids_helper_store(it, iex);
         }
     }
+
+    __syncthreads();
+    const int it_compact = it_compact_shared;
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
 
     for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
@@ -129,7 +96,8 @@ static void launch_mm_ids_helper(
 
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
-    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+    const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+    const size_t nbytes_shared = (size_t) n_tokens * n_expert_used * sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1);
