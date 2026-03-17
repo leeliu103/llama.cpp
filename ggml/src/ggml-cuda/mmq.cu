@@ -11,6 +11,26 @@ static uint32_t ggml_cuda_mxfp4_q_offset_2d(const int64_t ne00, const int64_t nr
     return (uint32_t) q_offset;
 }
 
+static uint32_t ggml_cuda_q8_0_d_offset_2d(const int64_t ne00, const int64_t nrows) {
+    const uint64_t nblocks = (uint64_t) ne00 * (uint64_t) nrows / QK8_0;
+    const uint64_t d_offset = nblocks * QK8_0;
+
+    GGML_ASSERT(d_offset <= UINT32_MAX);
+    return (uint32_t) d_offset;
+}
+
+static uint32_t ggml_cuda_x_soa_aux_offset(const ggml_tensor * src0) {
+    if (src0->type == GGML_TYPE_MXFP4) {
+        return ggml_cuda_mxfp4_q_offset_2d(src0->ne[0], ggml_nelements(src0) / src0->ne[0]);
+    }
+
+    if (ggml_cuda_tensor_uses_q8_0_soa(src0)) {
+        return ggml_cuda_q8_0_d_offset_2d(src0->ne[0], ggml_nelements(src0) / src0->ne[0]);
+    }
+
+    return 0;
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q4_0:
@@ -112,11 +132,7 @@ void ggml_cuda_mul_mat_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    const uint64_t mxfp4_q_offset_u64 = src0->type == GGML_TYPE_MXFP4
-        ? ((uint64_t) ggml_nelements(src0) / ggml_blck_size(src0->type)) * (QK_MXFP4 / 2)
-        : 0;
-    GGML_ASSERT(mxfp4_q_offset_u64 <= UINT32_MAX);
-    const uint32_t mxfp4_q_offset = (uint32_t) mxfp4_q_offset_u64;
+    const uint32_t x_soa_aux_offset = ggml_cuda_x_soa_aux_offset(src0);
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s1  =  dst->nb[1] / ts_dst;
@@ -165,7 +181,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1, mxfp4_q_offset};
+            use_stream_k, ne1, x_soa_aux_offset};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -225,7 +241,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12, mxfp4_q_offset};
+        use_stream_k, ne12, x_soa_aux_offset};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -249,7 +265,7 @@ void ggml_cuda_op_mul_mat_q(
 
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
-    const uint32_t mxfp4_q_offset = src0->type == GGML_TYPE_MXFP4
+    const uint32_t x_soa_aux_offset = src0->type == GGML_TYPE_MXFP4
         ? ggml_cuda_mxfp4_q_offset_2d(ne00, row_high - row_low)
         : 0;
 
@@ -268,7 +284,7 @@ void ggml_cuda_op_mul_mat_q(
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
-        use_stream_k, src1_ncols, mxfp4_q_offset};
+        use_stream_k, src1_ncols, x_soa_aux_offset};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 

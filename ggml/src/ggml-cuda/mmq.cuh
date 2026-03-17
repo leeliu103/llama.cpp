@@ -15,7 +15,7 @@ using namespace ggml_cuda_mma;
 #define MMQ_NWARPS 8
 
 typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride,
-                                 const uint32_t mxfp4_q_offset);
+                                 const uint32_t x_soa_aux_offset);
 typedef void (*vec_dot_mmq_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
 typedef void (*mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
     float * __restrict__ dst, const int stride, const int i_max, const int j_max);
@@ -662,7 +662,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q8_0(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
-    const uint32_t /*mxfp4_q_offset*/) {
+    const uint32_t x_soa_aux_offset) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -682,6 +682,54 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     const int kbx  = txi / QI8_0;
     const int kqsx = txi % QI8_0;
 
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+    if (x_soa_aux_offset != 0) {
+        const int8_t * x_q = (const int8_t *) x;
+        const ggml_half * x_d = (const ggml_half *) (x_q + x_soa_aux_offset);
+
+#pragma unroll
+        for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+            int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+            if (need_check) {
+                i = min(i, i_max);
+            }
+
+            const int64_t ib = kbx0 + (int64_t) i*stride + kbx;
+            const int8_t * q = x_q + ib*QK8_0;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 0             + txi] = get_int_b2(q, kqsx);
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + MMQ_TILE_NE_K + txi] = get_int_b2(q + (MMQ_TILE_NE_K/QI8_0)*QK8_0, kqsx);
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = get_int_b2(q, kqsx);
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = get_int_b2(q + (MMQ_TILE_NE_K/QI8_0)*QK8_0, kqsx);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+
+#pragma unroll
+        for (int i0 = 0; i0 < mmq_y; i0 += nwarps * rows_per_warp) {
+            int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+            if (need_check) {
+                i = min(i, i_max);
+            }
+
+            const int64_t ib = kbx0 + (int64_t) i*stride + kbxd;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_df[i*MMQ_MMA_TILE_X_K_Q8_0                 + kbxd] = x_d[ib];
+#else
+            x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = x_d[ib];
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+
+        return;
+    }
+
 #pragma unroll
     for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
         int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
@@ -700,10 +748,6 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
-
-    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
-    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
-    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
 
 #pragma unroll
     for (int i0 = 0; i0 < mmq_y; i0 += nwarps * rows_per_warp) {
@@ -725,7 +769,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp4(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
-    const uint32_t mxfp4_q_offset) {
+    const uint32_t x_soa_aux_offset) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -745,7 +789,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     const int kqsx = txi % QI_MXFP4;
     const int blocks_left = stride - kbx0 % stride;
     const uint8_t * x_q = (const uint8_t *) x;
-    const uint8_t * x_e = x_q + mxfp4_q_offset;
+    const uint8_t * x_e = x_q + x_soa_aux_offset;
 
 #pragma unroll
     for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
@@ -807,7 +851,7 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restr
                                                             const int kbx0,
                                                             const int i_max,
                                                             const int stride,
-                                                            const uint32_t mxfp4_q_offset) {
+                                                            const uint32_t x_soa_aux_offset) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -816,7 +860,7 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restr
 
     const int txi = threadIdx.x;
     const uint8_t * x_q = (const uint8_t *) x;
-    const uint8_t * x_e = x_q + mxfp4_q_offset;
+    const uint8_t * x_e = x_q + x_soa_aux_offset;
     const int blocks_left = stride - kbx0 % stride;
 
     constexpr int iter_k = get_iter_k(GGML_TYPE_MXFP4);
@@ -3418,7 +3462,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
-        const uint32_t mxfp4_q_offset) {
+        const uint32_t x_soa_aux_offset) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = mmq_get_nwarps_device();
@@ -3452,7 +3496,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     float sum[mmq_x*mmq_y / (nwarps*warp_size)] = {0.0f};
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, mxfp4_q_offset);
+        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, x_soa_aux_offset);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
@@ -3514,7 +3558,7 @@ static __global__ void mul_mat_q(
         const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int channel_ratio, const int nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ncols_max, const uint32_t mxfp4_q_offset) {
+        const int ncols_max, const uint32_t x_soa_aux_offset) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -3600,7 +3644,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, ncols_x/qk, mxfp4_q_offset);
+             tile_x_max_i, tile_y_max_j, 0, ncols_x/qk, x_soa_aux_offset);
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -3681,7 +3725,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, mxfp4_q_offset);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa_aux_offset);
 
         kbc += blocks_per_ne00;
         kbc -= kbc % blocks_per_ne00;
@@ -3748,7 +3792,7 @@ static __global__ void mul_mat_q(
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, mxfp4_q_offset);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa_aux_offset);
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
@@ -3919,7 +3963,7 @@ struct mmq_args {
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
-    bool use_stream_k; int64_t ncols_max; uint32_t mxfp4_q_offset;
+    bool use_stream_k; int64_t ncols_max; uint32_t x_soa_aux_offset;
 };
 
 template<ggml_type type>
@@ -3966,7 +4010,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 args.ncols_max, args.mxfp4_q_offset);
+                 args.ncols_max, args.x_soa_aux_offset);
         } else {
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -3974,7 +4018,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 args.ncols_max, args.mxfp4_q_offset);
+                 args.ncols_max, args.x_soa_aux_offset);
         }
         return;
     }
@@ -3995,7 +4039,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max, args.mxfp4_q_offset);
+             args.ncols_max, args.x_soa_aux_offset);
 
         if (!fixup_needed) {
             return;
@@ -4012,7 +4056,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max, args.mxfp4_q_offset);
+             args.ncols_max, args.x_soa_aux_offset);
 
         if (!fixup_needed) {
             return;

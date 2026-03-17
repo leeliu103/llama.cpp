@@ -105,6 +105,92 @@ static __device__ void cpy_blck_q8_0_f32(const char * cxi, char * cdsti) {
     }
 }
 
+static __global__ void cpy_q8_0_soa_f32(
+        const int8_t * __restrict__ src_q,
+        const ggml_half * __restrict__ src_d,
+        char * __restrict__ cdst,
+        const int64_t ne,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    const int64_t i = ((int64_t) blockDim.x * blockIdx.x + threadIdx.x) * QK8_0;
+
+    if (i >= ne) {
+        return;
+    }
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
+
+    const int64_t block_index =
+        (i00 / QK8_0) * (nb00 / (int64_t) sizeof(block_q8_0)) +
+        i01 * (nb01 / (int64_t) sizeof(block_q8_0)) +
+        i02 * (nb02 / (int64_t) sizeof(block_q8_0)) +
+        i03 * (nb03 / (int64_t) sizeof(block_q8_0));
+
+    float * dst = (float *) (cdst + dst_offset);
+
+#pragma unroll
+    for (int j = 0; j < QK8_0; j += 2) {
+        float2 dq;
+        dequantize_q8_0_soa(src_q, src_d, block_index, j, dq);
+        dst[j + 0] = dq.x;
+        dst[j + 1] = dq.y;
+    }
+}
+
+static __global__ void cpy_f32_q8_0_soa(
+        const char * __restrict__ cx,
+        int8_t * __restrict__ dst_q,
+        ggml_half * __restrict__ dst_d,
+        const int64_t ne,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    const int64_t i = ((int64_t) blockDim.x * blockIdx.x + threadIdx.x) * QK8_0;
+
+    if (i >= ne) {
+        return;
+    }
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t src_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+
+    const int64_t block_index =
+        (i10 / QK8_0) * (nb10 / (int64_t) sizeof(block_q8_0)) +
+        i11 * (nb11 / (int64_t) sizeof(block_q8_0)) +
+        i12 * (nb12 / (int64_t) sizeof(block_q8_0)) +
+        i13 * (nb13 / (int64_t) sizeof(block_q8_0));
+
+    block_q8_0 block;
+    quantize_f32_q8_0_block((const float *) (cx + src_offset), &block);
+
+    dst_d[block_index] = block.d;
+    int8_t * q = dst_q + block_index * QK8_0;
+#pragma unroll
+    for (int j = 0; j < QK8_0; ++j) {
+        q[j] = block.qs[j];
+    }
+}
+
 template<dequantize_kernel_t dequant, int qk>
 static __device__ void cpy_blck_q_f32(const char * cxi, char * cdsti) {
     float * cdstf = (float *)(cdsti);
@@ -244,6 +330,22 @@ static void ggml_cpy_f32_q8_0_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
+static void ggml_cpy_f32_q8_0_soa_cuda(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
+
+    GGML_ASSERT(ne % QK8_0 == 0);
+    const int64_t num_blocks = ne / QK8_0;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+
+    int8_t * dst_q = (int8_t *) cdst;
+    ggml_half * dst_d = (ggml_half *) (cdst + ne);
+
+    cpy_f32_q8_0_soa<<<num_blocks, 1, 0, stream>>>(
+        cx, dst_q, dst_d, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
 static void ggml_cpy_q8_0_f32_cuda(
     const char * cx, char * cdst, const int64_t ne,
     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -253,6 +355,22 @@ static void ggml_cpy_q8_0_f32_cuda(
     GGML_ASSERT(num_blocks < UINT_MAX);
     cpy_q_f32<cpy_blck_q8_0_f32, QK8_0><<<num_blocks, 1, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
+static void ggml_cpy_q8_0_soa_f32_cuda(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
+
+    GGML_ASSERT(ne % QK8_0 == 0);
+    const int64_t num_blocks = ne / QK8_0;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+
+    const int8_t * src_q = (const int8_t *) cx;
+    const ggml_half * src_d = (const ggml_half *) (cx + ne);
+
+    cpy_q8_0_soa_f32<<<num_blocks, 1, 0, stream>>>(
+        src_q, src_d, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
 static void ggml_cpy_f32_q4_0_cuda(
@@ -405,9 +523,21 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
     const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
         src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
+    const bool src0_q8_0_soa = ggml_cuda_tensor_uses_q8_0_soa(src0);
+    const bool src1_q8_0_soa = ggml_cuda_tensor_uses_q8_0_soa(src1);
 
     if (src0->type == src1->type && contiguous_srcs) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));
+        if (src0->type == GGML_TYPE_Q8_0 && src0_q8_0_soa != src1_q8_0_soa) {
+            GGML_ASSERT(ne % QK8_0 == 0);
+            const int64_t nblocks = ne / QK8_0;
+            if (src0_q8_0_soa) {
+                convert_block_q8_0_soa_to_aos(src0_ddc, src1_ddc, nblocks, main_stream);
+            } else {
+                convert_block_q8_0_aos_to_soa(src0_ddc, src1_ddc, nblocks, main_stream);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        } else
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
         if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) {
             CUDA_CHECK(mudnnMemcpyAsync(ctx, src1, src0));
@@ -441,11 +571,21 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q8_0) {
-        ggml_cpy_f32_q8_0_cuda
+        if (src1_q8_0_soa) {
+            ggml_cpy_f32_q8_0_soa_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        } else {
+            ggml_cpy_f32_q8_0_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
     } else if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32) {
-        ggml_cpy_q8_0_f32_cuda
+        if (src0_q8_0_soa) {
+            ggml_cpy_q8_0_soa_f32_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        } else {
+            ggml_cpy_q8_0_f32_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q4_0) {
         ggml_cpy_f32_q4_0_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);

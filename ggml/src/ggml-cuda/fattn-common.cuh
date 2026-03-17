@@ -821,19 +821,40 @@ void launch_fattn(
     size_t nb11 = K->nb[1];
     size_t nb12 = K->nb[2];
     size_t nb13 = K->nb[3];
+    const bool K_q8_0_soa_storage = K->view_src && ggml_cuda_tensor_storage_uses_q8_0_soa(K);
 
     const char * V_data = (const char *) V->data;
     size_t nb21 = V->nb[1];
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
+    const bool V_q8_0_soa_storage = V->view_src && ggml_cuda_tensor_storage_uses_q8_0_soa(V);
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
         K_f16.alloc(ggml_nelements(K));
-        if (ggml_is_contiguously_allocated(K)) {
-            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+        if (K_q8_0_soa_storage) {
+            const ggml_cuda_q8_0_soa_view K_soa = ggml_cuda_get_q8_0_soa_view(K);
+            if (ggml_is_contiguously_allocated(K)) {
+                dequantize_q8_0_soa_cont_cuda(K_soa.qs, K_soa.ds, K_f16.ptr, ggml_nelements(K), main_stream);
+
+                nb11 = nb11*bs*sizeof(half)/ts;
+                nb12 = nb12*bs*sizeof(half)/ts;
+                nb13 = nb13*bs*sizeof(half)/ts;
+            } else {
+                GGML_ASSERT(K->nb[0] == ts);
+                const int64_t s01 = nb11 / ts;
+                const int64_t s02 = nb12 / ts;
+                const int64_t s03 = nb13 / ts;
+                dequantize_q8_0_soa_cuda(K_soa.qs, K_soa.ds, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+
+                nb11 = K->ne[0] * sizeof(half);
+                nb12 = K->ne[1] * nb11;
+                nb13 = K->ne[2] * nb12;
+            }
+        } else if (ggml_is_contiguously_allocated(K)) {
+            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K);
             to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
 
             nb11 = nb11*bs*sizeof(half)/ts;
@@ -841,7 +862,7 @@ void launch_fattn(
             nb13 = nb13*bs*sizeof(half)/ts;
         } else {
             GGML_ASSERT(K->nb[0] == ts);
-            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K);
             const int64_t s01 = nb11 / ts;
             const int64_t s02 = nb12 / ts;
             const int64_t s03 = nb13 / ts;
@@ -865,8 +886,29 @@ void launch_fattn(
             const size_t ts = ggml_type_size(V->type);
 
             V_f16.alloc(ggml_nelements(V));
-            if (ggml_is_contiguously_allocated(V)) {
-                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+            if (V_q8_0_soa_storage) {
+                const ggml_cuda_q8_0_soa_view V_soa = ggml_cuda_get_q8_0_soa_view(V);
+                if (ggml_is_contiguously_allocated(V)) {
+                    dequantize_q8_0_soa_cont_cuda(V_soa.qs, V_soa.ds, V_f16.ptr, ggml_nelements(V), main_stream);
+                    V_data = (char *) V_f16.ptr;
+
+                    nb21 = nb21*bs*sizeof(half)/ts;
+                    nb22 = nb22*bs*sizeof(half)/ts;
+                    nb23 = nb23*bs*sizeof(half)/ts;
+                } else {
+                    GGML_ASSERT(V->nb[0] == ts);
+                    const int64_t s01 = nb21 / ts;
+                    const int64_t s02 = nb22 / ts;
+                    const int64_t s03 = nb23 / ts;
+                    dequantize_q8_0_soa_cuda(V_soa.qs, V_soa.ds, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+
+                    nb21 = V->ne[0] * sizeof(half);
+                    nb22 = V->ne[1] * nb21;
+                    nb23 = V->ne[2] * nb22;
+                }
+                V_data = (char *) V_f16.ptr;
+            } else if (ggml_is_contiguously_allocated(V)) {
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V);
                 to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
                 V_data = (char *) V_f16.ptr;
 
@@ -875,7 +917,7 @@ void launch_fattn(
                 nb23 = nb23*bs*sizeof(half)/ts;
             } else {
                 GGML_ASSERT(V->nb[0] == ts);
-                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V);
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;

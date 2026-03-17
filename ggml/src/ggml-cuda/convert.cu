@@ -40,6 +40,87 @@ static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __
     }
 }
 
+template <typename dst_t>
+static __global__ void dequantize_block_q8_0_soa(
+        const int8_t * __restrict__ qs,
+        const ggml_half * __restrict__ ds,
+        dst_t * __restrict__ y,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne0203,
+        const uint3 ne02,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03) {
+    const int64_t i00 = 2 * (int64_t(blockDim.x) * blockIdx.x + threadIdx.x);
+
+    if (i00 >= ne00) {
+        return;
+    }
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const uint2 dm = fast_div_modulo((uint32_t) i0203, ne02);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+
+            const int64_t ibx0 = i03*s03 + i02*s02 + i01*s01;
+            const int64_t ib = ibx0 + i00/QK8_0;
+            const int64_t iqs = i00 % QK8_0;
+            const int64_t iybs = i00 - i00 % QK8_0;
+
+            float2 v;
+            dequantize_q8_0_soa(qs, ds, ib, iqs, v);
+
+            const int64_t iy0 = (i0203*ne01 + i01)*ne00 + iybs + iqs;
+            y[iy0 + 0] = ggml_cuda_cast<dst_t>(v.x);
+            y[iy0 + 1] = ggml_cuda_cast<dst_t>(v.y);
+        }
+    }
+}
+
+static __global__ void kernel_convert_block_q8_0_aos_to_soa(
+        const block_q8_0 * src,
+        int8_t * dst_q,
+        ggml_half * dst_d,
+        int64_t nblocks) {
+    const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+
+    const block_q8_0 b = src[ib];
+    dst_d[ib] = b.d;
+
+    int8_t * q = dst_q + ib * QK8_0;
+#pragma unroll
+    for (int i = 0; i < QK8_0; ++i) {
+        q[i] = b.qs[i];
+    }
+}
+
+static __global__ void kernel_convert_block_q8_0_soa_to_aos(
+        const int8_t * src_q,
+        const ggml_half * src_d,
+        block_q8_0 * dst,
+        int64_t nblocks) {
+    const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+
+    block_q8_0 b;
+    b.d = src_d[ib];
+
+    const int8_t * q = src_q + ib * QK8_0;
+#pragma unroll
+    for (int i = 0; i < QK8_0; ++i) {
+        b.qs[i] = q[i];
+    }
+
+    dst[ib] = b;
+}
+
 template <bool need_check>
 static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t k) {
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
@@ -79,6 +160,42 @@ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, h
     GGML_UNUSED_VARS(vx, y, k);
     NO_DEVICE_CODE;
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+}
+
+void convert_block_q8_0_aos_to_soa(
+        const void * src_aos,
+        void * dst_soa,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    if (nblocks == 0) {
+        return;
+    }
+
+    const block_q8_0 * src = (const block_q8_0 *) src_aos;
+    int8_t * dst_q = (int8_t *) dst_soa;
+    ggml_half * dst_d = (ggml_half *) (dst_q + nblocks * QK8_0);
+
+    constexpr int nth = 256;
+    const int nbl = (nblocks + nth - 1) / nth;
+    kernel_convert_block_q8_0_aos_to_soa<<<nbl, nth, 0, stream>>>(src, dst_q, dst_d, nblocks);
+}
+
+void convert_block_q8_0_soa_to_aos(
+        const void * src_soa,
+        void * dst_aos,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    if (nblocks == 0) {
+        return;
+    }
+
+    const int8_t * src_q = (const int8_t *) src_soa;
+    const ggml_half * src_d = (const ggml_half *) (src_q + nblocks * QK8_0);
+    block_q8_0 * dst = (block_q8_0 *) dst_aos;
+
+    constexpr int nth = 256;
+    const int nbl = (nblocks + nth - 1) / nth;
+    kernel_convert_block_q8_0_soa_to_aos<<<nbl, nth, 0, stream>>>(src_q, src_d, dst, nblocks);
 }
 
 template<typename dst_t>
@@ -603,6 +720,114 @@ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __r
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
 }
 
+template <typename dst_t>
+static void dequantize_block_q8_0_soa_cuda_impl(
+        const int8_t * __restrict__ qs,
+        const ggml_half * __restrict__ ds,
+        dst_t * __restrict__ y,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne02,
+        const int64_t ne03,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        cudaStream_t stream) {
+    const int64_t ne0203 = ne02 * ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    const dim3 num_blocks((ne00 + 2*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2*CUDA_DEQUANTIZE_BLOCK_SIZE),
+        (int) std::min(ne01, (int64_t) 65535), (int) std::min(ne0203, (int64_t) 65535));
+
+    dequantize_block_q8_0_soa<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+        qs, ds, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
+template <typename dst_t>
+static void dequantize_block_q8_0_soa_cuda(
+        const void * __restrict__ vx,
+        dst_t * __restrict__ y,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne02,
+        const int64_t ne03,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        cudaStream_t stream) {
+    const int8_t * qs = (const int8_t *) vx;
+    const uint64_t qbytes = (uint64_t) ne00 * ne01 * ne02 * ne03;
+    const ggml_half * ds = (const ggml_half *) (qs + qbytes);
+
+    dequantize_block_q8_0_soa_cuda_impl(qs, ds, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+}
+
+template <typename dst_t>
+static void dequantize_block_q8_0_soa_cont_cuda(
+        const void * __restrict__ vx,
+        dst_t * __restrict__ y,
+        const int64_t k,
+        cudaStream_t stream) {
+    dequantize_block_q8_0_soa_cuda(vx, y, k, 1, 1, 1, k/QK8_0, k/QK8_0, k/QK8_0, stream);
+}
+
+template <typename dst_t>
+static void dequantize_q8_0_soa_cont_cuda_impl(
+        const int8_t * __restrict__ qs,
+        const ggml_half * __restrict__ ds,
+        dst_t * __restrict__ y,
+        const int64_t k,
+        cudaStream_t stream) {
+    dequantize_block_q8_0_soa_cuda_impl(qs, ds, y, k, 1, 1, 1, k/QK8_0, k/QK8_0, k/QK8_0, stream);
+}
+
+void dequantize_q8_0_soa_cont_cuda(
+        const int8_t * qs,
+        const ggml_half * ds,
+        half * y,
+        int64_t k,
+        cudaStream_t stream) {
+    dequantize_q8_0_soa_cont_cuda_impl(qs, ds, y, k, stream);
+}
+
+void dequantize_q8_0_soa_cont_cuda(
+        const int8_t * qs,
+        const ggml_half * ds,
+        float * y,
+        int64_t k,
+        cudaStream_t stream) {
+    dequantize_q8_0_soa_cont_cuda_impl(qs, ds, y, k, stream);
+}
+
+void dequantize_q8_0_soa_cuda(
+        const int8_t * qs,
+        const ggml_half * ds,
+        half * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03,
+        cudaStream_t stream) {
+    dequantize_block_q8_0_soa_cuda_impl(qs, ds, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+}
+
+void dequantize_q8_0_soa_cuda(
+        const int8_t * qs,
+        const ggml_half * ds,
+        nv_bfloat16 * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03,
+        cudaStream_t stream) {
+    dequantize_block_q8_0_soa_cuda_impl(qs, ds, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+}
+
+void dequantize_q8_0_soa_cuda(
+        const int8_t * qs,
+        const ggml_half * ds,
+        float * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03,
+        cudaStream_t stream) {
+    dequantize_block_q8_0_soa_cuda_impl(qs, ds, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+}
+
 static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_Q8_0_NE_ALIGN - 1) / CUDA_Q8_0_NE_ALIGN;
     if (k % CUDA_Q8_0_NE_ALIGN == 0) {
@@ -828,6 +1053,14 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     }
 }
 
+to_fp16_cuda_t ggml_get_to_fp16_cuda(const ggml_tensor * tensor) {
+    if (ggml_cuda_tensor_uses_q8_0_soa(tensor)) {
+        return dequantize_block_q8_0_soa_cont_cuda<half>;
+    }
+
+    return tensor ? ggml_get_to_fp16_cuda(tensor->type) : nullptr;
+}
+
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
@@ -879,6 +1112,14 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     }
 }
 
+to_fp32_cuda_t ggml_get_to_fp32_cuda(const ggml_tensor * tensor) {
+    if (ggml_cuda_tensor_uses_q8_0_soa(tensor)) {
+        return dequantize_block_q8_0_soa_cont_cuda<float>;
+    }
+
+    return tensor ? ggml_get_to_fp32_cuda(tensor->type) : nullptr;
+}
+
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -898,6 +1139,14 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
         default:
             return nullptr;
     }
+}
+
+to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(const ggml_tensor * tensor) {
+    if (ggml_cuda_tensor_uses_q8_0_soa(tensor)) {
+        return dequantize_block_q8_0_soa_cuda<half>;
+    }
+
+    return tensor ? ggml_get_to_fp16_nc_cuda(tensor->type) : nullptr;
 }
 
 to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
@@ -921,6 +1170,14 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
     }
 }
 
+to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(const ggml_tensor * tensor) {
+    if (ggml_cuda_tensor_uses_q8_0_soa(tensor)) {
+        return dequantize_block_q8_0_soa_cuda<nv_bfloat16>;
+    }
+
+    return tensor ? ggml_get_to_bf16_nc_cuda(tensor->type) : nullptr;
+}
+
 to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F16:
@@ -940,4 +1197,12 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
         default:
             return nullptr;
     }
+}
+
+to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(const ggml_tensor * tensor) {
+    if (ggml_cuda_tensor_uses_q8_0_soa(tensor)) {
+        return dequantize_block_q8_0_soa_cuda<float>;
+    }
+
+    return tensor ? ggml_get_to_fp32_nc_cuda(tensor->type) : nullptr;
 }

@@ -11,10 +11,12 @@ typedef to_t_cuda_t<half> to_fp16_cuda_t;
 typedef to_t_cuda_t<nv_bfloat16> to_bf16_cuda_t;
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type);
+to_fp16_cuda_t ggml_get_to_fp16_cuda(const ggml_tensor * tensor);
 
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
+to_fp32_cuda_t ggml_get_to_fp32_cuda(const ggml_tensor * tensor);
 
 // TODO more general support for non-contiguous inputs
 
@@ -30,6 +32,59 @@ typedef to_t_nc_cuda_t<nv_bfloat16> to_bf16_nc_cuda_t;
 to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type);
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type);
 to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type);
+to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(const ggml_tensor * tensor);
+to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(const ggml_tensor * tensor);
+to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(const ggml_tensor * tensor);
+
+void dequantize_q8_0_soa_cont_cuda(
+        const int8_t * qs,
+        const ggml_half * ds,
+        half * y,
+        int64_t k,
+        cudaStream_t stream);
+
+void dequantize_q8_0_soa_cont_cuda(
+        const int8_t * qs,
+        const ggml_half * ds,
+        float * y,
+        int64_t k,
+        cudaStream_t stream);
+
+void dequantize_q8_0_soa_cuda(
+        const int8_t * qs,
+        const ggml_half * ds,
+        half * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03,
+        cudaStream_t stream);
+
+void dequantize_q8_0_soa_cuda(
+        const int8_t * qs,
+        const ggml_half * ds,
+        nv_bfloat16 * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03,
+        cudaStream_t stream);
+
+void dequantize_q8_0_soa_cuda(
+        const int8_t * qs,
+        const ggml_half * ds,
+        float * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03,
+        cudaStream_t stream);
+
+void convert_block_q8_0_aos_to_soa(
+        const void * src_aos,
+        void * dst_soa,
+        int64_t nblocks,
+        cudaStream_t stream);
+
+void convert_block_q8_0_soa_to_aos(
+        const void * src_soa,
+        void * dst_aos,
+        int64_t nblocks,
+        cudaStream_t stream);
 
 void convert_block_mxfp4_aos_to_soa(
         const void * src_aos,

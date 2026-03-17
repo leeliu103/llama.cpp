@@ -590,6 +590,68 @@ static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_buffer_free_buffer;
 }
 
+bool ggml_cuda_tensor_uses_q8_0_soa(const ggml_tensor * tensor) {
+    return tensor != nullptr &&
+        tensor->buffer != nullptr &&
+        tensor->view_src == nullptr &&
+        tensor->type == GGML_TYPE_Q8_0 &&
+        ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_buffer_is_cuda(tensor->buffer);
+}
+
+bool ggml_cuda_tensor_storage_uses_q8_0_soa(const ggml_tensor * tensor) {
+    const ggml_tensor * storage = tensor != nullptr && tensor->view_src != nullptr ? tensor->view_src : tensor;
+
+    return storage != nullptr &&
+        storage->buffer != nullptr &&
+        storage->type == GGML_TYPE_Q8_0 &&
+        ggml_backend_buffer_get_usage(storage->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_buffer_is_cuda(storage->buffer);
+}
+
+ggml_cuda_q8_0_soa_view ggml_cuda_get_q8_0_soa_view(const ggml_tensor * tensor) {
+    GGML_ASSERT(ggml_cuda_tensor_storage_uses_q8_0_soa(tensor));
+
+    const ggml_tensor * storage = tensor->view_src != nullptr ? tensor->view_src : tensor;
+    const int8_t * qs_base = (const int8_t *) storage->data;
+    const ggml_half * ds_base = (const ggml_half *) (qs_base + ggml_nelements(storage));
+
+    const size_t view_offs = tensor->view_src != nullptr ? tensor->view_offs : 0;
+    GGML_ASSERT(view_offs % sizeof(block_q8_0) == 0);
+    const size_t block_offs = view_offs / sizeof(block_q8_0);
+
+    return ggml_cuda_q8_0_soa_view{
+        qs_base + block_offs * QK8_0,
+        ds_base + block_offs,
+    };
+}
+
+static bool ggml_backend_cuda_buffer_should_repack_q8_0(ggml_backend_buffer_t buffer, const ggml_tensor * tensor) {
+    return buffer == tensor->buffer && ggml_cuda_tensor_uses_q8_0_soa(tensor);
+}
+
+static bool ggml_cuda_tensors_need_q8_0_layout_convert(const ggml_tensor * src, const ggml_tensor * dst) {
+    return src->type == GGML_TYPE_Q8_0 &&
+        dst->type == GGML_TYPE_Q8_0 &&
+        src->view_src == nullptr &&
+        dst->view_src == nullptr &&
+        ggml_cuda_tensor_uses_q8_0_soa(src) != ggml_cuda_tensor_uses_q8_0_soa(dst);
+}
+
+static void ggml_cuda_convert_q8_0_layout(const ggml_tensor * src, ggml_tensor * dst, cudaStream_t stream) {
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nbytes(src) == ggml_nbytes(dst));
+
+    const int64_t nblocks = ggml_nelements(src) / ggml_blck_size(src->type);
+    if (ggml_cuda_tensor_uses_q8_0_soa(src)) {
+        convert_block_q8_0_soa_to_aos(src->data, dst->data, nblocks, stream);
+    } else {
+        convert_block_q8_0_aos_to_soa(src->data, dst->data, nblocks, stream);
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+}
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     return ctx->dev_ptr;
@@ -629,21 +691,38 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
 
-    if (tensor->type == GGML_TYPE_MXFP4) {
-        // Store MXFP4 as SoA on device so all kernels can share the same layout contract.
-        GGML_ASSERT(offset == 0);
-        GGML_ASSERT(size == ggml_nbytes(tensor));
-
-        void * tmp_src = nullptr;
-        CUDA_CHECK(ggml_cuda_device_malloc(&tmp_src, size, ctx->device));
-        CUDA_CHECK(cudaMemcpyAsync(tmp_src, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
-
+    const bool repack_q8_0 = ggml_backend_cuda_buffer_should_repack_q8_0(buffer, tensor);
+    if (tensor->type == GGML_TYPE_MXFP4 || repack_q8_0) {
+        const size_t nbytes = ggml_nbytes(tensor);
+        GGML_ASSERT(offset + size <= nbytes);
         const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
-        convert_block_mxfp4_aos_to_soa(tmp_src, tensor->data, nblocks, cudaStreamPerThread);
-        CUDA_CHECK(cudaGetLastError());
 
-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-        CUDA_CHECK(cudaFree(tmp_src));
+        if (tensor->type == GGML_TYPE_MXFP4) {
+            GGML_ASSERT(offset == 0);
+            GGML_ASSERT(size == nbytes);
+
+            void * tmp_src = nullptr;
+            CUDA_CHECK(ggml_cuda_device_malloc(&tmp_src, size, ctx->device));
+            CUDA_CHECK(cudaMemcpyAsync(tmp_src, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            convert_block_mxfp4_aos_to_soa(tmp_src, tensor->data, nblocks, cudaStreamPerThread);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            CUDA_CHECK(cudaFree(tmp_src));
+        } else {
+            void * tmp_aos = nullptr;
+            CUDA_CHECK(ggml_cuda_device_malloc(&tmp_aos, nbytes, ctx->device));
+
+            if (offset != 0 || size != nbytes) {
+                convert_block_q8_0_soa_to_aos(tensor->data, tmp_aos, nblocks, cudaStreamPerThread);
+                CUDA_CHECK(cudaGetLastError());
+            }
+
+            CUDA_CHECK(cudaMemcpyAsync((char *) tmp_aos + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            convert_block_q8_0_aos_to_soa(tmp_aos, tensor->data, nblocks, cudaStreamPerThread);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            CUDA_CHECK(cudaFree(tmp_aos));
+        }
         return;
     }
 
@@ -654,7 +733,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
-    if (tensor->type == GGML_TYPE_MXFP4) {
+    if (tensor->type == GGML_TYPE_MXFP4 || ggml_backend_cuda_buffer_should_repack_q8_0(buffer, tensor)) {
         ggml_cuda_set_device(ctx->device);
 
         const size_t nbytes = ggml_nbytes(tensor);
@@ -664,7 +743,11 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         CUDA_CHECK(ggml_cuda_device_malloc(&tmp_dst, nbytes, ctx->device));
 
         const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
-        convert_block_mxfp4_soa_to_aos(tensor->data, tmp_dst, nblocks, cudaStreamPerThread);
+        if (tensor->type == GGML_TYPE_MXFP4) {
+            convert_block_mxfp4_soa_to_aos(tensor->data, tmp_dst, nblocks, cudaStreamPerThread);
+        } else {
+            convert_block_q8_0_soa_to_aos(tensor->data, tmp_dst, nblocks, cudaStreamPerThread);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tmp_dst + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
@@ -682,6 +765,17 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+
+        if (ggml_cuda_tensors_need_q8_0_layout_convert(src, dst)) {
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || src_ctx->device != dst_ctx->device) {
+                return false;
+            }
+
+            ggml_cuda_convert_q8_0_layout(src, dst, cudaStreamPerThread);
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            return true;
+        }
+
         if (src_ctx->device == dst_ctx->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
@@ -1379,21 +1473,31 @@ static void ggml_cuda_op_mul_mat_cublas(
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
         if (src0->type != GGML_TYPE_F16) {
-            const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src0->type);
-            GGML_ASSERT(to_fp16_cuda != nullptr);
             size_t ne = row_diff*ne00;
             src0_as_f16.alloc(ne);
-            to_fp16_cuda(src0_dd_i, src0_as_f16.get(), ne, stream);
+            if (src0->view_src != nullptr && ggml_cuda_tensor_storage_uses_q8_0_soa(src0)) {
+                const ggml_cuda_q8_0_soa_view src0_soa = ggml_cuda_get_q8_0_soa_view(src0);
+                dequantize_q8_0_soa_cont_cuda(src0_soa.qs, src0_soa.ds, src0_as_f16.get(), ne, stream);
+            } else {
+                const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src0);
+                GGML_ASSERT(to_fp16_cuda != nullptr);
+                to_fp16_cuda(src0_dd_i, src0_as_f16.get(), ne, stream);
+            }
         }
         const half * src0_ptr = src0->type == GGML_TYPE_F16 ? (const half *) src0_dd_i : src0_as_f16.get();
 
         ggml_cuda_pool_alloc<half> src1_as_f16(ctx.pool(id));
         if (src1->type != GGML_TYPE_F16) {
-            const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src1->type);
-            GGML_ASSERT(to_fp16_cuda != nullptr);
             size_t ne = src1_ncols*ne10;
             src1_as_f16.alloc(ne);
-            to_fp16_cuda(src1_ddf_i, src1_as_f16.get(), ne, stream);
+            if (src1->view_src != nullptr && ggml_cuda_tensor_storage_uses_q8_0_soa(src1)) {
+                const ggml_cuda_q8_0_soa_view src1_soa = ggml_cuda_get_q8_0_soa_view(src1);
+                dequantize_q8_0_soa_cont_cuda(src1_soa.qs, src1_soa.ds, src1_as_f16.get(), ne, stream);
+            } else {
+                const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src1);
+                GGML_ASSERT(to_fp16_cuda != nullptr);
+                to_fp16_cuda(src1_ddf_i, src1_as_f16.get(), ne, stream);
+            }
         }
         const half * src1_ptr = src1->type == GGML_TYPE_F16 ? (const half *) src1_ddf_i : src1_as_f16.get();
 
@@ -1433,16 +1537,26 @@ static void ggml_cuda_op_mul_mat_cublas(
         ggml_cuda_pool_alloc<float> src1_ddq_as_f32(ctx.pool(id));
 
         if (src0->type != GGML_TYPE_F32) {
-            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
-            GGML_ASSERT(to_fp32_cuda != nullptr);
             src0_ddq_as_f32.alloc(row_diff*ne00);
-            to_fp32_cuda(src0_dd_i, src0_ddq_as_f32.get(), row_diff*ne00, stream);
+            if (src0->view_src != nullptr && ggml_cuda_tensor_storage_uses_q8_0_soa(src0)) {
+                const ggml_cuda_q8_0_soa_view src0_soa = ggml_cuda_get_q8_0_soa_view(src0);
+                dequantize_q8_0_soa_cont_cuda(src0_soa.qs, src0_soa.ds, src0_ddq_as_f32.get(), row_diff*ne00, stream);
+            } else {
+                const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0);
+                GGML_ASSERT(to_fp32_cuda != nullptr);
+                to_fp32_cuda(src0_dd_i, src0_ddq_as_f32.get(), row_diff*ne00, stream);
+            }
         }
         if (src1->type != GGML_TYPE_F32) {
-            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src1->type);
-            GGML_ASSERT(to_fp32_cuda != nullptr);
             src1_ddq_as_f32.alloc(src1_ncols*ne10);
-            to_fp32_cuda(src1_ddf_i, src1_ddq_as_f32.get(), src1_ncols*ne10, stream);
+            if (src1->view_src != nullptr && ggml_cuda_tensor_storage_uses_q8_0_soa(src1)) {
+                const ggml_cuda_q8_0_soa_view src1_soa = ggml_cuda_get_q8_0_soa_view(src1);
+                dequantize_q8_0_soa_cont_cuda(src1_soa.qs, src1_soa.ds, src1_ddq_as_f32.get(), src1_ncols*ne10, stream);
+            } else {
+                const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src1);
+                GGML_ASSERT(to_fp32_cuda != nullptr);
+                to_fp32_cuda(src1_ddf_i, src1_ddq_as_f32.get(), src1_ncols*ne10, stream);
+            }
         }
 
         const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_ddq_as_f32.get();
@@ -1900,7 +2014,7 @@ struct batched_mul_mat_traits<GGML_TYPE_F32> {
     static inline const float beta = 0.0f;
     static inline const void* get_alpha() { static const float val = alpha; return &val; }
     static inline const void* get_beta() { static const float val = beta; return &val; }
-    static inline auto get_nc_converter(ggml_type src_type) { return ggml_get_to_fp32_nc_cuda(src_type); }
+    static inline auto get_nc_converter(const ggml_tensor * src) { return ggml_get_to_fp32_nc_cuda(src); }
 };
 
 template<>
@@ -1913,7 +2027,7 @@ struct batched_mul_mat_traits<GGML_TYPE_BF16> {
     static inline const float beta = 0.0f;
     static inline const void* get_alpha() { static const float val = alpha; return &val; }
     static inline const void* get_beta() { static const float val = beta; return &val; }
-    static inline auto get_nc_converter(ggml_type src_type) { return ggml_get_to_bf16_nc_cuda(src_type); }
+    static inline auto get_nc_converter(const ggml_tensor * src) { return ggml_get_to_bf16_nc_cuda(src); }
 };
 
 template<>
@@ -1926,7 +2040,7 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline const half beta = 0.0;
     static inline const void* get_alpha() { static const half val = alpha; return &val; }
     static inline const void* get_beta() { static const half val = beta; return &val; }
-    static inline auto get_nc_converter(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
+    static inline auto get_nc_converter(const ggml_tensor * src) { return ggml_get_to_fp16_nc_cuda(src); }
 };
 
 template<ggml_type src0_type>
@@ -1976,9 +2090,21 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
         const int64_t ne_src1 = ggml_nelements(src1);
         src1_alloc.alloc(ne_src1);
 
-        const auto convert_func = traits::get_nc_converter(src1->type);
-        GGML_ASSERT(convert_func != nullptr);
-        convert_func(src1->data, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+        if (src1->view_src != nullptr && ggml_cuda_tensor_storage_uses_q8_0_soa(src1)) {
+            const ggml_cuda_q8_0_soa_view src1_soa = ggml_cuda_get_q8_0_soa_view(src1);
+            if constexpr (std::is_same_v<cuda_t, half>) {
+                dequantize_q8_0_soa_cuda(src1_soa.qs, src1_soa.ds, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+            } else if constexpr (std::is_same_v<cuda_t, nv_bfloat16>) {
+                dequantize_q8_0_soa_cuda(src1_soa.qs, src1_soa.ds, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+            } else {
+                static_assert(std::is_same_v<cuda_t, float>);
+                dequantize_q8_0_soa_cuda(src1_soa.qs, src1_soa.ds, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+            }
+        } else {
+            const auto convert_func = traits::get_nc_converter(src1);
+            GGML_ASSERT(convert_func != nullptr);
+            convert_func(src1->data, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+        }
         src1_ptr = src1_alloc.get();
         s11 = ne10;
         s12 = ne11*s11;
@@ -2239,12 +2365,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+    const bool src0_q8_0_soa_view = src0->view_src != nullptr && ggml_cuda_tensor_storage_uses_q8_0_soa(src0);
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !src0_q8_0_soa_view && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // fusion is not universally faster on Pascal
@@ -2275,6 +2402,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+    const bool src0_q8_0_soa_view = src0->view_src != nullptr && ggml_cuda_tensor_storage_uses_q8_0_soa(src0);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -2286,10 +2414,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !src0_q8_0_soa_view
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
-    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
+    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear && !src0_q8_0_soa_view
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     bool any_gpus_with_slow_fp16 = false;
@@ -2368,6 +2496,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
 
     GGML_TENSOR_BINARY_OP_LOCALS
+    const bool src0_q8_0_soa_view = src0->view_src != nullptr && ggml_cuda_tensor_storage_uses_q8_0_soa(src0);
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
@@ -2375,7 +2504,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
+            if (ggml_is_quantized(src0->type) && !src0_q8_0_soa_view) {
                 if (ne2 <= MMVQ_MMID_MAX_BATCH_SIZE) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
@@ -2388,7 +2517,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (!src0_q8_0_soa_view && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2888,6 +3017,27 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (ggml_backend_cuda_buffer_should_repack_q8_0(buf, tensor)) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        const size_t nbytes = ggml_nbytes(tensor);
+        GGML_ASSERT(offset + size <= nbytes);
+
+        void * tmp_aos = nullptr;
+        CUDA_CHECK(ggml_cuda_device_malloc(&tmp_aos, nbytes, cuda_ctx->device));
+
+        const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+        if (offset != 0 || size != nbytes) {
+            convert_block_q8_0_soa_to_aos(tensor->data, tmp_aos, nblocks, cuda_ctx->stream());
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync((char *) tmp_aos + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+        convert_block_q8_0_aos_to_soa(tmp_aos, tensor->data, nblocks, cuda_ctx->stream());
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        CUDA_CHECK(cudaFree(tmp_aos));
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -2924,6 +3074,26 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         GGML_LOG_DEBUG("%s: backend and buffer devices do not match\n", __func__);
 #endif
         return false;
+    }
+
+    if (ggml_cuda_tensors_need_q8_0_layout_convert(src, dst)) {
+        if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || cuda_ctx_src->device != cuda_ctx_dst->device) {
+            return false;
+        }
+
+        ggml_cuda_convert_q8_0_layout(src, dst, cuda_ctx_src->stream());
+
+        if (backend_src != backend_dst) {
+            if (!cuda_ctx_src->copy_event) {
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
+            }
+
+            CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
+        }
+
+        return true;
     }
 
     if (backend_src != backend_dst) {
