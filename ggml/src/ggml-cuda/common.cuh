@@ -1331,10 +1331,17 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    struct q8_0_async_upload {
+        ggml_cuda_pool * pool = nullptr;
+        void * aos = nullptr;
+        size_t aos_size = 0;
+    };
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int curr_stream_no = 0;
+    std::unordered_map<const ggml_tensor *, q8_0_async_upload> q8_0_async_uploads;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

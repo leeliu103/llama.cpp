@@ -12,6 +12,10 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+using ggml_backend_tensor_uses_q8_0_soa_t = bool (*)(const ggml_tensor * tensor);
+using ggml_backend_begin_tensor_upload_q8_0_soa_async_t = void (*)(ggml_backend_t backend, const ggml_tensor * tensor);
+using ggml_backend_finish_tensor_upload_q8_0_soa_async_t = void (*)(ggml_backend_t backend, const ggml_tensor * tensor);
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -1077,6 +1081,19 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    ggml_backend_tensor_uses_q8_0_soa_t tensor_uses_q8_0_soa = nullptr;
+    ggml_backend_begin_tensor_upload_q8_0_soa_async_t begin_tensor_upload_q8_0_soa_async = nullptr;
+    ggml_backend_finish_tensor_upload_q8_0_soa_async_t finish_tensor_upload_q8_0_soa_async = nullptr;
+    if (upload_backend) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(upload_backend));
+        tensor_uses_q8_0_soa = (ggml_backend_tensor_uses_q8_0_soa_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_tensor_uses_q8_0_soa");
+        begin_tensor_upload_q8_0_soa_async = (ggml_backend_begin_tensor_upload_q8_0_soa_async_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_begin_tensor_upload_q8_0_soa_async");
+        finish_tensor_upload_q8_0_soa_async = (ggml_backend_finish_tensor_upload_q8_0_soa_async_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_finish_tensor_upload_q8_0_soa_async");
+    }
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1133,7 +1150,19 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                const bool is_q8_0_soa_tensor = upload_backend &&
+                    tensor_uses_q8_0_soa != nullptr &&
+                    tensor_uses_q8_0_soa(cur);
+                const bool use_chunked_q8_0_soa_async_upload = is_q8_0_soa_tensor &&
+                    begin_tensor_upload_q8_0_soa_async != nullptr &&
+                    finish_tensor_upload_q8_0_soa_async != nullptr;
+                const bool avoid_chunked_async_upload = is_q8_0_soa_tensor && !use_chunked_q8_0_soa_async_upload;
+
+                if (upload_backend && !avoid_chunked_async_upload) {
+                    if (use_chunked_q8_0_soa_async_upload) {
+                        begin_tensor_upload_q8_0_soa_async(upload_backend, cur);
+                    }
+
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1175,8 +1204,12 @@ bool llama_model_loader::load_all_data(
                         }
 
                         // Async upload actual data to GPU
+                        const bool is_last_chunk = data_read + data_to_copy == n_size;
                         ggml_backend_tensor_set_async(upload_backend, cur,
                                                       reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
+                        if (use_chunked_q8_0_soa_async_upload && is_last_chunk) {
+                            finish_tensor_upload_q8_0_soa_async(upload_backend, cur);
+                        }
                         ggml_backend_event_record(events[buffer_idx], upload_backend);
 
                         data_read += data_to_copy;
@@ -1186,6 +1219,10 @@ bool llama_model_loader::load_all_data(
                         buffer_idx %= n_buffers;
                     }
                 } else {
+                    if (avoid_chunked_async_upload) {
+                        LLAMA_LOG_DEBUG("%s: falling back to whole-tensor upload for q8_0 SoA tensor %s\n", __func__, ggml_get_name(cur));
+                    }
+
                     read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
