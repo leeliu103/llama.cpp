@@ -72,13 +72,15 @@ static __device__ __forceinline__ float vec_dot_mxfp4_soa_q8_1_x4(
 #pragma unroll
     for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
         const int aux_q4 = get_int_b1(q4, iqs + l);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
-        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        const int2 v = get_int_from_mxfp4_q8_0_approx(aux_q4);
+        const int v0 = __vsubss4(v.x, 0xF8F8F8F8);
+        sumi = ggml_cuda_dp4a(v0,   q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
     }
 
-    const float d = ggml_cuda_e8m0_to_fp32(vx_e[kbx]) * 0.5f * __low2float(by->ds[block_inner]);
-    return d * sumi;
+    const float2 ds8f = __half22float2(by->ds[block_inner]);
+    const float d = ggml_cuda_e8m0_to_fp32(vx_e[kbx]) * 0.75f;
+    return d * (sumi * ds8f.x - 2.0f * ds8f.y);
 }
 
 enum mmvq_parameter_table_id {
