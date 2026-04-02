@@ -301,6 +301,18 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_0_16_q8_1_
 #define VDR_MXFP4_Q8_1_MMVQ 2
 #define VDR_MXFP4_Q8_1_MMQ  4
 
+static __device__ __forceinline__ int2 get_int_from_mxfp4_q8_0_approx(const int & q4) {
+    const int signs0 = __vcmpne4(q4 & 0x08080808, 0);
+    const int signs1 = __vcmpne4((q4 >> 4) & 0x08080808, 0);
+
+    const int mags0 = q4 & 0x07070707;
+    const int mags1 = (q4 >> 4) & 0x07070707;
+
+    return make_int2(
+            __vsub4(mags0 ^ signs0, signs0),
+            __vsub4(mags1 ^ signs1, signs1));
+}
+
 static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -312,14 +324,17 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #pragma unroll
     for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
         const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+        const int2 v = get_int_from_mxfp4_q8_0_approx(aux_q4);
 
-        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        const int v0 = __vsubss4(v.x, 0xF8F8F8F8);
+
+        sumi = ggml_cuda_dp4a(v0,   q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
     }
 
-    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
-    return d * sumi;
+    const float2 ds8f = __half22float2(bq8_1->ds);
+    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.75f;
+    return d * (sumi * ds8f.x - 2.0f * ds8f.y);
 }
 
 #define VDR_Q2_K_Q8_1_MMVQ 1
