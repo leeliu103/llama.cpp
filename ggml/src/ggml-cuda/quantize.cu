@@ -86,17 +86,17 @@ static __global__ void quantize_q8_1_x4(
     const float d = amax / 127.0f;
     const float d_inv = (amax == 0.0f) ? 0.0f : (1.0f / d);
 
-    const int8_t q0 = (amax == 0.0f) ? 0 : (int8_t) roundf(x0 * d_inv);
-    const int8_t q1 = (amax == 0.0f) ? 0 : (int8_t) roundf(x1 * d_inv);
-    const int8_t q2 = (amax == 0.0f) ? 0 : (int8_t) roundf(x2 * d_inv);
-    const int8_t q3 = (amax == 0.0f) ? 0 : (int8_t) roundf(x3 * d_inv);
-
     // Keep CUDA q8_1 behavior consistent with the existing kernel: ds.y stores sum(x), not d * sum(q).
     float sum = x0 + x1 + x2 + x3;
     sum = warp_reduce_sum<8>(sum);
 
     block_q8_1_x4 * y = (block_q8_1_x4 *) vy;
     const int64_t ibx4_outer = ((i3*ne2.z + i2) * ne1 + i1) * x4_per_row + blockIdx.x;
+
+    const int8_t q0 = (amax == 0.0f) ? 0 : (int8_t) roundf(x0 * d_inv);
+    const int8_t q1 = (amax == 0.0f) ? 0 : (int8_t) roundf(x1 * d_inv);
+    const int8_t q2 = (amax == 0.0f) ? 0 : (int8_t) roundf(x2 * d_inv);
+    const int8_t q3 = (amax == 0.0f) ? 0 : (int8_t) roundf(x3 * d_inv);
 
     y[ibx4_outer].qs[ibx4_inner * 8 + iqs] = pack_q8_1_i8x4(q0, q1, q2, q3);
     if (iqs == 0) {
