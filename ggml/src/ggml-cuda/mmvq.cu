@@ -138,9 +138,13 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 }
 
 static int calc_q4_K_q8_1_x4_nwarps(const int cc, const int nrows_x, const int ncols_x) {
-    if ((GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) &&
-        nrows_x <= 32768 && ncols_x >= 1024) {
-        return 2;
+    if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        if (nrows_x <= 32768 && ncols_x >= 3072) {
+            return 4;
+        }
+        if (nrows_x <= 32768 && ncols_x >= 512) {
+            return 2;
+        }
     }
     return 1;
 }
@@ -423,6 +427,15 @@ static void launch_mul_mat_vec_q4_K_q8_1_x4(
     const int device = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[device].cc;
     const int nwarps = calc_q4_K_q8_1_x4_nwarps(cc, (int) block_nums.x, (int) ncols_x);
+
+    if (nwarps == 4) {
+        const dim3 block_dims(generic_block_dims.x, 4, 1);
+        mul_mat_vec_q4_K_q8_1_x4<has_fusion, has_gate_fusion, has_ids, 4><<<block_nums, block_dims, 0, stream>>>
+            (vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        return;
+    }
 
     if (nwarps == 2) {
         const dim3 block_dims(generic_block_dims.x, 2, 1);
