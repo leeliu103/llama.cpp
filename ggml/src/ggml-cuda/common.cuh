@@ -1085,6 +1085,14 @@ struct ggml_cuda_pool_alloc {
         }
     }
 
+    void reset() {
+        if (ptr != nullptr) {
+            pool->free(ptr, actual_size);
+            ptr = nullptr;
+            actual_size = 0;
+        }
+    }
+
     // size is in number of elements
     T * alloc(size_t size) {
         GGML_ASSERT(pool != nullptr);
@@ -1410,6 +1418,27 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_pool & pool() {
         return pool(device);
+    }
+
+    struct mmvq_src1_cache {
+        ggml_cuda_pool_alloc<char> buffer;
+        const ggml_tensor * src1 = nullptr;
+    };
+
+    std::array<mmvq_src1_cache, GGML_CUDA_MAX_STREAMS> mmvq_src1_q8_1_cache;
+    std::array<mmvq_src1_cache, GGML_CUDA_MAX_STREAMS> mmvq_src1_q8_1_x4_cache;
+
+    mmvq_src1_cache & mmvq_src1_cache_for_format(const bool use_x4) {
+        return use_x4 ? mmvq_src1_q8_1_x4_cache[curr_stream_no] : mmvq_src1_q8_1_cache[curr_stream_no];
+    }
+
+    void reset_mmvq_src1_cache_metadata() {
+        for (auto & cache : mmvq_src1_q8_1_cache) {
+            cache.src1 = nullptr;
+        }
+        for (auto & cache : mmvq_src1_q8_1_x4_cache) {
+            cache.src1 = nullptr;
+        }
     }
 };
 
