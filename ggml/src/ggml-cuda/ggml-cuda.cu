@@ -3372,6 +3372,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
+    // MMVQ can reuse a quantized src1 buffer within one graph execution, but tensor contents
+    // may change between graph evaluations even when the tensor object is reused.
+    cuda_ctx->reset_mmvq_src1_cache_metadata();
+
     ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
     bool                         is_concurrent_event_active = false;
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
