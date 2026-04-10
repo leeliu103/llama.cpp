@@ -7,7 +7,7 @@ import {
 	LT_REGEX,
 	GT_REGEX,
 	FENCE_PATTERN
-} from '$lib/constants';
+} from '$lib/constants/code';
 
 export interface IncompleteCodeBlock {
 	language: string;

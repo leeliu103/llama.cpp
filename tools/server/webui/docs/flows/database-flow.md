@@ -66,14 +66,6 @@ sequenceDiagram
     DbSvc-->>Store: rootMessageId
     deactivate DbSvc
 
-    Store->>DbSvc: createSystemMessage(convId, content, parentId)
-    activate DbSvc
-    DbSvc->>DbSvc: Create message {role: "system", parent: parentId}
-    DbSvc->>Dexie: db.messages.add(systemMsg)
-    Dexie->>IDB: INSERT
-    DbSvc-->>Store: DatabaseMessage
-    deactivate DbSvc
-
     Store->>DbSvc: createMessageBranch(message, parentId)
     activate DbSvc
     DbSvc->>DbSvc: Generate UUID for new message
@@ -124,13 +116,6 @@ sequenceDiagram
     end
     DbSvc->>Dexie: db.messages.delete(msgId)
     Dexie->>IDB: DELETE target message
-
-    alt target message has a parent
-        DbSvc->>Dexie: db.messages.get(parentId)
-        DbSvc->>DbSvc: parent.children.filter(id !== msgId)
-        DbSvc->>Dexie: db.messages.update(parentId, {children})
-        Note right of DbSvc: Remove deleted message from parent's children[]
-    end
     deactivate DbSvc
 
     %% ═══════════════════════════════════════════════════════════════════════════
@@ -140,16 +125,12 @@ sequenceDiagram
     Store->>DbSvc: importConversations(data)
     activate DbSvc
     loop each conversation in data
-        DbSvc->>Dexie: db.conversations.get(conv.id)
-        alt conversation already exists
-            Note right of DbSvc: Skip duplicate (keep existing)
-        else conversation is new
-            DbSvc->>Dexie: db.conversations.add(conversation)
-            Dexie->>IDB: INSERT conversation
-            loop each message
-                DbSvc->>Dexie: db.messages.add(message)
-                Dexie->>IDB: INSERT message
-            end
+        DbSvc->>DbSvc: Generate new UUIDs (avoid conflicts)
+        DbSvc->>Dexie: db.conversations.add(conversation)
+        Dexie->>IDB: INSERT conversation
+        loop each message
+            DbSvc->>Dexie: db.messages.add(message)
+            Dexie->>IDB: INSERT message
         end
     end
     deactivate DbSvc

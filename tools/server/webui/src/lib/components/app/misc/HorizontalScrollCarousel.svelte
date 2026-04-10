@@ -1,10 +1,9 @@
 <script lang="ts">
 	import { ChevronLeft, ChevronRight } from '@lucide/svelte';
-	import type { Snippet } from 'svelte';
 
 	interface Props {
 		class?: string;
-		children?: Snippet;
+		children?: import('svelte').Snippet;
 		gapSize?: string;
 		onScrollableChange?: (isScrollable: boolean) => void;
 	}

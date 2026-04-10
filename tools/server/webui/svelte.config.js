@@ -21,7 +21,7 @@ const config = {
 			strict: true
 		}),
 		output: {
-			bundleStrategy: 'single'
+			bundleStrategy: 'inline'
 		},
 		alias: {
 			$styles: 'src/styles'

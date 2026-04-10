@@ -4,7 +4,7 @@ import {
 	SECONDS_PER_HOUR,
 	SHORT_DURATION_THRESHOLD,
 	MEDIUM_DURATION_THRESHOLD
-} from '$lib/constants';
+} from '$lib/constants/formatters';
 
 /**
  * Formats file size in bytes to human readable format

@@ -3,24 +3,17 @@
 	import { Button } from '$lib/components/ui/button';
 	import {
 		ChatFormActionAttachmentsDropdown,
-		ChatFormActionAttachmentsSheet,
 		ChatFormActionRecord,
 		ChatFormActionSubmit,
-		McpServersSelector,
-		ModelsSelector,
-		ModelsSelectorSheet
+		ModelsSelector
 	} from '$lib/components/app';
-	import { SETTINGS_SECTION_TITLES } from '$lib/constants';
-	import { mcpStore } from '$lib/stores/mcp.svelte';
-	import { getChatSettingsDialogContext } from '$lib/contexts';
 	import { FileTypeCategory } from '$lib/enums';
 	import { getFileTypeCategory } from '$lib/utils';
 	import { config } from '$lib/stores/settings.svelte';
 	import { modelsStore, modelOptions, selectedModelId } from '$lib/stores/models.svelte';
-	import { isRouterMode, serverError } from '$lib/stores/server.svelte';
+	import { isRouterMode } from '$lib/stores/server.svelte';
 	import { chatStore } from '$lib/stores/chat.svelte';
-	import { activeMessages, conversationsStore } from '$lib/stores/conversations.svelte';
-	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
+	import { activeMessages } from '$lib/stores/conversations.svelte';
 
 	interface Props {
 		canSend?: boolean;
@@ -34,8 +27,6 @@
 		onMicClick?: () => void;
 		onStop?: () => void;
 		onSystemPromptClick?: () => void;
-		onMcpPromptClick?: () => void;
-		onMcpResourcesClick?: () => void;
 	}
 
 	let {
@@ -49,30 +40,22 @@
 		onFileUpload,
 		onMicClick,
 		onStop,
-		onSystemPromptClick,
-		onMcpPromptClick,
-		onMcpResourcesClick
+		onSystemPromptClick
 	}: Props = $props();
 
 	let currentConfig = $derived(config());
 	let isRouter = $derived(isRouterMode());
-	let isOffline = $derived(!!serverError());
 
 	let conversationModel = $derived(
 		chatStore.getConversationModel(activeMessages() as DatabaseMessage[])
 	);
 
-	let lastSyncedConversationModel: string | null = null;
+	let previousConversationModel: string | null = null;
 
 	$effect(() => {
-		if (conversationModel && conversationModel !== lastSyncedConversationModel) {
-			lastSyncedConversationModel = conversationModel;
+		if (conversationModel && conversationModel !== previousConversationModel) {
+			previousConversationModel = conversationModel;
 			modelsStore.selectModelByName(conversationModel);
-		} else if (isRouter && !modelsStore.selectedModelId && modelsStore.loadedModelIds.length > 0) {
-			lastSyncedConversationModel = null;
-			// auto-select the first loaded model only when nothing is selected yet
-			const first = modelOptions().find((m) => modelsStore.loadedModelIds.includes(m.model));
-			if (first) modelsStore.selectModelById(first.id);
 		}
 	});
 
@@ -165,83 +148,32 @@
 		return '';
 	});
 
-	let selectorModelRef: ModelsSelector | ModelsSelectorSheet | undefined = $state(undefined);
-
-	let isMobile = new IsMobile();
+	let selectorModelRef: ModelsSelector | undefined = $state(undefined);
 
 	export function openModelSelector() {
 		selectorModelRef?.open();
 	}
-
-	const chatSettingsDialog = getChatSettingsDialogContext();
-
-	let hasMcpPromptsSupport = $derived.by(() => {
-		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
-
-		return mcpStore.hasPromptsCapability(perChatOverrides);
-	});
-
-	let hasMcpResourcesSupport = $derived.by(() => {
-		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
-
-		return mcpStore.hasResourcesCapability(perChatOverrides);
-	});
 </script>
 
 <div class="flex w-full items-center gap-3 {className}" style="container-type: inline-size">
 	<div class="mr-auto flex items-center gap-2">
-		{#if isMobile.current}
-			<ChatFormActionAttachmentsSheet
-				{disabled}
-				{hasAudioModality}
-				{hasVisionModality}
-				{hasMcpPromptsSupport}
-				{hasMcpResourcesSupport}
-				{onFileUpload}
-				{onSystemPromptClick}
-				{onMcpPromptClick}
-				{onMcpResourcesClick}
-				onMcpSettingsClick={() => chatSettingsDialog.open(SETTINGS_SECTION_TITLES.MCP)}
-			/>
-		{:else}
-			<ChatFormActionAttachmentsDropdown
-				{disabled}
-				{hasAudioModality}
-				{hasVisionModality}
-				{hasMcpPromptsSupport}
-				{hasMcpResourcesSupport}
-				{onFileUpload}
-				{onSystemPromptClick}
-				{onMcpPromptClick}
-				{onMcpResourcesClick}
-				onMcpSettingsClick={() => chatSettingsDialog.open(SETTINGS_SECTION_TITLES.MCP)}
-			/>
-		{/if}
-
-		<McpServersSelector
+		<ChatFormActionAttachmentsDropdown
 			{disabled}
-			onSettingsClick={() => chatSettingsDialog.open(SETTINGS_SECTION_TITLES.MCP)}
+			{hasAudioModality}
+			{hasVisionModality}
+			{onFileUpload}
+			{onSystemPromptClick}
 		/>
 	</div>
 
 	<div class="ml-auto flex items-center gap-1.5">
-		{#if isMobile.current}
-			<ModelsSelectorSheet
-				disabled={disabled || isOffline}
-				bind:this={selectorModelRef}
-				currentModel={conversationModel}
-				forceForegroundText
-				useGlobalSelection
-			/>
-		{:else}
-			<ModelsSelector
-				disabled={disabled || isOffline}
-				bind:this={selectorModelRef}
-				currentModel={conversationModel}
-				forceForegroundText
-				useGlobalSelection
-			/>
-		{/if}
+		<ModelsSelector
+			{disabled}
+			bind:this={selectorModelRef}
+			currentModel={conversationModel}
+			forceForegroundText={true}
+			useGlobalSelection={true}
+		/>
 	</div>
 
 	{#if isLoading}

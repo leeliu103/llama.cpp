@@ -21,7 +21,6 @@
 		onEdit: () => void;
 		onDelete: () => void;
 		onConfirmDelete: () => void;
-		onForkConversation?: (options: { name: string; includeAttachments: boolean }) => void;
 		onShowDeleteDialogChange: (show: boolean) => void;
 		onNavigateToSibling?: (siblingId: string) => void;
 		onCopy: () => void;
@@ -36,7 +35,6 @@
 		onEdit,
 		onDelete,
 		onConfirmDelete,
-		onForkConversation,
 		onShowDeleteDialogChange,
 		onNavigateToSibling,
 		onCopy
@@ -84,7 +82,7 @@
 	{:else}
 		{#if message.extra && message.extra.length > 0}
 			<div class="mb-2 max-w-[80%]">
-				<ChatAttachmentsList attachments={message.extra} readonly imageHeight="h-80" />
+				<ChatAttachmentsList attachments={message.extra} readonly={true} imageHeight="h-80" />
 			</div>
 		{/if}
 
@@ -116,7 +114,6 @@
 					{onCopy}
 					{onDelete}
 					{onEdit}
-					{onForkConversation}
 					{onNavigateToSibling}
 					{onShowDeleteDialogChange}
 					{siblingInfo}

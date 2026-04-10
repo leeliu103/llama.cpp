@@ -73,7 +73,7 @@
 			conversationsStore.conversations = mockConversations;
 		}, 0));
 		
-		const searchTrigger = screen.getByText('Search');
+		const searchTrigger = screen.getByText('Search conversations');
 		userEvent.click(searchTrigger);
 	}}
 >

@@ -1,6 +1,5 @@
 import type { ErrorDialogType } from '$lib/enums';
-import type { ApiChatCompletionToolCall } from './api';
-import type { DatabaseMessage, DatabaseMessageExtra } from './database';
+import type { DatabaseMessageExtra } from './database';
 
 export interface ChatUploadedFile {
 	id: string;
@@ -10,11 +9,6 @@ export interface ChatUploadedFile {
 	file: File;
 	preview?: string;
 	textContent?: string;
-	mcpPrompt?: {
-		serverName: string;
-		promptName: string;
-		arguments?: Record<string, string>;
-	};
 	isLoading?: boolean;
 	loadError?: string;
 }
@@ -25,8 +19,6 @@ export interface ChatAttachmentDisplayItem {
 	size?: number;
 	preview?: string;
 	isImage: boolean;
-	isMcpPrompt?: boolean;
-	isMcpResource?: boolean;
 	isLoading?: boolean;
 	loadError?: string;
 	uploadedFile?: ChatUploadedFile;
@@ -64,66 +56,25 @@ export interface ChatMessageTimings {
 	predicted_n?: number;
 	prompt_ms?: number;
 	prompt_n?: number;
-	agentic?: ChatMessageAgenticTimings;
-}
-
-export interface ChatMessageAgenticTimings {
-	turns: number;
-	toolCallsCount: number;
-	toolsMs: number;
-	toolCalls?: ChatMessageToolCallTiming[];
-	perTurn?: ChatMessageAgenticTurnStats[];
-	llm: {
-		predicted_n: number;
-		predicted_ms: number;
-		prompt_n: number;
-		prompt_ms: number;
-	};
-}
-
-export interface ChatMessageAgenticTurnStats {
-	turn: number;
-	llm: {
-		predicted_n: number;
-		predicted_ms: number;
-		prompt_n: number;
-		prompt_ms: number;
-	};
-	toolCalls: ChatMessageToolCallTiming[];
-	toolsMs: number;
-}
-
-export interface ChatMessageToolCallTiming {
-	name: string;
-	duration_ms: number;
-	success: boolean;
 }
 
 /**
- * Callbacks for streaming chat responses (used by both agentic and non-agentic paths)
+ * Callbacks for streaming chat responses
  */
 export interface ChatStreamCallbacks {
 	onChunk?: (chunk: string) => void;
 	onReasoningChunk?: (chunk: string) => void;
-	onToolCallsStreaming?: (toolCalls: ApiChatCompletionToolCall[]) => void;
-	onAttachments?: (messageId: string, extras: DatabaseMessageExtra[]) => void;
+	onToolCallChunk?: (chunk: string) => void;
+	onAttachments?: (extras: DatabaseMessageExtra[]) => void;
 	onModel?: (model: string) => void;
 	onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void;
-	onAssistantTurnComplete?: (
-		content: string,
-		reasoningContent: string | undefined,
-		timings: ChatMessageTimings | undefined,
-		toolCalls: ApiChatCompletionToolCall[] | undefined
-	) => Promise<void>;
-	createToolResultMessage?: (
-		toolCallId: string,
-		content: string,
-		extras?: DatabaseMessageExtra[]
-	) => Promise<DatabaseMessage>;
-	createAssistantMessage?: () => Promise<DatabaseMessage>;
-	onFlowComplete?: (timings?: ChatMessageTimings) => void;
+	onComplete?: (
+		content?: string,
+		reasoningContent?: string,
+		timings?: ChatMessageTimings,
+		toolCallContent?: string
+	) => void;
 	onError?: (error: Error) => void;
-	onTurnComplete?: (intermediateTimings: ChatMessageTimings) => void;
 }
 
 /**

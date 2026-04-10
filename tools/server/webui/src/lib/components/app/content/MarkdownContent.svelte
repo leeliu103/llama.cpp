@@ -4,7 +4,6 @@
 	import remarkGfm from 'remark-gfm';
 	import remarkMath from 'remark-math';
 	import rehypeHighlight from 'rehype-highlight';
-	import { all as lowlightAll } from 'lowlight';
 	import remarkRehype from 'remark-rehype';
 	import rehypeKatex from 'rehype-katex';
 	import rehypeStringify from 'rehype-stringify';
@@ -17,19 +16,21 @@
 	import { rehypeEnhanceLinks } from '$lib/markdown/enhance-links';
 	import { rehypeEnhanceCodeBlocks } from '$lib/markdown/enhance-code-blocks';
 	import { rehypeResolveAttachmentImages } from '$lib/markdown/resolve-attachment-images';
-	import { rehypeRtlSupport } from '$lib/markdown/rehype-rtl-support';
 	import { remarkLiteralHtml } from '$lib/markdown/literal-html';
 	import { copyCodeToClipboard, preprocessLaTeX, getImageErrorFallbackHtml } from '$lib/utils';
 	import {
 		IMAGE_NOT_ERROR_BOUND_SELECTOR,
 		DATA_ERROR_BOUND_ATTR,
 		DATA_ERROR_HANDLED_ATTR,
-		BOOL_TRUE_STRING,
-		SETTINGS_KEYS
-	} from '$lib/constants';
-	import { ColorMode, UrlProtocol } from '$lib/enums';
+		BOOL_TRUE_STRING
+	} from '$lib/constants/markdown';
+	import { UrlPrefix } from '$lib/enums';
 	import { FileTypeText } from '$lib/enums/files';
-	import { highlightCode, detectIncompleteCodeBlock, type IncompleteCodeBlock } from '$lib/utils';
+	import {
+		highlightCode,
+		detectIncompleteCodeBlock,
+		type IncompleteCodeBlock
+	} from '$lib/utils/code';
 	import '$styles/katex-custom.scss';
 	import githubDarkCss from 'highlight.js/styles/github-dark.css?inline';
 	import githubLightCss from 'highlight.js/styles/github.css?inline';
@@ -38,7 +39,7 @@
 	import { createAutoScrollController } from '$lib/hooks/use-auto-scroll.svelte';
 	import type { DatabaseMessageExtra } from '$lib/types/database';
 	import { config } from '$lib/stores/settings.svelte';
-	import { fadeInView } from '$lib/actions/fade-in-view.svelte';
+	import { SETTINGS_KEYS } from '$lib/constants/settings-keys';
 
 	interface Props {
 		attachments?: DatabaseMessageExtra[];
@@ -97,14 +98,12 @@
 
 		return proc
 			.use(rehypeHighlight, {
-				languages: lowlightAll,
 				aliases: { [FileTypeText.XML]: [FileTypeText.SVELTE, FileTypeText.VUE] }
 			}) // Add syntax highlighting
 			.use(rehypeRestoreTableHtml) // Restore limited HTML (e.g., <br>, <ul>) inside Markdown tables
 			.use(rehypeEnhanceLinks) // Add target="_blank" to links
 			.use(rehypeEnhanceCodeBlocks) // Wrap code blocks with header and actions
 			.use(rehypeResolveAttachmentImages, { attachments })
-			.use(rehypeRtlSupport) // Add bidirectional text support
 			.use(rehypeStringify, { allowDangerousHtml: true }); // Convert to HTML string
 	});
 
@@ -506,7 +505,7 @@
 
 		// Don't handle data URLs or already-handled images
 		if (
-			img.src.startsWith(UrlProtocol.DATA) ||
+			img.src.startsWith(UrlPrefix.DATA) ||
 			img.dataset[DATA_ERROR_HANDLED_ATTR] === BOOL_TRUE_STRING
 		)
 			return;
@@ -561,7 +560,7 @@
 
 	$effect(() => {
 		const currentMode = mode.current;
-		const isDark = currentMode === ColorMode.DARK;
+		const isDark = currentMode === 'dark';
 
 		loadHighlightTheme(isDark);
 	});
@@ -603,7 +602,7 @@
 		: ''}"
 >
 	{#each renderedBlocks as block (block.id)}
-		<div class="markdown-block" data-block-id={block.id} use:fadeInView={{ skipIfVisible: true }}>
+		<div class="markdown-block" data-block-id={block.id}>
 			<!-- eslint-disable-next-line no-at-html-tags -->
 			{@html block.html}
 		</div>
@@ -623,7 +622,7 @@
 				<ActionIconsCodeBlock
 					code={incompleteCodeBlock.code}
 					language={incompleteCodeBlock.language || 'text'}
-					disabled
+					disabled={true}
 					onPreview={(code, lang) => {
 						previewCode = code;
 						previewLanguage = lang;
@@ -656,6 +655,7 @@
 />
 
 <style>
+	.markdown-block,
 	.markdown-block--unstable {
 		display: contents;
 	}
@@ -785,19 +785,19 @@
 	/* Lists */
 	div :global(ul) {
 		list-style-type: disc;
-		margin-inline-start: 1.5rem;
+		margin-left: 1.5rem;
 		margin-bottom: 1rem;
 	}
 
 	div :global(ol) {
 		list-style-type: decimal;
-		margin-inline-start: 1.5rem;
+		margin-left: 1.5rem;
 		margin-bottom: 1rem;
 	}
 
 	div :global(li) {
 		margin-bottom: 0.25rem;
-		padding-inline-start: 0.5rem;
+		padding-left: 0.5rem;
 	}
 
 	div :global(li::marker) {
@@ -820,8 +820,8 @@
 	/* Task lists */
 	div :global(.task-list-item) {
 		list-style: none;
-		margin-inline-start: 0;
-		padding-inline-start: 0;
+		margin-left: 0;
+		padding-left: 0;
 	}
 
 	div :global(.task-list-item-checkbox) {

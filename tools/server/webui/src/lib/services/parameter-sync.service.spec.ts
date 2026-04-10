@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import { ParameterSyncService } from './parameter-sync.service';
-import { ColorMode } from '$lib/enums';
 
 describe('ParameterSyncService', () => {
 	describe('roundFloatingPoint', () => {
@@ -51,7 +50,7 @@ describe('ParameterSyncService', () => {
 				chat_format: '',
 				reasoning_format: '',
 				reasoning_in_content: false,
-				generation_prompt: '',
+				thinking_forced_open: false,
 				'speculative.n_max': 0,
 				'speculative.n_min': 0,
 				'speculative.p_min': 0.0,
@@ -116,7 +115,7 @@ describe('ParameterSyncService', () => {
 				chat_format: '',
 				reasoning_format: '',
 				reasoning_in_content: false,
-				generation_prompt: '',
+				thinking_forced_open: false,
 				'speculative.n_max': 0,
 				'speculative.n_min': 0,
 				'speculative.p_min': 0.0,
@@ -137,7 +136,7 @@ describe('ParameterSyncService', () => {
 				pasteLongTextToFileLen: 0,
 				pdfAsImage: true,
 				renderUserContentAsMarkdown: false,
-				theme: ColorMode.DARK
+				theme: 'dark'
 			});
 
 			expect(result.pasteLongTextToFileLen).toBe(0);

@@ -1,13 +1,11 @@
-ARG UBUNTU_VERSION=24.04
+ARG UBUNTU_VERSION=22.04
 
 FROM ubuntu:$UBUNTU_VERSION AS build
 
 ARG TARGETARCH
 
 RUN apt-get update && \
-    apt-get install -y gcc-14 g++-14 build-essential git cmake libssl-dev
-
-ENV CC=gcc-14 CXX=g++-14
+    apt-get install -y build-essential git cmake libssl-dev
 
 WORKDIR /app
 
@@ -36,7 +34,7 @@ RUN mkdir -p /app/full \
 FROM ubuntu:$UBUNTU_VERSION AS base
 
 RUN apt-get update \
-    && apt-get install -y libgomp1 curl \
+    && apt-get install -y libgomp1 curl\
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \
@@ -57,9 +55,8 @@ RUN apt-get update \
     git \
     python3 \
     python3-pip \
-    python3-wheel \
-    && pip install --break-system-packages --upgrade setuptools \
-    && pip install --break-system-packages -r requirements.txt \
+    && pip install --upgrade pip setuptools wheel \
+    && pip install -r requirements.txt \
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \

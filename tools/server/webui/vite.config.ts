@@ -1,6 +1,7 @@
 import tailwindcss from '@tailwindcss/vite';
 import { sveltekit } from '@sveltejs/kit/vite';
-import { readFileSync, writeFileSync, existsSync, readdirSync, copyFileSync } from 'fs';
+import * as fflate from 'fflate';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -19,13 +20,15 @@ const GUIDE_FOR_FRONTEND = `
 -->
 `.trim();
 
+const MAX_BUNDLE_SIZE = 2 * 1024 * 1024;
+
 /**
  * the maximum size of an embedded asset in bytes,
  * e.g. maximum size of embedded font (see node_modules/katex/dist/fonts/*.woff2)
  */
 const MAX_ASSET_SIZE = 32000;
 
-/** public/index.html minified flag */
+/** public/index.html.gz minified flag */
 const ENABLE_JS_MINIFICATION = true;
 
 function llamaCppBuildPlugin() {
@@ -37,6 +40,7 @@ function llamaCppBuildPlugin() {
 			setTimeout(() => {
 				try {
 					const indexPath = resolve('../public/index.html');
+					const gzipPath = resolve('../public/index.html.gz');
 
 					if (!existsSync(indexPath)) {
 						return;
@@ -57,35 +61,26 @@ function llamaCppBuildPlugin() {
 
 					content = content.replace(/\r/g, '');
 					content = GUIDE_FOR_FRONTEND + '\n' + content;
-					content = content.replace(/\/_app\/immutable\/bundle\.[^"]+\.js/g, './bundle.js');
-					content = content.replace(
-						/\/_app\/immutable\/assets\/bundle\.[^"]+\.css/g,
-						'./bundle.css'
-					);
 
-					writeFileSync(indexPath, content, 'utf-8');
-					console.log('✓ Updated index.html');
+					const compressed = fflate.gzipSync(Buffer.from(content, 'utf-8'), { level: 9 });
 
-					// Copy bundle.*.js -> ../public/bundle.js
-					const immutableDir = resolve('../public/_app/immutable');
-					const bundleDir = resolve('../public/_app/immutable/assets');
-					if (existsSync(immutableDir)) {
-						const jsFiles = readdirSync(immutableDir).filter((f) => f.match(/^bundle\..+\.js$/));
-						if (jsFiles.length > 0) {
-							copyFileSync(resolve(immutableDir, jsFiles[0]), resolve('../public/bundle.js'));
-							console.log(`✓ Copied ${jsFiles[0]} -> bundle.js`);
-						}
+					compressed[0x4] = 0;
+					compressed[0x5] = 0;
+					compressed[0x6] = 0;
+					compressed[0x7] = 0;
+					compressed[0x9] = 0;
+
+					if (compressed.byteLength > MAX_BUNDLE_SIZE) {
+						throw new Error(
+							`Bundle size is too large (${Math.ceil(compressed.byteLength / 1024)} KB).\n` +
+								`Please reduce the size of the frontend or increase MAX_BUNDLE_SIZE in vite.config.ts.\n`
+						);
 					}
-					// Copy bundle.*.css -> ../public/bundle.css
-					if (existsSync(bundleDir)) {
-						const cssFiles = readdirSync(bundleDir).filter((f) => f.match(/^bundle\..+\.css$/));
-						if (cssFiles.length > 0) {
-							copyFileSync(resolve(bundleDir, cssFiles[0]), resolve('../public/bundle.css'));
-							console.log(`✓ Copied ${cssFiles[0]} -> bundle.css`);
-						}
-					}
+
+					writeFileSync(gzipPath, compressed);
+					console.log('✓ Created index.html.gz');
 				} catch (error) {
-					console.error('Failed to update index.html:', error);
+					console.error('Failed to create gzip file:', error);
 				}
 			}, 100);
 		}

@@ -1,6 +1,6 @@
 import { base } from '$app/paths';
 import { getJsonHeaders, getAuthHeaders } from './api-headers';
-import { UrlProtocol } from '$lib/enums';
+import { UrlPrefix } from '$lib/enums';
 
 /**
  * API Fetch Utilities
@@ -50,9 +50,7 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
 	const headers = { ...baseHeaders, ...customHeaders };
 
 	const url =
-		path.startsWith(UrlProtocol.HTTP) || path.startsWith(UrlProtocol.HTTPS)
-			? path
-			: `${base}${path}`;
+		path.startsWith(UrlPrefix.HTTP) || path.startsWith(UrlPrefix.HTTPS) ? path : `${base}${path}`;
 
 	const response = await fetch(url, {
 		...fetchOptions,

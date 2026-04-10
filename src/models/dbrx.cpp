@@ -1,11 +1,12 @@
 #include "models.h"
 
+
 llm_build_dbrx::llm_build_dbrx(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
-    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int64_t n_embd_head = hparams.n_embd_head_v;
     const int64_t n_embd_gqa  = hparams.n_embd_v_gqa();
 
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-    GGML_ASSERT(n_embd_head == n_rot);
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+    GGML_ASSERT(n_embd_head == hparams.n_rot);
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -88,7 +89,7 @@ llm_build_dbrx::llm_build_dbrx(const llama_model & model, const llm_graph_params
                 nullptr,
                 n_expert, n_expert_used,
                 LLM_FFN_SILU, true,
-                hparams.expert_weights_scale,
+                false, 0.0,
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                 il);
         cb(cur, "ffn_moe_out", il);

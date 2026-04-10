@@ -45,7 +45,6 @@ export interface ApiErrorResponse {
 export interface ApiChatMessageData {
 	role: ChatRole;
 	content: string | ApiChatMessageContentPart[];
-	reasoning_content?: string;
 	tool_calls?: ApiChatCompletionToolCall[];
 	tool_call_id?: string;
 	timestamp?: number;
@@ -55,7 +54,7 @@ export interface ApiChatMessageData {
  * Model status object from /models endpoint
  */
 export interface ApiModelStatus {
-	/** Status value: loaded, unloaded, loading, sleeping, failed */
+	/** Status value: loaded, unloaded, loading, failed */
 	value: ServerModelStatus;
 	/** Command line arguments used when loading (only for loaded models) */
 	args?: string[];
@@ -82,10 +81,6 @@ export interface ApiModelDataEntry {
 	path: string;
 	/** Current status of the model */
 	status: ApiModelStatus;
-	/** Alternative names that resolve to this model */
-	aliases?: string[];
-	/** Informational tags for this model */
-	tags?: string[];
 	/** Legacy meta field (may be present in older responses) */
 	meta?: Record<string, unknown> | null;
 }
@@ -165,7 +160,7 @@ export interface ApiLlamaCppServerProps {
 			chat_format: string;
 			reasoning_format: string;
 			reasoning_in_content: boolean;
-			generation_prompt: string;
+			thinking_forced_open: boolean;
 			samplers: string[];
 			backend_sampling: boolean;
 			'speculative.n_max': number;
@@ -202,9 +197,6 @@ export interface ApiChatCompletionRequest {
 	messages: Array<{
 		role: ChatRole;
 		content: string | ApiChatMessageContentPart[];
-		reasoning_content?: string;
-		tool_calls?: ApiChatCompletionToolCall[];
-		tool_call_id?: string;
 	}>;
 	stream?: boolean;
 	model?: string;
@@ -336,7 +328,7 @@ export interface ApiSlotData {
 		chat_format: string;
 		reasoning_format: string;
 		reasoning_in_content: boolean;
-		generation_prompt: string;
+		thinking_forced_open: boolean;
 		samplers: string[];
 		backend_sampling: boolean;
 		'speculative.n_max': number;

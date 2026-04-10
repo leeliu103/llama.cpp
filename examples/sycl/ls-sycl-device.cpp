@@ -6,10 +6,8 @@
 
 
 #include "ggml-sycl.h"
-#include <clocale>
 
 int main() {
-    std::setlocale(LC_NUMERIC, "C");
     ggml_backend_sycl_print_sycl_devices();
     return 0;
 }

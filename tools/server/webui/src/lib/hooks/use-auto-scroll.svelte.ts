@@ -1,8 +1,8 @@
-import { AUTO_SCROLL_AT_BOTTOM_THRESHOLD, AUTO_SCROLL_INTERVAL } from '$lib/constants';
+import { AUTO_SCROLL_AT_BOTTOM_THRESHOLD, AUTO_SCROLL_INTERVAL } from '$lib/constants/auto-scroll';
 
 export interface AutoScrollOptions {
+	/** Whether auto-scroll is disabled globally (e.g., from settings) */
 	disabled?: boolean;
-	isColumnReverse?: boolean;
 }
 
 /**
@@ -12,7 +12,6 @@ export interface AutoScrollOptions {
  * - Auto-scrolls to bottom during streaming/loading
  * - Stops auto-scroll when user manually scrolls up
  * - Resumes auto-scroll when user scrolls back to bottom
- * - Supports both normal and column-reverse scroll containers
  */
 export class AutoScrollController {
 	private _autoScrollEnabled = $state(true);
@@ -22,14 +21,9 @@ export class AutoScrollController {
 	private _scrollTimeout: ReturnType<typeof setTimeout> | undefined;
 	private _container: HTMLElement | undefined;
 	private _disabled: boolean;
-	private _isColumnReverse: boolean;
-	private _mutationObserver: MutationObserver | null = null;
-	private _rafPending = false;
-	private _observerEnabled = false;
 
 	constructor(options: AutoScrollOptions = {}) {
 		this._disabled = options.disabled ?? false;
-		this._isColumnReverse = options.isColumnReverse ?? false;
 	}
 
 	get autoScrollEnabled(): boolean {
@@ -44,12 +38,7 @@ export class AutoScrollController {
 	 * Binds the controller to a scrollable container element.
 	 */
 	setContainer(container: HTMLElement | undefined): void {
-		this._doStopObserving();
 		this._container = container;
-
-		if (this._observerEnabled && container && !this._disabled) {
-			this._doStartObserving();
-		}
 	}
 
 	/**
@@ -60,9 +49,6 @@ export class AutoScrollController {
 		if (disabled) {
 			this._autoScrollEnabled = false;
 			this.stopInterval();
-			this._doStopObserving();
-		} else if (this._observerEnabled && this._container && !this._mutationObserver) {
-			this._doStartObserving();
 		}
 	}
 
@@ -73,23 +59,10 @@ export class AutoScrollController {
 		if (this._disabled || !this._container) return;
 
 		const { scrollTop, scrollHeight, clientHeight } = this._container;
-
-		let distanceFromBottom: number;
-		let isScrollingUp: boolean;
-
-		if (this._isColumnReverse) {
-			// column-reverse: scrollTop=0 at bottom, negative when scrolled up
-			distanceFromBottom = Math.abs(scrollTop);
-			isScrollingUp = scrollTop < this._lastScrollTop;
-		} else {
-			// normal: scrollTop=0 at top, increases when scrolled down
-			distanceFromBottom = scrollHeight - clientHeight - scrollTop;
-			isScrollingUp = scrollTop < this._lastScrollTop;
-		}
-
+		const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
 		const isAtBottom = distanceFromBottom < AUTO_SCROLL_AT_BOTTOM_THRESHOLD;
 
-		if (isScrollingUp && !isAtBottom) {
+		if (scrollTop < this._lastScrollTop && !isAtBottom) {
 			this._userScrolledUp = true;
 			this._autoScrollEnabled = false;
 		} else if (isAtBottom && this._userScrolledUp) {
@@ -117,12 +90,10 @@ export class AutoScrollController {
 	scrollToBottom(behavior: ScrollBehavior = 'smooth'): void {
 		if (this._disabled || !this._container) return;
 
-		if (this._isColumnReverse) {
-			// column-reverse: scrollTop=0 is the bottom
-			this._container.scrollTo({ top: 0, behavior });
-		} else {
-			this._container.scrollTo({ top: this._container.scrollHeight, behavior });
-		}
+		this._container.scrollTo({
+			top: this._container.scrollHeight,
+			behavior
+		});
 	}
 
 	/**
@@ -179,68 +150,10 @@ export class AutoScrollController {
 	 */
 	destroy(): void {
 		this.stopInterval();
-		this._doStopObserving();
-
 		if (this._scrollTimeout) {
 			clearTimeout(this._scrollTimeout);
 			this._scrollTimeout = undefined;
 		}
-	}
-
-	/**
-	 * Starts a MutationObserver on the container that auto-scrolls to bottom
-	 * on content changes. More responsive than interval-based polling.
-	 */
-	startObserving(): void {
-		this._observerEnabled = true;
-
-		if (this._container && !this._disabled && !this._mutationObserver) {
-			this._doStartObserving();
-		}
-	}
-
-	/**
-	 * Stops the MutationObserver.
-	 */
-	stopObserving(): void {
-		this._observerEnabled = false;
-		this._doStopObserving();
-	}
-
-	private _doStartObserving(): void {
-		if (!this._container || this._mutationObserver) return;
-
-		const isReverse = this._isColumnReverse;
-
-		this._mutationObserver = new MutationObserver(() => {
-			if (!this._autoScrollEnabled || this._rafPending) return;
-			this._rafPending = true;
-			requestAnimationFrame(() => {
-				this._rafPending = false;
-				if (this._autoScrollEnabled && this._container) {
-					if (isReverse) {
-						// column-reverse: scrollTop=0 is the bottom
-						this._container.scrollTop = 0;
-					} else {
-						this._container.scrollTop = this._container.scrollHeight;
-					}
-				}
-			});
-		});
-
-		this._mutationObserver.observe(this._container, {
-			childList: true,
-			subtree: true,
-			characterData: true
-		});
-	}
-
-	private _doStopObserving(): void {
-		if (this._mutationObserver) {
-			this._mutationObserver.disconnect();
-			this._mutationObserver = null;
-		}
-		this._rafPending = false;
 	}
 }
 

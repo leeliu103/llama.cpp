@@ -102,9 +102,11 @@ int op_sum_rows(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
+    const int      n_threads  = octx->n_threads;
     const uint32_t src0_nrows = ne01 * ne02 * ne03;
-    const uint32_t n_threads = MIN(octx->n_threads, src0_nrows);
-    const uint32_t rows_per_thread = (src0_nrows + n_threads - 1) / n_threads;
+
+    uint32_t n_jobs = MIN(n_threads, src0_nrows);
+    uint32_t rows_per_thread = (src0_nrows + n_jobs - 1) / n_jobs;
 
     bool opt_path = false;
     if ((0 == hex_is_aligned((void *) src0->data, VLEN)) && !(nb01 & (VLEN - 1))) {
@@ -122,7 +124,7 @@ int op_sum_rows(struct htp_ops_context * octx) {
         .opt_path        = opt_path,
     };
 
-    worker_pool_run_func(octx->ctx->worker_pool, sum_rows_thread_f32, &smctx, n_threads);
+    worker_pool_run_func(octx->ctx->worker_pool, sum_rows_thread_f32, &smctx, n_jobs);
 
     return HTP_STATUS_OK;
 }

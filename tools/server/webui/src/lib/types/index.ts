@@ -40,9 +40,6 @@ export type {
 	ChatMessageSiblingInfo,
 	ChatMessagePromptProgress,
 	ChatMessageTimings,
-	ChatMessageAgenticTimings,
-	ChatMessageAgenticTurnStats,
-	ChatMessageToolCallTiming,
 	ChatStreamCallbacks,
 	ErrorDialogState,
 	LiveProcessingStats,
@@ -53,13 +50,10 @@ export type {
 
 // Database types
 export type {
-	McpServerOverride,
 	DatabaseConversation,
 	DatabaseMessageExtraAudioFile,
 	DatabaseMessageExtraImageFile,
 	DatabaseMessageExtraLegacyContext,
-	DatabaseMessageExtraMcpPrompt,
-	DatabaseMessageExtraMcpResource,
 	DatabaseMessageExtraPdfFile,
 	DatabaseMessageExtraTextFile,
 	DatabaseMessageExtra,
@@ -88,66 +82,5 @@ export type {
 	KeyValuePair,
 	BinaryDetectionOptions,
 	ClipboardTextAttachment,
-	ClipboardMcpPromptAttachment,
-	ClipboardAttachment,
 	ParsedClipboardContent
 } from './common';
-
-// MCP types
-export type {
-	ClientCapabilities,
-	ServerCapabilities,
-	Implementation,
-	MCPConnectionLog,
-	MCPServerInfo,
-	MCPCapabilitiesInfo,
-	MCPToolInfo,
-	MCPPromptInfo,
-	MCPConnectionDetails,
-	MCPPhaseCallback,
-	MCPConnection,
-	HealthCheckState,
-	HealthCheckParams,
-	MCPServerConfig,
-	MCPClientConfig,
-	MCPServerSettingsEntry,
-	MCPToolCall,
-	OpenAIToolDefinition,
-	ServerStatus,
-	ToolCallParams,
-	ToolExecutionResult,
-	Tool,
-	Prompt,
-	GetPromptResult,
-	PromptMessage,
-	MCPProgressState,
-	MCPResourceAnnotations,
-	MCPResourceIcon,
-	MCPResource,
-	MCPResourceTemplate,
-	MCPTextResourceContent,
-	MCPBlobResourceContent,
-	MCPResourceContent,
-	MCPReadResourceResult,
-	MCPResourceInfo,
-	MCPResourceTemplateInfo,
-	MCPCachedResource,
-	MCPResourceAttachment,
-	MCPResourceSubscription,
-	MCPServerResources
-} from './mcp';
-
-// Agentic types
-export type {
-	AgenticConfig,
-	AgenticToolCallPayload,
-	AgenticMessage,
-	AgenticAssistantMessage,
-	AgenticToolCallList,
-	AgenticChatCompletionRequest,
-	AgenticSession,
-	AgenticFlowCallbacks,
-	AgenticFlowOptions,
-	AgenticFlowParams,
-	AgenticFlowResult
-} from './agentic';

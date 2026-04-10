@@ -57,7 +57,7 @@ To run a single test:
 ./tests.sh unit/test_chat_completion.py::test_invalid_chat_completion_req
 ```
 
-Hint: You can compile and run test in single command, useful for local development:
+Hint: You can compile and run test in single command, useful for local developement:
 
 ```shell
 cmake --build build -j --target llama-server && ./tools/server/tests/tests.sh

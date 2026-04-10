@@ -1,11 +1,12 @@
 <script lang="ts">
 	import {
-		ChatMessageAgenticContent,
 		ChatMessageActions,
 		ChatMessageStatistics,
+		MarkdownContent,
 		ModelBadge,
 		ModelsSelector
 	} from '$lib/components/app';
+	import ChatMessageThinkingBlock from './ChatMessageThinkingBlock.svelte';
 	import { getMessageEditContext } from '$lib/contexts';
 	import { useProcessingState } from '$lib/hooks/use-processing-state.svelte';
 	import { isLoading, isChatStreaming } from '$lib/stores/chat.svelte';
@@ -15,15 +16,14 @@
 	import { Check, X } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Checkbox } from '$lib/components/ui/checkbox';
-	import { INPUT_CLASSES } from '$lib/constants';
-	import { MessageRole, KeyboardKey, ChatMessageStatsView } from '$lib/enums';
+	import { INPUT_CLASSES } from '$lib/constants/css-classes';
+	import { MessageRole, KeyboardKey } from '$lib/enums';
 	import Label from '$lib/components/ui/label/label.svelte';
 	import { config } from '$lib/stores/settings.svelte';
 	import { isRouterMode } from '$lib/stores/server.svelte';
 	import { modelsStore } from '$lib/stores/models.svelte';
 	import { ServerModelStatus } from '$lib/enums';
-
-	import { hasAgenticContent } from '$lib/utils';
+	import { REASONING_TAGS } from '$lib/constants/agentic';
 
 	interface Props {
 		class?: string;
@@ -35,14 +35,12 @@
 		} | null;
 		isLastAssistantMessage?: boolean;
 		message: DatabaseMessage;
-		toolMessages?: DatabaseMessage[];
 		messageContent: string | undefined;
 		onCopy: () => void;
 		onConfirmDelete: () => void;
 		onContinue?: () => void;
 		onDelete: () => void;
 		onEdit?: () => void;
-		onForkConversation?: (options: { name: string; includeAttachments: boolean }) => void;
 		onNavigateToSibling?: (siblingId: string) => void;
 		onRegenerate: (modelOverride?: string) => void;
 		onShowDeleteDialogChange: (show: boolean) => void;
@@ -51,19 +49,69 @@
 		textareaElement?: HTMLTextAreaElement;
 	}
 
+	interface ParsedReasoningContent {
+		content: string;
+		reasoningContent: string | null;
+		hasReasoningMarkers: boolean;
+	}
+
+	function parseReasoningContent(content: string | undefined): ParsedReasoningContent {
+		if (!content) {
+			return {
+				content: '',
+				reasoningContent: null,
+				hasReasoningMarkers: false
+			};
+		}
+
+		const plainParts: string[] = [];
+		const reasoningParts: string[] = [];
+		const { START, END } = REASONING_TAGS;
+		let cursor = 0;
+		let hasReasoningMarkers = false;
+
+		while (cursor < content.length) {
+			const startIndex = content.indexOf(START, cursor);
+
+			if (startIndex === -1) {
+				plainParts.push(content.slice(cursor));
+				break;
+			}
+
+			hasReasoningMarkers = true;
+			plainParts.push(content.slice(cursor, startIndex));
+
+			const reasoningStart = startIndex + START.length;
+			const endIndex = content.indexOf(END, reasoningStart);
+
+			if (endIndex === -1) {
+				reasoningParts.push(content.slice(reasoningStart));
+				cursor = content.length;
+				break;
+			}
+
+			reasoningParts.push(content.slice(reasoningStart, endIndex));
+			cursor = endIndex + END.length;
+		}
+
+		return {
+			content: plainParts.join(''),
+			reasoningContent: reasoningParts.length > 0 ? reasoningParts.join('\n\n') : null,
+			hasReasoningMarkers
+		};
+	}
+
 	let {
 		class: className = '',
 		deletionInfo,
 		isLastAssistantMessage = false,
 		message,
-		toolMessages = [],
 		messageContent,
 		onConfirmDelete,
 		onContinue,
 		onCopy,
 		onDelete,
 		onEdit,
-		onForkConversation,
 		onNavigateToSibling,
 		onRegenerate,
 		onShowDeleteDialogChange,
@@ -88,14 +136,15 @@
 		}
 	}
 
-	const isAgentic = $derived(hasAgenticContent(message, toolMessages));
-	const hasReasoning = $derived(!!message.reasoningContent);
+	const parsedMessageContent = $derived.by(() => parseReasoningContent(messageContent));
+	const visibleMessageContent = $derived(parsedMessageContent.content);
+	const thinkingContent = $derived(parsedMessageContent.reasoningContent);
+	const hasReasoningMarkers = $derived(parsedMessageContent.hasReasoningMarkers);
 	const processingState = useProcessingState();
 
 	let currentConfig = $derived(config());
 	let isRouter = $derived(isRouterMode());
 	let showRawOutput = $state(false);
-	let activeStatsView = $state<ChatMessageStatsView>(ChatMessageStatsView.GENERATION);
 	let statsContainerEl: HTMLDivElement | undefined = $state();
 
 	function getScrollParent(el: HTMLElement): HTMLElement | null {
@@ -110,24 +159,18 @@
 		return null;
 	}
 
-	async function handleStatsViewChange(view: ChatMessageStatsView) {
+	async function handleStatsViewChange() {
 		const el = statsContainerEl;
 		if (!el) {
-			activeStatsView = view;
-
 			return;
 		}
 
 		const scrollParent = getScrollParent(el);
 		if (!scrollParent) {
-			activeStatsView = view;
-
 			return;
 		}
 
 		const yBefore = el.getBoundingClientRect().top;
-
-		activeStatsView = view;
 
 		await tick();
 
@@ -146,30 +189,24 @@
 		});
 	}
 
-	let highlightAgenticTurns = $derived(
-		isAgentic &&
-			(currentConfig.alwaysShowAgenticTurns || activeStatsView === ChatMessageStatsView.SUMMARY)
-	);
-
 	let displayedModel = $derived(message.model ?? null);
 
 	let isCurrentlyLoading = $derived(isLoading());
 	let isStreaming = $derived(isChatStreaming());
-	let hasNoContent = $derived(!message?.content?.trim());
+	let hasNoContent = $derived(!visibleMessageContent?.trim());
 	let isActivelyProcessing = $derived(isCurrentlyLoading || isStreaming);
 
 	let showProcessingInfoTop = $derived(
 		message?.role === MessageRole.ASSISTANT &&
 			isActivelyProcessing &&
 			hasNoContent &&
-			!isAgentic &&
 			isLastAssistantMessage
 	);
 
 	let showProcessingInfoBottom = $derived(
 		message?.role === MessageRole.ASSISTANT &&
 			isActivelyProcessing &&
-			(!hasNoContent || isAgentic) &&
+			!hasNoContent &&
 			isLastAssistantMessage
 	);
 
@@ -195,6 +232,14 @@
 	role="group"
 	aria-label="Assistant message with actions"
 >
+	{#if !editCtx.isEditing && thinkingContent}
+		<ChatMessageThinkingBlock
+			reasoningContent={thinkingContent}
+			isStreaming={!message.timestamp}
+			hasRegularContent={!!visibleMessageContent?.trim()}
+		/>
+	{/if}
+
 	{#if showProcessingInfoTop}
 		<div class="mt-6 w-full max-w-[48rem]" in:fade>
 			<div class="processing-container">
@@ -254,12 +299,7 @@
 		{#if showRawOutput}
 			<pre class="raw-output">{messageContent || ''}</pre>
 		{:else}
-			<ChatMessageAgenticContent
-				{message}
-				{toolMessages}
-				isStreaming={isChatStreaming()}
-				highlightTurns={highlightAgenticTurns}
-			/>
+			<MarkdownContent content={visibleMessageContent || ''} attachments={message.extra} />
 		{/if}
 	{:else}
 		<div class="text-sm whitespace-pre-wrap">
@@ -305,13 +345,11 @@
 				{/if}
 
 				{#if currentConfig.showMessageStats && message.timings && message.timings.predicted_n && message.timings.predicted_ms}
-					{@const agentic = message.timings.agentic}
 					<ChatMessageStatistics
-						promptTokens={agentic ? agentic.llm.prompt_n : message.timings.prompt_n}
-						promptMs={agentic ? agentic.llm.prompt_ms : message.timings.prompt_ms}
-						predictedTokens={agentic ? agentic.llm.predicted_n : message.timings.predicted_n}
-						predictedMs={agentic ? agentic.llm.predicted_ms : message.timings.predicted_ms}
-						agenticTimings={agentic}
+						promptTokens={message.timings.prompt_n}
+						promptMs={message.timings.prompt_ms}
+						predictedTokens={message.timings.predicted_n}
+						predictedMs={message.timings.predicted_ms}
 						onActiveViewChange={handleStatsViewChange}
 					/>
 				{:else if isLoading() && currentConfig.showMessageStats}
@@ -323,7 +361,7 @@
 
 					{#if liveStats || genStats}
 						<ChatMessageStatistics
-							isLive
+							isLive={true}
 							isProcessingPrompt={!!isStillProcessingPrompt}
 							promptTokens={liveStats?.tokensProcessed}
 							promptMs={liveStats?.timeMs}
@@ -347,8 +385,9 @@
 			{onCopy}
 			{onEdit}
 			{onRegenerate}
-			onContinue={currentConfig.enableContinueGeneration && !hasReasoning ? onContinue : undefined}
-			{onForkConversation}
+			onContinue={currentConfig.enableContinueGeneration && !hasReasoningMarkers
+				? onContinue
+				: undefined}
 			{onDelete}
 			{onConfirmDelete}
 			{onNavigateToSibling}

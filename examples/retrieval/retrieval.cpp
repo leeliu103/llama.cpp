@@ -4,7 +4,6 @@
 #include "llama.h"
 
 #include <algorithm>
-#include <clocale>
 #include <fstream>
 #include <iostream> // TODO: remove me
 
@@ -113,15 +112,13 @@ static void batch_process(llama_context * ctx, llama_batch & batch, float * outp
 }
 
 int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
-
     common_params params;
-
-    common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_RETRIEVAL, print_usage)) {
         return 1;
     }
+
+    common_init();
 
     // For BERT models, batch size must be equal to ubatch size
     params.n_ubatch = params.n_batch;

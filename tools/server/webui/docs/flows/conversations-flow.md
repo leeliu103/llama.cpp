@@ -6,7 +6,7 @@ sequenceDiagram
     participant DbSvc as ⚙️ DatabaseService
     participant IDB as 💾 IndexedDB
 
-    Note over convStore: State:<br/>conversations: DatabaseConversation[]<br/>activeConversation: DatabaseConversation | null<br/>activeMessages: DatabaseMessage[]<br/>isInitialized: boolean<br/>pendingMcpServerOverrides: Map&lt;string, McpServerOverride&gt;
+    Note over convStore: State:<br/>conversations: DatabaseConversation[]<br/>activeConversation: DatabaseConversation | null<br/>activeMessages: DatabaseMessage[]<br/>isInitialized: boolean<br/>usedModalities: $derived({vision, audio})
 
     %% ═══════════════════════════════════════════════════════════════════════════
     Note over UI,IDB: 🚀 INITIALIZATION
@@ -37,13 +37,6 @@ sequenceDiagram
     convStore->>convStore: conversations.unshift(conversation)
     convStore->>convStore: activeConversation = $state(conversation)
     convStore->>convStore: activeMessages = $state([])
-
-    alt pendingMcpServerOverrides has entries
-        loop each pending override
-            convStore->>DbSvc: Store MCP server override for new conversation
-        end
-        convStore->>convStore: clearPendingMcpServerOverrides()
-    end
     deactivate convStore
 
     %% ═══════════════════════════════════════════════════════════════════════════
@@ -65,7 +58,8 @@ sequenceDiagram
     Note right of convStore: Filter to show only current branch path
     convStore->>convStore: activeMessages = $state(filtered)
 
-    Note right of convStore: Route (+page.svelte) then calls:<br/>chatStore.syncLoadingStateForChat(convId)
+    convStore->>chatStore: syncLoadingStateForChat(convId)
+    Note right of chatStore: Sync isLoading/currentResponse if streaming
     deactivate convStore
 
     %% ═══════════════════════════════════════════════════════════════════════════
@@ -127,36 +121,16 @@ sequenceDiagram
     end
     deactivate convStore
 
-    UI->>convStore: deleteAll()
-    activate convStore
-    convStore->>DbSvc: Delete all conversations and messages
-    convStore->>convStore: conversations = []
-    convStore->>convStore: clearActiveConversation()
-    deactivate convStore
-
     %% ═══════════════════════════════════════════════════════════════════════════
-    Note over UI,IDB: � MCP SERVER PER-CHAT OVERRIDES
+    Note over UI,IDB: 📊 MODALITY TRACKING
     %% ═══════════════════════════════════════════════════════════════════════════
 
-    Note over convStore: Conversations can override which MCP servers are enabled.
-    Note over convStore: Uses pendingMcpServerOverrides before conversation<br/>is created, then persists to conversation metadata.
+    Note over convStore: usedModalities = $derived.by(() => {<br/>  calculateModalitiesFromMessages(activeMessages)<br/>})
 
-    UI->>convStore: setMcpServerOverride(convId, serverName, override)
-    Note right of convStore: override = {enabled: boolean}
+    Note over convStore: Scans activeMessages for attachments:<br/>- IMAGE → vision: true<br/>- PDF (processedAsImages) → vision: true<br/>- AUDIO → audio: true
 
-    UI->>convStore: toggleMcpServerForChat(convId, serverName, enabled)
-    activate convStore
-    convStore->>convStore: setMcpServerOverride(convId, serverName, {enabled})
-    deactivate convStore
-
-    UI->>convStore: isMcpServerEnabledForChat(convId, serverName)
-    Note right of convStore: Check override → fall back to global MCP config
-
-    UI->>convStore: getAllMcpServerOverrides(convId)
-    Note right of convStore: Returns all overrides for a conversation
-
-    UI->>convStore: removeMcpServerOverride(convId, serverName)
-    UI->>convStore: getMcpServerOverride(convId, serverName)
+    UI->>convStore: getModalitiesUpToMessage(msgId)
+    Note right of convStore: Used for regeneration validation<br/>Only checks messages BEFORE target
 
     %% ═══════════════════════════════════════════════════════════════════════════
     Note over UI,IDB: 📤 EXPORT / 📥 IMPORT
@@ -174,10 +148,8 @@ sequenceDiagram
     UI->>convStore: importConversations(file)
     activate convStore
     convStore->>convStore: Parse JSON file
-    convStore->>convStore: importConversationsData(parsed)
     convStore->>DbSvc: importConversations(parsed)
-    Note right of DbSvc: Skips duplicate conversations<br/>(checks existing by ID)
-    DbSvc->>IDB: INSERT conversations + messages (skip existing)
+    DbSvc->>IDB: Bulk INSERT conversations + messages
     convStore->>convStore: loadConversations()
     deactivate convStore
 ```

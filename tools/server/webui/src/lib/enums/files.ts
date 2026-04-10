@@ -11,13 +11,6 @@ export enum FileTypeCategory {
 	TEXT = 'text'
 }
 
-/**
- * Special file types for internal use (not MIME types)
- */
-export enum SpecialFileType {
-	MCP_PROMPT = 'mcp-prompt'
-}
-
 // Specific file type enums for each category
 export enum FileTypeImage {
 	JPEG = 'jpeg',

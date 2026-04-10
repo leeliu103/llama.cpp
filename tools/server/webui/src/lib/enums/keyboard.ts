@@ -11,6 +11,5 @@ export enum KeyboardKey {
 	D_UPPER = 'D',
 	E_UPPER = 'E',
 	K_LOWER = 'k',
-	O_UPPER = 'O',
-	SPACE = ' '
+	O_UPPER = 'O'
 }

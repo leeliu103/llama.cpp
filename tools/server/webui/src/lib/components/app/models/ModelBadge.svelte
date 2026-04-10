@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { Package } from '@lucide/svelte';
 	import { BadgeInfo, ActionIconCopyToClipboard } from '$lib/components/app';
-	import ModelId from './ModelId.svelte';
 	import { modelsStore } from '$lib/stores/models.svelte';
 	import { serverStore } from '$lib/stores/server.svelte';
 	import * as Tooltip from '$lib/components/ui/tooltip';
@@ -24,7 +23,6 @@
 
 	let model = $derived(modelProp || modelsStore.singleModelName);
 	let isModelMode = $derived(serverStore.isModelMode);
-	let shouldShow = $derived(model && (modelProp !== undefined || isModelMode));
 </script>
 
 {#snippet badgeContent()}
@@ -33,9 +31,7 @@
 			<Package class="h-3 w-3" />
 		{/snippet}
 
-		{#if model}
-			<ModelId modelId={model} />
-		{/if}
+		{model}
 
 		{#if showCopyIcon}
 			<ActionIconCopyToClipboard text={model || ''} ariaLabel="Copy model name" />
@@ -43,7 +39,7 @@
 	</BadgeInfo>
 {/snippet}
 
-{#if shouldShow}
+{#if model && isModelMode}
 	{#if showTooltip}
 		<Tooltip.Root>
 			<Tooltip.Trigger>

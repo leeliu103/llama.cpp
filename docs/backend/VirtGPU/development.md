@@ -55,8 +55,7 @@ LLAMA_MAC_BUILD=$PWD/build/ggml-virtgpu-backend
 cmake -S . -B $LLAMA_MAC_BUILD \
       -DGGML_NATIVE=OFF \
       -DLLAMA_CURL=ON \
-      -DGGML_VIRTGPU=ON \
-      -DGGML_VIRTGPU_BACKEND=ONLY \
+      -DGGML_REMOTINGBACKEND=ONLY \
       -DGGML_METAL=ON
 
 TARGETS="ggml-metal"
@@ -72,7 +71,6 @@ cmake --build $LLAMA_MAC_BUILD --parallel 8 --target $EXTRA_TARGETS
 ```bash
 # Build virglrenderer with APIR support
 mkdir virglrenderer
-cd virglrenderer
 git clone https://gitlab.freedesktop.org/kpouget/virglrenderer -b main-macos src
 cd src
 
@@ -97,7 +95,7 @@ mkdir llama.cpp
 git clone https://github.com/ggml-org/llama.cpp.git src
 cd src
 
-LLAMA_LINUX_BUILD=$PWD/build-virtgpu
+LLAMA_LINUX_BUILD=$PWD//build-virtgpu
 
 cmake -S . -B $LLAMA_LINUX_BUILD \
       -DGGML_VIRTGPU=ON

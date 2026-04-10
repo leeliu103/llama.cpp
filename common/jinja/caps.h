@@ -18,8 +18,6 @@ struct caps {
     bool supports_string_content = true;
     bool supports_typed_content = false;
 
-    bool supports_object_arguments = false;
-
     // for reporting on server
     std::map<std::string, bool> to_map() const;
 

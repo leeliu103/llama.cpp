@@ -1,4 +1,4 @@
-import { DEFAULT_MOBILE_BREAKPOINT } from '$lib/constants';
+import { DEFAULT_MOBILE_BREAKPOINT } from '$lib/constants/viewport';
 import { MediaQuery } from 'svelte/reactivity';
 
 export class IsMobile extends MediaQuery {

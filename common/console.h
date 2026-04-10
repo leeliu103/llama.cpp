@@ -4,9 +4,7 @@
 
 #include "common.h"
 
-#include <functional>
 #include <string>
-#include <vector>
 
 enum display_type {
     DISPLAY_TYPE_RESET = 0,
@@ -22,9 +20,6 @@ namespace console {
     void cleanup();
     void set_display(display_type display);
     bool readline(std::string & line, bool multiline_input);
-
-    using completion_callback = std::function<std::vector<std::pair<std::string, size_t>>(std::string_view, size_t)>;
-    void set_completion_callback(completion_callback cb);
 
     namespace spinner {
         void start();

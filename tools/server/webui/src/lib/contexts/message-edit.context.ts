@@ -1,5 +1,4 @@
 import { getContext, setContext } from 'svelte';
-import { CONTEXT_KEY_MESSAGE_EDIT } from '$lib/constants';
 
 export interface MessageEditState {
 	readonly isEditing: boolean;
@@ -23,7 +22,7 @@ export interface MessageEditActions {
 
 export type MessageEditContext = MessageEditState & MessageEditActions;
 
-const MESSAGE_EDIT_KEY = Symbol.for(CONTEXT_KEY_MESSAGE_EDIT);
+const MESSAGE_EDIT_KEY = Symbol.for('chat-message-edit');
 
 /**
  * Sets the message edit context. Call this in the parent component (ChatMessage.svelte).

@@ -1,17 +1,11 @@
 <script lang="ts">
-	import { fadeInView } from '$lib/actions/fade-in-view.svelte';
 	import { ChatMessage } from '$lib/components/app';
 	import { setChatActionsContext } from '$lib/contexts';
 	import { MessageRole } from '$lib/enums';
 	import { chatStore } from '$lib/stores/chat.svelte';
 	import { conversationsStore, activeConversation } from '$lib/stores/conversations.svelte';
 	import { config } from '$lib/stores/settings.svelte';
-	import {
-		copyToClipboard,
-		formatMessageForClipboard,
-		getMessageSiblings,
-		hasAgenticContent
-	} from '$lib/utils';
+	import { copyToClipboard, formatMessageForClipboard, getMessageSiblings } from '$lib/utils';
 
 	interface Props {
 		class?: string;
@@ -84,13 +78,6 @@
 			onUserAction?.();
 			await chatStore.continueAssistantMessage(message.id);
 			refreshAllMessages();
-		},
-
-		forkConversation: async (
-			message: DatabaseMessage,
-			options: { name: string; includeAttachments: boolean }
-		) => {
-			await conversationsStore.forkConversation(message.id, options);
 		}
 	});
 
@@ -124,91 +111,42 @@
 			? messages
 			: messages.filter((msg) => msg.type !== MessageRole.SYSTEM);
 
-		// Build display entries, grouping agentic sessions into single entries.
-		// An agentic session = assistant(with tool_calls) → tool → assistant → tool → ... → assistant(final)
-		const result: Array<{
-			message: DatabaseMessage;
-			toolMessages: DatabaseMessage[];
-			isLastAssistantMessage: boolean;
-			siblingInfo: ChatMessageSiblingInfo;
-		}> = [];
+		let lastAssistantIndex = -1;
 
-		for (let i = 0; i < filteredMessages.length; i++) {
-			const msg = filteredMessages[i];
+		for (let i = filteredMessages.length - 1; i >= 0; i--) {
+			if (filteredMessages[i].role === MessageRole.ASSISTANT) {
+				lastAssistantIndex = i;
 
-			// Skip tool messages - they're grouped with preceding assistant
-			if (msg.role === MessageRole.TOOL) continue;
-
-			const toolMessages: DatabaseMessage[] = [];
-			if (msg.role === MessageRole.ASSISTANT && hasAgenticContent(msg)) {
-				let j = i + 1;
-
-				while (j < filteredMessages.length) {
-					const next = filteredMessages[j];
-
-					if (next.role === MessageRole.TOOL) {
-						toolMessages.push(next);
-
-						j++;
-					} else if (next.role === MessageRole.ASSISTANT) {
-						toolMessages.push(next);
-
-						j++;
-					} else {
-						break;
-					}
-				}
-
-				i = j - 1;
-			} else if (msg.role === MessageRole.ASSISTANT) {
-				let j = i + 1;
-
-				while (j < filteredMessages.length && filteredMessages[j].role === MessageRole.TOOL) {
-					toolMessages.push(filteredMessages[j]);
-					j++;
-				}
-			}
-
-			const siblingInfo = getMessageSiblings(allConversationMessages, msg.id);
-
-			result.push({
-				message: msg,
-				toolMessages,
-				isLastAssistantMessage: false,
-				siblingInfo: siblingInfo || {
-					message: msg,
-					siblingIds: [msg.id],
-					currentIndex: 0,
-					totalSiblings: 1
-				}
-			});
-		}
-
-		// Mark the last assistant message
-		for (let i = result.length - 1; i >= 0; i--) {
-			if (result[i].message.role === MessageRole.ASSISTANT) {
-				result[i].isLastAssistantMessage = true;
 				break;
 			}
 		}
 
-		return result;
+		return filteredMessages.map((message, index) => {
+			const siblingInfo = getMessageSiblings(allConversationMessages, message.id);
+			const isLastAssistantMessage =
+				message.role === MessageRole.ASSISTANT && index === lastAssistantIndex;
+
+			return {
+				message,
+				isLastAssistantMessage,
+				siblingInfo: siblingInfo || {
+					message,
+					siblingIds: [message.id],
+					currentIndex: 0,
+					totalSiblings: 1
+				}
+			};
+		});
 	});
 </script>
 
-<div
-	class="flex h-full flex-col space-y-10 pt-24 {className}"
-	style="height: auto; min-height: calc(100dvh - 14rem);"
->
-	{#each displayMessages as { message, toolMessages, isLastAssistantMessage, siblingInfo } (message.id)}
-		<div use:fadeInView>
-			<ChatMessage
-				class="mx-auto w-full max-w-[48rem]"
-				{message}
-				{toolMessages}
-				{isLastAssistantMessage}
-				{siblingInfo}
-			/>
-		</div>
+<div class="flex h-full flex-col space-y-10 pt-24 {className}" style="height: auto; ">
+	{#each displayMessages as { message, isLastAssistantMessage, siblingInfo } (message.id)}
+		<ChatMessage
+			class="mx-auto w-full max-w-[48rem]"
+			{message}
+			{isLastAssistantMessage}
+			{siblingInfo}
+		/>
 	{/each}
 </div>

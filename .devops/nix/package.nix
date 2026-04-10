@@ -16,7 +16,7 @@
   rocmPackages,
   vulkan-headers,
   vulkan-loader,
-  openssl,
+  curl,
   shaderc,
   useBlas ?
     builtins.all (x: !x) [
@@ -41,7 +41,6 @@
   effectiveStdenv ? if useCuda then cudaPackages.backendStdenv else stdenv,
   enableStatic ? effectiveStdenv.hostPlatform.isStatic,
   precompileMetalShaders ? false,
-  useWebUi ? true,
 }:
 
 let
@@ -160,13 +159,11 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     ++ optionals useMpi [ mpi ]
     ++ optionals useRocm rocmBuildInputs
     ++ optionals useBlas [ blas ]
-    ++ optionals useVulkan vulkanBuildInputs
-    ++ [ openssl ];
+    ++ optionals useVulkan vulkanBuildInputs;
 
   cmakeFlags =
     [
       (cmakeBool "LLAMA_BUILD_SERVER" true)
-      (cmakeBool "LLAMA_BUILD_WEBUI" useWebUi)
       (cmakeBool "BUILD_SHARED_LIBS" (!enableStatic))
       (cmakeBool "CMAKE_SKIP_BUILD_RPATH" true)
       (cmakeBool "GGML_NATIVE" false)
