@@ -143,6 +143,9 @@ static int calc_q4_K_q8_1_x4_nwarps(
         if (has_gate_fusion) {
             return 1;
         }
+        if (nrows_x <= 32768 && ncols_x >= 4096) {
+            return 4;
+        }
         if (nrows_x <= 32768 && ncols_x >= 1024) {
             return 2;
         }
