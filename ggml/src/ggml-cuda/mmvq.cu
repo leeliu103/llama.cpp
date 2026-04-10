@@ -389,10 +389,13 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 static int calc_q4_K_q8_1_x4_nwarps(
         const int cc, const int nrows_x, const int ncols_x, const bool has_gate_fusion) {
     if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-        if (has_gate_fusion) {
+        if (has_gate_fusion && ncols_x >= 3072) {
             return 1;
         }
-        if (nrows_x <= 32768 && ncols_x >= 1024) {
+        if (nrows_x <= 32768 && ncols_x >= 3072) {
+            return 4;
+        }
+        if (nrows_x <= 32768 && ncols_x >= 512) {
             return 2;
         }
     }
