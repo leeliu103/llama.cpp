@@ -1666,19 +1666,26 @@ void ggml_cuda_mul_mat_vec_q(
     const bool use_q6_K_q8_1_x4 = src0->type == GGML_TYPE_Q6_K && ncols_dst == 1;
     const bool use_q8_1_x4 = use_q4_K_q8_1_x4 || use_q6_K_q8_1_x4;
     const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
-    {
+    auto & src1_q8_1_cache = ctx.mmvq_src1_cache_for_format(use_q8_1_x4);
+    if (src1_q8_1_cache.buffer.get() == nullptr || src1_q8_1_cache.buffer.actual_size < nbytes_src1_q8_1) {
+        src1_q8_1_cache.buffer.reset();
+        src1_q8_1_cache.buffer.alloc(ctx.pool(), nbytes_src1_q8_1);
+        src1_q8_1_cache.src1 = nullptr;
+    }
+
+    if (src1_q8_1_cache.src1 != src1) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         if (use_q8_1_x4) {
-            quantize_row_q8_1_x4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            quantize_row_q8_1_x4_cuda(src1_d, nullptr, src1_q8_1_cache.buffer.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         } else {
-            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_cache.buffer.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         }
+        src1_q8_1_cache.src1 = src1;
     }
 
-    const void * src1_q8_1_d = src1_q8_1.get();
+    const void * src1_q8_1_d = src1_q8_1_cache.buffer.get();
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = use_q8_1_x4 ? ne10_padded / (4 * QK8_1) : ne10_padded / QK8_1;
