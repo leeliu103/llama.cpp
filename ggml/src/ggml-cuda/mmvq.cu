@@ -392,6 +392,9 @@ static int calc_q4_K_q8_1_x4_nwarps(
         if (has_gate_fusion) {
             return 1;
         }
+        if (nrows_x <= 32768 && ncols_x >= 4096) {
+            return 4;
+        }
         if (nrows_x <= 32768 && ncols_x >= 1024) {
             return 2;
         }
@@ -2089,9 +2092,10 @@ void ggml_cuda_mul_mat_vec_q(
         const int device = ggml_cuda_get_device();
         const int warp_size = ggml_cuda_info().devices[device].warp_size;
         const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
-        const std::pair<dim3, dim3> dims = calc_launch_params(1, (int) ne01, (int) nchannels_dst, (int) ne3, warp_size, table_id);
 
         if (use_q4_K_q8_1_x4) {
+            const std::pair<dim3, dim3> dims = calc_launch_params<GGML_TYPE_Q4_K>(
+                1, (int) ne01, (int) nchannels_dst, (int) ne3, warp_size, table_id);
             dispatch_mul_mat_vec_q4_K_q8_1_x4(
                 src0->data, src1_q8_1_d, ids_d, fusion_local, dst_d, (uint32_t) ne00,
                 nchannels_y_fd, (uint32_t) s01, (uint32_t) stride_col_y, (uint32_t) stride_col_dst,
@@ -2101,6 +2105,8 @@ void ggml_cuda_mul_mat_vec_q(
             return;
         }
 
+        const std::pair<dim3, dim3> dims = calc_launch_params<GGML_TYPE_Q6_K>(
+            1, (int) ne01, (int) nchannels_dst, (int) ne3, warp_size, table_id);
         dispatch_mul_mat_vec_q6_K_q8_1_x4(
             src0->data, src1_q8_1_d, ids_d, fusion_local, dst_d, (uint32_t) ne00,
             nchannels_y_fd, (uint32_t) s01, (uint32_t) stride_col_y, (uint32_t) stride_col_dst,
