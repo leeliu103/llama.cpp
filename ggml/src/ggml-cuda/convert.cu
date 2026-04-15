@@ -486,6 +486,107 @@ static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_
     }
 }
 
+template<typename dst_t>
+static __global__ void dequantize_block_mxfp4_soa(const uint8_t * __restrict__ x_q,
+                                                  const uint8_t * __restrict__ x_e,
+                                                  dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+
+    const int64_t tid = threadIdx.x;
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    const int64_t block_idx = i*(QK_K/QK_MXFP4) + ib;
+    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const uint8_t * q4 = x_q + block_idx*(QK_MXFP4/2) + 4*il;
+    const float d = ggml_cuda_e8m0_to_fp32(x_e[block_idx]);
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = d * kvalues_mxfp4[q4[j] & 0xf]*0.5f;
+        y[j+16] = d * kvalues_mxfp4[q4[j] >>  4]*0.5f;
+    }
+}
+
+static __global__ void kernel_convert_block_mxfp4_aos_to_soa(
+        const block_mxfp4 * src,
+        uint8_t * dst_e,
+        uint8_t * dst_q,
+        int64_t nblocks) {
+    const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+
+    const block_mxfp4 b = src[ib];
+    dst_e[ib] = b.e;
+
+    uint8_t * q = dst_q + ib * (QK_MXFP4 / 2);
+#pragma unroll
+    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+        q[i] = b.qs[i];
+    }
+}
+
+static __global__ void kernel_convert_block_mxfp4_soa_to_aos(
+        const uint8_t * src_e,
+        const uint8_t * src_q,
+        block_mxfp4 * dst,
+        int64_t nblocks) {
+    const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+
+    block_mxfp4 b;
+    b.e = src_e[ib];
+
+    const uint8_t * q = src_q + ib * (QK_MXFP4 / 2);
+#pragma unroll
+    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+        b.qs[i] = q[i];
+    }
+
+    dst[ib] = b;
+}
+
+void convert_block_mxfp4_aos_to_soa(
+        const void * src_aos,
+        void * dst_soa,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    if (nblocks == 0) {
+        return;
+    }
+
+    const block_mxfp4 * src = (const block_mxfp4 *) src_aos;
+    uint8_t * dst = (uint8_t *) dst_soa;
+    const int64_t qbytes = nblocks * (QK_MXFP4 / 2);
+    uint8_t * dst_q = dst;
+    uint8_t * dst_e = dst + qbytes;
+
+    constexpr int nth = 256;
+    const int nbl = (nblocks + nth - 1) / nth;
+    kernel_convert_block_mxfp4_aos_to_soa<<<nbl, nth, 0, stream>>>(src, dst_e, dst_q, nblocks);
+}
+
+void convert_block_mxfp4_soa_to_aos(
+        const void * src_soa,
+        void * dst_aos,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    if (nblocks == 0) {
+        return;
+    }
+
+    const uint8_t * src = (const uint8_t *) src_soa;
+    const int64_t qbytes = nblocks * (QK_MXFP4 / 2);
+    const uint8_t * src_q = src;
+    const uint8_t * src_e = src + qbytes;
+    block_mxfp4 * dst = (block_mxfp4 *) dst_aos;
+
+    constexpr int nth = 256;
+    const int nbl = (nblocks + nth - 1) / nth;
+    kernel_convert_block_mxfp4_soa_to_aos<<<nbl, nth, 0, stream>>>(src_e, src_q, dst, nblocks);
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -614,7 +715,10 @@ static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t
 template<typename dst_t>
 static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
+    const int64_t nblocks = k / QK_MXFP4;
+    const uint8_t * x_q = (const uint8_t *) vx;
+    const uint8_t * x_e = x_q + nblocks*(QK_MXFP4/2);
+    dequantize_block_mxfp4_soa<<<nb, 32, 0, stream>>>(x_q, x_e, y);
 }
 
 template <typename dst_t>

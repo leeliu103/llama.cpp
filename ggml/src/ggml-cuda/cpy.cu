@@ -87,6 +87,8 @@ static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const 
             }
         }
 
+        __syncthreads();
+
         cur_tile_buf = (cur_tile_buf + 1) % 2;
     }
 
