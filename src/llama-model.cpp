@@ -8094,6 +8094,48 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
+#if defined(GGML_USE_HIP)
+    if (ml.use_mmap && !ml.check_tensors) {
+        const auto ctx_uses_hip_mxfp4_async_layout = [&](ggml_backend_buffer_type_t buft, ggml_context * ctx) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (!dev || buft != ggml_backend_dev_buffer_type(dev)) {
+                return false;
+            }
+
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            if (!reg || ggml_backend_reg_get_proc_address(reg, "ggml_backend_tensor_uses_mxfp4_soa") == nullptr) {
+                return false;
+            }
+
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) {
+                return false;
+            }
+
+            if (!ggml_backend_dev_host_buffer_type(dev)) {
+                return false;
+            }
+
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
+                if (cur->type == GGML_TYPE_MXFP4 && cur->view_src == nullptr) {
+                    return true;
+                }
+            }
+
+            return false;
+        };
+
+        for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+            if (ctx_uses_hip_mxfp4_async_layout(buft, ctx_ptr.get())) {
+                LLAMA_LOG_INFO("%s: disabling mmap for HIP MXFP4 tensors so async uploads keep the legacy device layout\n", __func__);
+                ml.use_mmap = false;
+                break;
+            }
+        }
+    }
+#endif
+
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {

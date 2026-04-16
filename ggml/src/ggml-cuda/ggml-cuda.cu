@@ -629,17 +629,43 @@ static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_buffer_free_buffer;
 }
 
+static const ggml_tensor * ggml_cuda_mxfp4_soa_storage_tensor(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_MXFP4) {
+        return nullptr;
+    }
+
+    const ggml_tensor * storage = tensor;
+    if (tensor->view_src != nullptr) {
+        // Pure alias views like permute/transpose share the same full storage span, so they
+        // still need AoS<->SoA conversion when written through the generic tensor-set API.
+        if (tensor->view_offs != 0 ||
+            ggml_nbytes(tensor) != ggml_nbytes(tensor->view_src) ||
+            ggml_nelements(tensor) != ggml_nelements(tensor->view_src)) {
+            return nullptr;
+        }
+        storage = tensor->view_src;
+    }
+
+    if (storage->buffer == nullptr || !ggml_backend_buffer_is_cuda(storage->buffer)) {
+        return nullptr;
+    }
+
+    return storage;
+}
+
+static bool ggml_cuda_tensor_has_mxfp4_soa_layout(const ggml_tensor * tensor) {
+    return ggml_cuda_mxfp4_soa_storage_tensor(tensor) != nullptr;
+}
+
 static bool ggml_cuda_tensor_uses_mxfp4_soa(const ggml_tensor * tensor) {
-    return tensor != nullptr &&
-        tensor->buffer != nullptr &&
+    return ggml_cuda_tensor_has_mxfp4_soa_layout(tensor) &&
         tensor->view_src == nullptr &&
-        tensor->type == GGML_TYPE_MXFP4 &&
-        ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-        ggml_backend_buffer_is_cuda(tensor->buffer);
+        ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
 }
 
 static bool ggml_backend_cuda_buffer_should_repack_mxfp4(ggml_backend_buffer_t buffer, const ggml_tensor * tensor) {
-    return buffer == tensor->buffer && ggml_cuda_tensor_uses_mxfp4_soa(tensor);
+    const ggml_tensor * storage = ggml_cuda_mxfp4_soa_storage_tensor(tensor);
+    return storage != nullptr && buffer == storage->buffer;
 }
 
 static void ggml_backend_cuda_begin_tensor_upload_mxfp4_soa_async(ggml_backend_t backend, const ggml_tensor * tensor) {
@@ -657,6 +683,20 @@ static void ggml_backend_cuda_begin_tensor_upload_mxfp4_soa_async(ggml_backend_t
     cuda_ctx->mxfp4_async_uploads.emplace(tensor, upload);
 }
 
+static void ggml_backend_cuda_begin_tensor_upload_mxfp4_device_layout_async(ggml_backend_t backend, const ggml_tensor * tensor) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    GGML_ASSERT(ggml_cuda_tensor_uses_mxfp4_soa(tensor));
+    GGML_ASSERT(cuda_ctx->mxfp4_async_uploads.find(tensor) == cuda_ctx->mxfp4_async_uploads.end());
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    ggml_backend_cuda_context::mxfp4_async_upload upload = {};
+    upload.device_layout = true;
+
+    cuda_ctx->mxfp4_async_uploads.emplace(tensor, upload);
+}
+
 static void ggml_backend_cuda_finish_tensor_upload_mxfp4_soa_async(ggml_backend_t backend, const ggml_tensor * tensor) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
     auto it = cuda_ctx->mxfp4_async_uploads.find(tensor);
@@ -665,31 +705,33 @@ static void ggml_backend_cuda_finish_tensor_upload_mxfp4_soa_async(ggml_backend_
 
     ggml_cuda_set_device(cuda_ctx->device);
 
-    const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
-    convert_block_mxfp4_aos_to_soa(it->second.aos, tensor->data, nblocks, cuda_ctx->stream());
-    CUDA_CHECK(cudaGetLastError());
+    if (!it->second.device_layout) {
+        const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+        convert_block_mxfp4_aos_to_soa(it->second.aos, tensor->data, nblocks, cuda_ctx->stream());
+        CUDA_CHECK(cudaGetLastError());
 
-    if (getenv("GGML_HIP_MXFP4_DEBUG_UPLOAD") != nullptr) {
-        const uint8_t * host_aos = (const uint8_t *) it->second.aos;
-        const size_t qbytes = (size_t) nblocks * (QK_MXFP4 / 2);
-        std::vector<uint8_t> dev_q(16);
-        std::vector<uint8_t> dev_e(8);
+        if (getenv("GGML_HIP_MXFP4_DEBUG_UPLOAD") != nullptr) {
+            const uint8_t * host_aos = (const uint8_t *) it->second.aos;
+            const size_t qbytes = (size_t) nblocks * (QK_MXFP4 / 2);
+            std::vector<uint8_t> dev_q(16);
+            std::vector<uint8_t> dev_e(8);
 
-        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-        CUDA_CHECK(cudaMemcpy(dev_q.data(), tensor->data, dev_q.size(), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(dev_e.data(), (const uint8_t *) tensor->data + qbytes, dev_e.size(), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+            CUDA_CHECK(cudaMemcpy(dev_q.data(), tensor->data, dev_q.size(), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(dev_e.data(), (const uint8_t *) tensor->data + qbytes, dev_e.size(), cudaMemcpyDeviceToHost));
 
-        fprintf(stderr, "MXFP4_UPLOAD name=%s host_e0=%02x host_q0=%02x host_q1=%02x host_q2=%02x host_q3=%02x "
-                        "dev_q=%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x "
-                        "dev_e=%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x\n",
-                ggml_get_name(tensor),
-                host_aos[0], host_aos[1], host_aos[2], host_aos[3], host_aos[4],
-                dev_q[0], dev_q[1], dev_q[2], dev_q[3], dev_q[4], dev_q[5], dev_q[6], dev_q[7],
-                dev_q[8], dev_q[9], dev_q[10], dev_q[11], dev_q[12], dev_q[13], dev_q[14], dev_q[15],
-                dev_e[0], dev_e[1], dev_e[2], dev_e[3], dev_e[4], dev_e[5], dev_e[6], dev_e[7]);
+            fprintf(stderr, "MXFP4_UPLOAD name=%s host_e0=%02x host_q0=%02x host_q1=%02x host_q2=%02x host_q3=%02x "
+                            "dev_q=%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x "
+                            "dev_e=%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x\n",
+                    ggml_get_name(tensor),
+                    host_aos[0], host_aos[1], host_aos[2], host_aos[3], host_aos[4],
+                    dev_q[0], dev_q[1], dev_q[2], dev_q[3], dev_q[4], dev_q[5], dev_q[6], dev_q[7],
+                    dev_q[8], dev_q[9], dev_q[10], dev_q[11], dev_q[12], dev_q[13], dev_q[14], dev_q[15],
+                    dev_e[0], dev_e[1], dev_e[2], dev_e[3], dev_e[4], dev_e[5], dev_e[6], dev_e[7]);
+        }
+
+        it->second.pool->free(it->second.aos, it->second.aos_size);
     }
-
-    it->second.pool->free(it->second.aos, it->second.aos_size);
     cuda_ctx->mxfp4_async_uploads.erase(it);
 }
 
@@ -3081,20 +3123,16 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-#if defined(GGML_USE_HIP)
-    if (tensor->type == GGML_TYPE_MXFP4 && getenv("GGML_HIP_MXFP4_USE_A7_ASYNC_LAYOUT") != nullptr) {
-        // Match the A7 async upload path exactly for perf comparison.
-        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
-        return;
-    }
-#endif
-
     if (ggml_backend_cuda_buffer_should_repack_mxfp4(buf, tensor)) {
         auto upload = cuda_ctx->mxfp4_async_uploads.find(tensor);
         if (upload != cuda_ctx->mxfp4_async_uploads.end()) {
             const size_t nbytes = ggml_nbytes(tensor);
             GGML_ASSERT(offset + size <= nbytes);
-            CUDA_CHECK(cudaMemcpyAsync((char *) upload->second.aos + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+            if (upload->second.device_layout) {
+                CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync((char *) upload->second.aos + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+            }
             return;
         }
 
@@ -5452,6 +5490,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_begin_tensor_upload_mxfp4_soa_async") == 0) {
         return (void *)ggml_backend_cuda_begin_tensor_upload_mxfp4_soa_async;
+    }
+    if (strcmp(name, "ggml_backend_begin_tensor_upload_mxfp4_device_layout_async") == 0) {
+        return (void *)ggml_backend_cuda_begin_tensor_upload_mxfp4_device_layout_async;
     }
     if (strcmp(name, "ggml_backend_finish_tensor_upload_mxfp4_soa_async") == 0) {
         return (void *)ggml_backend_cuda_finish_tensor_upload_mxfp4_soa_async;
