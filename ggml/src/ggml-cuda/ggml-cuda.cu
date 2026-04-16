@@ -683,7 +683,7 @@ static void ggml_backend_cuda_begin_tensor_upload_mxfp4_soa_async(ggml_backend_t
     cuda_ctx->mxfp4_async_uploads.emplace(tensor, upload);
 }
 
-static void ggml_backend_cuda_begin_tensor_upload_mxfp4_device_layout_async(ggml_backend_t backend, const ggml_tensor * tensor) {
+static void ggml_backend_cuda_begin_tensor_upload_mxfp4_soa_layout_async(ggml_backend_t backend, const ggml_tensor * tensor) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     GGML_ASSERT(ggml_cuda_tensor_uses_mxfp4_soa(tensor));
@@ -692,7 +692,7 @@ static void ggml_backend_cuda_begin_tensor_upload_mxfp4_device_layout_async(ggml
     ggml_cuda_set_device(cuda_ctx->device);
 
     ggml_backend_cuda_context::mxfp4_async_upload upload = {};
-    upload.device_layout = true;
+    upload.mxfp4_soa_layout = true;
 
     cuda_ctx->mxfp4_async_uploads.emplace(tensor, upload);
 }
@@ -705,7 +705,7 @@ static void ggml_backend_cuda_finish_tensor_upload_mxfp4_soa_async(ggml_backend_
 
     ggml_cuda_set_device(cuda_ctx->device);
 
-    if (!it->second.device_layout) {
+    if (!it->second.mxfp4_soa_layout) {
         const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
         convert_block_mxfp4_aos_to_soa(it->second.aos, tensor->data, nblocks, cuda_ctx->stream());
         CUDA_CHECK(cudaGetLastError());
@@ -3128,7 +3128,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         if (upload != cuda_ctx->mxfp4_async_uploads.end()) {
             const size_t nbytes = ggml_nbytes(tensor);
             GGML_ASSERT(offset + size <= nbytes);
-            if (upload->second.device_layout) {
+            if (upload->second.mxfp4_soa_layout) {
                 CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
             } else {
                 CUDA_CHECK(cudaMemcpyAsync((char *) upload->second.aos + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -5491,8 +5491,8 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_begin_tensor_upload_mxfp4_soa_async") == 0) {
         return (void *)ggml_backend_cuda_begin_tensor_upload_mxfp4_soa_async;
     }
-    if (strcmp(name, "ggml_backend_begin_tensor_upload_mxfp4_device_layout_async") == 0) {
-        return (void *)ggml_backend_cuda_begin_tensor_upload_mxfp4_device_layout_async;
+    if (strcmp(name, "ggml_backend_begin_tensor_upload_mxfp4_soa_layout_async") == 0) {
+        return (void *)ggml_backend_cuda_begin_tensor_upload_mxfp4_soa_layout_async;
     }
     if (strcmp(name, "ggml_backend_finish_tensor_upload_mxfp4_soa_async") == 0) {
         return (void *)ggml_backend_cuda_finish_tensor_upload_mxfp4_soa_async;
