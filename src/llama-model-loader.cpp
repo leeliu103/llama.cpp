@@ -19,7 +19,6 @@ static const size_t GiB = 1024*MiB;
 
 using ggml_backend_tensor_uses_mxfp4_soa_t = bool (*)(const ggml_tensor * tensor);
 using ggml_backend_begin_tensor_upload_mxfp4_soa_async_t = void (*)(ggml_backend_t backend, const ggml_tensor * tensor);
-using ggml_backend_begin_tensor_upload_mxfp4_soa_layout_async_t = void (*)(ggml_backend_t backend, const ggml_tensor * tensor);
 using ggml_backend_finish_tensor_upload_mxfp4_soa_async_t = void (*)(ggml_backend_t backend, const ggml_tensor * tensor);
 
 const char * llama_file_version_name(llama_fver version) {
@@ -1521,7 +1520,6 @@ bool llama_model_loader::load_all_data(
 
     ggml_backend_tensor_uses_mxfp4_soa_t tensor_uses_mxfp4_soa = nullptr;
     ggml_backend_begin_tensor_upload_mxfp4_soa_async_t begin_tensor_upload_mxfp4_soa_async = nullptr;
-    ggml_backend_begin_tensor_upload_mxfp4_soa_layout_async_t begin_tensor_upload_mxfp4_soa_layout_async = nullptr;
     ggml_backend_finish_tensor_upload_mxfp4_soa_async_t finish_tensor_upload_mxfp4_soa_async = nullptr;
 #if defined(GGML_USE_HIP)
     const bool use_hip_mxfp4_chunked_async_upload =
@@ -1533,8 +1531,6 @@ bool llama_model_loader::load_all_data(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_tensor_uses_mxfp4_soa");
         begin_tensor_upload_mxfp4_soa_async = (ggml_backend_begin_tensor_upload_mxfp4_soa_async_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_begin_tensor_upload_mxfp4_soa_async");
-        begin_tensor_upload_mxfp4_soa_layout_async = (ggml_backend_begin_tensor_upload_mxfp4_soa_layout_async_t)
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_begin_tensor_upload_mxfp4_soa_layout_async");
         finish_tensor_upload_mxfp4_soa_async = (ggml_backend_finish_tensor_upload_mxfp4_soa_async_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_finish_tensor_upload_mxfp4_soa_async");
     }
@@ -1607,23 +1603,11 @@ bool llama_model_loader::load_all_data(
                     !disable_chunked_mxfp4_soa_async_upload &&
                     begin_tensor_upload_mxfp4_soa_async != nullptr &&
                     finish_tensor_upload_mxfp4_soa_async != nullptr;
-#if defined(GGML_USE_HIP)
-                const bool use_mxfp4_soa_layout_async_upload = is_mxfp4_soa_tensor &&
-                    !use_chunked_mxfp4_soa_async_upload &&
-                    begin_tensor_upload_mxfp4_soa_layout_async != nullptr &&
-                    finish_tensor_upload_mxfp4_soa_async != nullptr;
-                const bool avoid_chunked_async_upload = false;
-#else
                 const bool avoid_chunked_async_upload = is_mxfp4_soa_tensor && !use_chunked_mxfp4_soa_async_upload;
-#endif
 
                 if (upload_backend && !avoid_chunked_async_upload) {
                     if (use_chunked_mxfp4_soa_async_upload) {
                         begin_tensor_upload_mxfp4_soa_async(upload_backend, cur);
-#if defined(GGML_USE_HIP)
-                    } else if (use_mxfp4_soa_layout_async_upload) {
-                        begin_tensor_upload_mxfp4_soa_layout_async(upload_backend, cur);
-#endif
                     }
 
                     size_t offset = weight->offs;
@@ -1670,11 +1654,7 @@ bool llama_model_loader::load_all_data(
                         const bool is_last_chunk = data_read + data_to_copy == n_size;
                         ggml_backend_tensor_set_async(upload_backend, cur,
                                                       reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
-                        if ((use_chunked_mxfp4_soa_async_upload
-#if defined(GGML_USE_HIP)
-                                || use_mxfp4_soa_layout_async_upload
-#endif
-                                ) && is_last_chunk) {
+                        if (use_chunked_mxfp4_soa_async_upload && is_last_chunk) {
                             finish_tensor_upload_mxfp4_soa_async(upload_backend, cur);
                         }
                         ggml_backend_event_record(events[buffer_idx], upload_backend);

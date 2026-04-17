@@ -76,9 +76,7 @@ llm_build_openai_moe_iswa::llm_build_openai_moe_iswa(const llama_model & model, 
                 nullptr,
                 n_expert, n_expert_used,
                 LLM_FFN_SWIGLU_OAI_MOE, false,
-                // Keep GPT-OSS/OpenAI-MoE aligned with the original A7 path:
-                // do not apply expert weight scaling after softmax-weight gating.
-                0.0f,
+                hparams.expert_weights_scale,
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT,
                 il);
         cb(cur, "ffn_moe_out", il);

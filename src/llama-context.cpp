@@ -153,14 +153,9 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
-    const bool disable_fused_gdn = [] {
-        const char * env = getenv("LLAMA_DISABLE_FUSED_GDN");
-        return env != nullptr && atoi(env) != 0;
-    }();
-
-    cparams.fused_gdn_ar = !disable_fused_gdn;
-    cparams.fused_gdn_ch = !disable_fused_gdn;
-    cparams.auto_fgdn    = !disable_fused_gdn;
+    cparams.fused_gdn_ar = true;
+    cparams.fused_gdn_ch = true;
+    cparams.auto_fgdn    = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;

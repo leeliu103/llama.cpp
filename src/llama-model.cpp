@@ -7897,7 +7897,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
 #if defined(GGML_USE_HIP)
     if (ml.use_mmap && !ml.check_tensors) {
-        const auto ctx_uses_hip_mxfp4_async_layout = [&](ggml_backend_buffer_type_t buft, ggml_context * ctx) {
+        const auto ctx_uses_hip_mxfp4_soa_upload = [&](ggml_backend_buffer_type_t buft, ggml_context * ctx) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             if (!dev || buft != ggml_backend_dev_buffer_type(dev)) {
                 return false;
@@ -7928,8 +7928,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         };
 
         for (auto & [buft, ctx_ptr] : ml.ctx_map) {
-            if (ctx_uses_hip_mxfp4_async_layout(buft, ctx_ptr.get())) {
-                LLAMA_LOG_INFO("%s: disabling mmap for HIP MXFP4 tensors so async uploads keep the legacy device layout\n", __func__);
+            if (ctx_uses_hip_mxfp4_soa_upload(buft, ctx_ptr.get())) {
+                LLAMA_LOG_INFO("%s: disabling mmap for HIP MXFP4 tensors so AoS GGUF weights are repacked into the device SoA layout during upload\n", __func__);
                 ml.use_mmap = false;
                 break;
             }

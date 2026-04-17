@@ -1362,7 +1362,6 @@ struct ggml_backend_cuda_context {
         ggml_cuda_pool * pool = nullptr;
         void * aos = nullptr;
         size_t aos_size = 0;
-        bool mxfp4_soa_layout = false;
     };
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
