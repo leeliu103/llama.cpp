@@ -686,26 +686,6 @@ static void ggml_backend_cuda_finish_tensor_upload_mxfp4_soa_async(ggml_backend_
     convert_block_mxfp4_aos_to_soa(it->second.aos, tensor->data, nblocks, cuda_ctx->stream());
     CUDA_CHECK(cudaGetLastError());
 
-    if (getenv("GGML_HIP_MXFP4_DEBUG_UPLOAD") != nullptr) {
-        const uint8_t * host_aos = (const uint8_t *) it->second.aos;
-        const size_t qbytes = (size_t) nblocks * (QK_MXFP4 / 2);
-        std::vector<uint8_t> dev_q(16);
-        std::vector<uint8_t> dev_e(8);
-
-        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-        CUDA_CHECK(cudaMemcpy(dev_q.data(), tensor->data, dev_q.size(), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(dev_e.data(), (const uint8_t *) tensor->data + qbytes, dev_e.size(), cudaMemcpyDeviceToHost));
-
-        fprintf(stderr, "MXFP4_UPLOAD name=%s host_e0=%02x host_q0=%02x host_q1=%02x host_q2=%02x host_q3=%02x "
-                        "dev_q=%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x "
-                        "dev_e=%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x\n",
-                ggml_get_name(tensor),
-                host_aos[0], host_aos[1], host_aos[2], host_aos[3], host_aos[4],
-                dev_q[0], dev_q[1], dev_q[2], dev_q[3], dev_q[4], dev_q[5], dev_q[6], dev_q[7],
-                dev_q[8], dev_q[9], dev_q[10], dev_q[11], dev_q[12], dev_q[13], dev_q[14], dev_q[15],
-                dev_e[0], dev_e[1], dev_e[2], dev_e[3], dev_e[4], dev_e[5], dev_e[6], dev_e[7]);
-    }
-
     it->second.pool->free(it->second.aos, it->second.aos_size);
     cuda_ctx->mxfp4_async_uploads.erase(it);
 }
@@ -3200,25 +3180,6 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         convert_block_mxfp4_aos_to_soa(tmp_aos, tensor->data, nblocks, cuda_ctx->stream());
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-
-        if (getenv("GGML_HIP_MXFP4_DEBUG_UPLOAD") != nullptr && offset == 0 && size == nbytes) {
-            const uint8_t * host_aos = (const uint8_t *) data;
-            const size_t qbytes = (size_t) nblocks * (QK_MXFP4 / 2);
-            std::vector<uint8_t> dev_q(16);
-            std::vector<uint8_t> dev_e(8);
-
-            CUDA_CHECK(cudaMemcpy(dev_q.data(), tensor->data, dev_q.size(), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(dev_e.data(), (const uint8_t *) tensor->data + qbytes, dev_e.size(), cudaMemcpyDeviceToHost));
-
-            fprintf(stderr, "MXFP4_UPLOAD_SYNC name=%s host_e0=%02x host_q0=%02x host_q1=%02x host_q2=%02x host_q3=%02x "
-                            "dev_q=%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x "
-                            "dev_e=%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x\n",
-                    ggml_get_name(tensor),
-                    host_aos[0], host_aos[1], host_aos[2], host_aos[3], host_aos[4],
-                    dev_q[0], dev_q[1], dev_q[2], dev_q[3], dev_q[4], dev_q[5], dev_q[6], dev_q[7],
-                    dev_q[8], dev_q[9], dev_q[10], dev_q[11], dev_q[12], dev_q[13], dev_q[14], dev_q[15],
-                    dev_e[0], dev_e[1], dev_e[2], dev_e[3], dev_e[4], dev_e[5], dev_e[6], dev_e[7]);
-        }
 
         CUDA_CHECK(cudaFree(tmp_aos));
         return;
