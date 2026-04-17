@@ -1594,15 +1594,13 @@ bool llama_model_loader::load_all_data(
                 const bool is_mxfp4_soa_tensor = upload_backend &&
                     tensor_uses_mxfp4_soa != nullptr &&
                     tensor_uses_mxfp4_soa(cur);
-#if defined(GGML_USE_HIP)
-                const bool disable_chunked_mxfp4_soa_async_upload = is_mxfp4_soa_tensor && !use_hip_mxfp4_chunked_async_upload;
-#else
-                const bool disable_chunked_mxfp4_soa_async_upload = false;
-#endif
-                const bool use_chunked_mxfp4_soa_async_upload = is_mxfp4_soa_tensor &&
-                    !disable_chunked_mxfp4_soa_async_upload &&
+                bool use_chunked_mxfp4_soa_async_upload = is_mxfp4_soa_tensor &&
                     begin_tensor_upload_mxfp4_soa_async != nullptr &&
                     finish_tensor_upload_mxfp4_soa_async != nullptr;
+#if defined(GGML_USE_HIP)
+                use_chunked_mxfp4_soa_async_upload = use_chunked_mxfp4_soa_async_upload &&
+                    use_hip_mxfp4_chunked_async_upload;
+#endif
                 const bool avoid_chunked_async_upload = is_mxfp4_soa_tensor && !use_chunked_mxfp4_soa_async_upload;
 
                 if (upload_backend && !avoid_chunked_async_upload) {

@@ -647,14 +647,11 @@ static const ggml_tensor * ggml_cuda_mxfp4_soa_storage_tensor(const ggml_tensor 
     return storage;
 }
 
-static bool ggml_cuda_tensor_has_mxfp4_soa_layout(const ggml_tensor * tensor) {
-    return ggml_cuda_mxfp4_soa_storage_tensor(tensor) != nullptr;
-}
-
 static bool ggml_cuda_tensor_uses_mxfp4_soa(const ggml_tensor * tensor) {
-    return ggml_cuda_tensor_has_mxfp4_soa_layout(tensor) &&
+    const ggml_tensor * storage = ggml_cuda_mxfp4_soa_storage_tensor(tensor);
+    return storage != nullptr &&
         tensor->view_src == nullptr &&
-        ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+        ggml_backend_buffer_get_usage(storage->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
 }
 
 static bool ggml_backend_cuda_buffer_should_repack_mxfp4(ggml_backend_buffer_t buffer, const ggml_tensor * tensor) {
@@ -1404,17 +1401,6 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     GGML_UNUSED_VARS(comm_ctx_v, tensors);
     return false;
 #endif // GGML_USE_NCCL
-}
-
-bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends) {
-    void * comm_ctx = ggml_backend_cuda_comm_init(backends, n_backends);
-    if (comm_ctx == nullptr) {
-        return false;
-    }
-
-    const bool ok = ggml_backend_cuda_comm_allreduce_tensor(comm_ctx, tensors);
-    ggml_backend_cuda_comm_free(comm_ctx);
-    return ok;
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(int main_device, const float * tensor_split) {
@@ -5608,9 +5594,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_finish_tensor_upload_mxfp4_soa_async") == 0) {
         return (void *)ggml_backend_cuda_finish_tensor_upload_mxfp4_soa_async;
-    }
-    if (strcmp(name, "ggml_backend_allreduce_tensor") == 0) {
-        return (void *)ggml_backend_cuda_allreduce_tensor;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
