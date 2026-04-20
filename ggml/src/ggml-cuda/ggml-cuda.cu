@@ -4925,6 +4925,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (a->buffer && ggml_backend_buft_is_cuda_split(a->buffer->buft)) {
                     if (a->ne[2] > 1 || a->ne[3] > 1) {
                         return false;
@@ -4942,8 +4943,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                     return false;
                 }
+                if (a->buffer &&
+                    a->type == GGML_TYPE_MXFP4 &&
+                    (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
+                    if (ggml_backend_buft_is_cuda(a->buffer->buft)) {
+                        return false;
+                    }
+                    if (ggml_backend_buft_is_cuda_repack(a->buffer->buft)) {
+                        return true;
+                    }
+                }
 #ifdef GGML_USE_MUSA
-                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (b->ne[2]*b->ne[3] > 1 && !ggml_is_transposed(a) && !ggml_is_transposed(b)) {
                     if (GGML_CUDA_CC_IS_QY1(cc) && op->op == GGML_OP_MUL_MAT &&
                             a->type == GGML_TYPE_F16 && b->type == GGML_TYPE_F16) {
