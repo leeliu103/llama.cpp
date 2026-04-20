@@ -31,6 +31,31 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type);
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type);
 to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type);
 
+constexpr int GGML_CUDA_QUANT_LAYOUT_MAX_SEGMENTS = 2;
+
+struct ggml_cuda_quant_layout {
+    uint16_t block_size;
+    uint8_t  nsegments;
+    uint16_t segment_src_offset[GGML_CUDA_QUANT_LAYOUT_MAX_SEGMENTS];
+    uint16_t segment_size[GGML_CUDA_QUANT_LAYOUT_MAX_SEGMENTS];
+};
+
+bool ggml_cuda_get_quant_layout(ggml_type type, ggml_cuda_quant_layout * layout);
+
+void ggml_cuda_convert_quant_block_aos_to_soa(
+        ggml_type type,
+        const void * src_aos,
+        void * dst_soa,
+        int64_t nblocks,
+        cudaStream_t stream);
+
+void ggml_cuda_convert_quant_block_soa_to_aos(
+        ggml_type type,
+        const void * src_soa,
+        void * dst_aos,
+        int64_t nblocks,
+        cudaStream_t stream);
+
 template<typename dst_t, typename src_t>
  __host__ __device__ inline dst_t ggml_cuda_cast(src_t x) {
     if constexpr (std::is_same_v<dst_t, src_t>) {
