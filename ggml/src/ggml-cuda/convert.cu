@@ -1,7 +1,127 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
 
+#include <cstddef>
 #include <cstdint>
+
+bool ggml_cuda_get_quant_layout(ggml_type type, ggml_cuda_quant_layout * layout) {
+    if (layout == nullptr) {
+        return false;
+    }
+
+    *layout = {};
+
+    switch (type) {
+        case GGML_TYPE_MXFP4:
+            layout->block_size = sizeof(block_mxfp4);
+            layout->nsegments = 2;
+            layout->segment_src_offset[0] = offsetof(block_mxfp4, qs);
+            layout->segment_size[0] = QK_MXFP4 / 2;
+            layout->segment_src_offset[1] = offsetof(block_mxfp4, e);
+            layout->segment_size[1] = sizeof(uint8_t);
+            return true;
+        default:
+            return false;
+    }
+}
+
+static __global__ void kernel_convert_quant_block_aos_to_soa(
+        const uint8_t * src_aos,
+        uint8_t * dst_soa,
+        int64_t nblocks,
+        ggml_cuda_quant_layout layout) {
+    const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+
+    const uint8_t * src_block = src_aos + ib * layout.block_size;
+    int64_t dst_segment_offset = 0;
+
+    for (int s = 0; s < layout.nsegments; ++s) {
+        const uint16_t src_offset = layout.segment_src_offset[s];
+        const uint16_t segment_size = layout.segment_size[s];
+        const uint8_t * src = src_block + src_offset;
+        uint8_t * dst = dst_soa + dst_segment_offset * nblocks + ib * segment_size;
+
+        for (int i = 0; i < segment_size; ++i) {
+            dst[i] = src[i];
+        }
+
+        dst_segment_offset += segment_size;
+    }
+}
+
+static __global__ void kernel_convert_quant_block_soa_to_aos(
+        const uint8_t * src_soa,
+        uint8_t * dst_aos,
+        int64_t nblocks,
+        ggml_cuda_quant_layout layout) {
+    const int64_t ib = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+
+    uint8_t * dst_block = dst_aos + ib * layout.block_size;
+    int64_t src_segment_offset = 0;
+
+    for (int s = 0; s < layout.nsegments; ++s) {
+        const uint16_t dst_offset = layout.segment_src_offset[s];
+        const uint16_t segment_size = layout.segment_size[s];
+        const uint8_t * src = src_soa + src_segment_offset * nblocks + ib * segment_size;
+        uint8_t * dst = dst_block + dst_offset;
+
+        for (int i = 0; i < segment_size; ++i) {
+            dst[i] = src[i];
+        }
+
+        src_segment_offset += segment_size;
+    }
+}
+
+void ggml_cuda_convert_quant_block_aos_to_soa(
+        ggml_type type,
+        const void * src_aos,
+        void * dst_soa,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    if (nblocks == 0) {
+        return;
+    }
+
+    ggml_cuda_quant_layout layout = {};
+    GGML_ASSERT(ggml_cuda_get_quant_layout(type, &layout));
+
+    constexpr int nth = 256;
+    const int nbl = (nblocks + nth - 1) / nth;
+    kernel_convert_quant_block_aos_to_soa<<<nbl, nth, 0, stream>>>(
+            (const uint8_t *) src_aos,
+            (uint8_t *) dst_soa,
+            nblocks,
+            layout);
+}
+
+void ggml_cuda_convert_quant_block_soa_to_aos(
+        ggml_type type,
+        const void * src_soa,
+        void * dst_aos,
+        int64_t nblocks,
+        cudaStream_t stream) {
+    if (nblocks == 0) {
+        return;
+    }
+
+    ggml_cuda_quant_layout layout = {};
+    GGML_ASSERT(ggml_cuda_get_quant_layout(type, &layout));
+
+    constexpr int nth = 256;
+    const int nbl = (nblocks + nth - 1) / nth;
+    kernel_convert_quant_block_soa_to_aos<<<nbl, nth, 0, stream>>>(
+            (const uint8_t *) src_soa,
+            (uint8_t *) dst_aos,
+            nblocks,
+            layout);
+}
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
