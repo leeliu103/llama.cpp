@@ -4621,6 +4621,16 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
     return ggml_backend_cuda_host_buffer_type();
 }
 
+static ggml_backend_buffer_type_t * ggml_backend_cuda_device_get_extra_buffers_type(ggml_backend_dev_t dev) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    static ggml_backend_buffer_type_t bufts[2];
+    bufts[0] = ggml_backend_cuda_repack_buffer_type(ctx->device);
+    bufts[1] = nullptr;
+
+    return bufts;
+}
+
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
@@ -5160,6 +5170,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_split_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_cuda_device_get_extra_buffers_type;
+        return (void *)fct;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
