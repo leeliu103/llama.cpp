@@ -659,7 +659,6 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
-    GGML_UNUSED(soa_q_offset);
 
     const uint32_t token_idx   = threadIdx.y;
     const int      row0        = c_rows_per_block*blockIdx.x;
@@ -678,6 +677,15 @@ static __global__ void mul_mat_vec_q_moe(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
 
+    const uint8_t * vx_e = nullptr;
+    const uint8_t * vx_q = nullptr;
+    if constexpr (type == GGML_TYPE_MXFP4) {
+        vx_q = (const uint8_t *) vx;
+        vx_e = vx_q + soa_q_offset;
+    } else {
+        GGML_UNUSED(soa_q_offset);
+    }
+
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
 
@@ -687,7 +695,12 @@ static __global__ void mul_mat_vec_q_moe(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            const int kbx_x = kbx_offset + i*stride_row_x + kbx;
+            if constexpr (type == GGML_TYPE_MXFP4) {
+                tmp[i] += vec_dot_mxfp4_q8_1_soa(vx_e, vx_q, &y[kby], kbx_x, kqs);
+            } else {
+                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_x, kqs);
+            }
         }
     }
 
