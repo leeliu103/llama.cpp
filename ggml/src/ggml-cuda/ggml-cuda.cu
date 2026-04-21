@@ -793,8 +793,30 @@ static void ggml_backend_cuda_repack_buffer_set_tensor(
         const void * data,
         size_t offset,
         size_t size) {
-    // TODO(hip-repack): AoS -> repacked layout conversion on upload.
-    ggml_backend_cuda_buffer_set_tensor(buffer, tensor, data, offset, size);
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+
+    ggml_cuda_quant_layout layout = {};
+    if (!ggml_cuda_get_quant_layout(tensor->type, &layout)) {
+        ggml_backend_cuda_buffer_set_tensor(buffer, tensor, data, offset, size);
+        return;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(size == nbytes);
+
+    ggml_cuda_set_device(ctx->device);
+
+    void * tmp_src = nullptr;
+    CUDA_CHECK(ggml_cuda_device_malloc(&tmp_src, nbytes, ctx->device));
+    CUDA_CHECK(cudaMemcpyAsync(tmp_src, data, nbytes, cudaMemcpyHostToDevice, cudaStreamPerThread));
+
+    const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+    ggml_cuda_convert_quant_block_aos_to_soa(layout, tmp_src, tensor->data, nblocks, cudaStreamPerThread);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    CUDA_CHECK(cudaFree(tmp_src));
 }
 
 static void ggml_backend_cuda_repack_buffer_get_tensor(
@@ -803,8 +825,29 @@ static void ggml_backend_cuda_repack_buffer_get_tensor(
         void * data,
         size_t offset,
         size_t size) {
-    // TODO(hip-repack): decode repacked layout back to canonical AoS if needed.
-    ggml_backend_cuda_buffer_get_tensor(buffer, tensor, data, offset, size);
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+
+    ggml_cuda_quant_layout layout = {};
+    if (!ggml_cuda_get_quant_layout(tensor->type, &layout)) {
+        ggml_backend_cuda_buffer_get_tensor(buffer, tensor, data, offset, size);
+        return;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    GGML_ASSERT(offset + size <= nbytes);
+
+    ggml_cuda_set_device(ctx->device);
+
+    void * tmp_dst = nullptr;
+    CUDA_CHECK(ggml_cuda_device_malloc(&tmp_dst, nbytes, ctx->device));
+
+    const int64_t nblocks = ggml_nelements(tensor) / ggml_blck_size(tensor->type);
+    ggml_cuda_convert_quant_block_soa_to_aos(layout, tensor->data, tmp_dst, nblocks, cudaStreamPerThread);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tmp_dst + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    CUDA_CHECK(cudaFree(tmp_dst));
 }
 
 static bool ggml_backend_cuda_repack_buffer_cpy_tensor(

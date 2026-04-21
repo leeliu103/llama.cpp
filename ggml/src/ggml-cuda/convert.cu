@@ -80,7 +80,7 @@ static __global__ void kernel_convert_quant_block_soa_to_aos(
 }
 
 void ggml_cuda_convert_quant_block_aos_to_soa(
-        ggml_type type,
+        const ggml_cuda_quant_layout & layout,
         const void * src_aos,
         void * dst_soa,
         int64_t nblocks,
@@ -88,9 +88,6 @@ void ggml_cuda_convert_quant_block_aos_to_soa(
     if (nblocks == 0) {
         return;
     }
-
-    ggml_cuda_quant_layout layout = {};
-    GGML_ASSERT(ggml_cuda_get_quant_layout(type, &layout));
 
     constexpr int nth = 256;
     const int nbl = (nblocks + nth - 1) / nth;
@@ -102,7 +99,7 @@ void ggml_cuda_convert_quant_block_aos_to_soa(
 }
 
 void ggml_cuda_convert_quant_block_soa_to_aos(
-        ggml_type type,
+        const ggml_cuda_quant_layout & layout,
         const void * src_soa,
         void * dst_aos,
         int64_t nblocks,
@@ -110,9 +107,6 @@ void ggml_cuda_convert_quant_block_soa_to_aos(
     if (nblocks == 0) {
         return;
     }
-
-    ggml_cuda_quant_layout layout = {};
-    GGML_ASSERT(ggml_cuda_get_quant_layout(type, &layout));
 
     constexpr int nth = 256;
     const int nbl = (nblocks + nth - 1) / nth;

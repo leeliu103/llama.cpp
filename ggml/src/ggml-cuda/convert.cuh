@@ -43,14 +43,14 @@ struct ggml_cuda_quant_layout {
 bool ggml_cuda_get_quant_layout(ggml_type type, ggml_cuda_quant_layout * layout);
 
 void ggml_cuda_convert_quant_block_aos_to_soa(
-        ggml_type type,
+        const ggml_cuda_quant_layout & layout,
         const void * src_aos,
         void * dst_soa,
         int64_t nblocks,
         cudaStream_t stream);
 
 void ggml_cuda_convert_quant_block_soa_to_aos(
-        ggml_type type,
+        const ggml_cuda_quant_layout & layout,
         const void * src_soa,
         void * dst_aos,
         int64_t nblocks,
