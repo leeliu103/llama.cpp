@@ -57,6 +57,28 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
+static __device__ __forceinline__ float vec_dot_mxfp4_q8_1_soa(
+        const uint8_t * __restrict__ vx_e,
+        const uint8_t * __restrict__ vx_q,
+        const block_q8_1 * __restrict__ bq8_1,
+        const int & kbx, const int & iqs) {
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+    const uint8_t * q4 = vx_q + (int64_t) kbx * (QK_MXFP4 / 2);
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = get_int_b1(q4, iqs + l);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+
+    const float d = ggml_cuda_e8m0_to_fp32(vx_e[kbx]) * 0.5f * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
     MMVQ_PARAMETERS_GCN,
@@ -157,7 +179,6 @@ static __global__ void mul_mat_vec_q(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
-    GGML_UNUSED(soa_q_offset);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -204,6 +225,22 @@ static __global__ void mul_mat_vec_q(
         active_glu    = fusion.glu_op;
     }
 
+    const uint8_t * vx_e = nullptr;
+    const uint8_t * vx_q = nullptr;
+    const uint8_t * vg_e = nullptr;
+    const uint8_t * vg_q = nullptr;
+    if constexpr (type == GGML_TYPE_MXFP4) {
+        vx_q = (const uint8_t *) vx;
+        vx_e = vx_q + soa_q_offset;
+        if constexpr (has_fusion) {
+            if (use_gate) {
+                vg_q = (const uint8_t *) vgate;
+                vg_e = vg_q + soa_q_offset;
+            }
+        }
+    } else {
+        GGML_UNUSED(soa_q_offset);
+    }
 
     float x_biases[ncols_dst]    = { 0.0f };
     float gate_biases[ncols_dst] = { 0.0f };
@@ -253,12 +290,21 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                const int kbx_x = kbx_offset + i*stride_row_x + kbx;
+                const block_q8_1 * yb = &y[j*stride_col_y + kby];
+
+                if constexpr (type == GGML_TYPE_MXFP4) {
+                    tmp[j][i] += vec_dot_mxfp4_q8_1_soa(vx_e, vx_q, yb, kbx_x, kqs);
+                } else {
+                    tmp[j][i] += vec_dot_q_cuda(vx, yb, kbx_x, kqs);
+                }
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        if constexpr (type == GGML_TYPE_MXFP4) {
+                            tmp_gate[j][i] += vec_dot_mxfp4_q8_1_soa(vg_e, vg_q, yb, kbx_x, kqs);
+                        } else {
+                            tmp_gate[j][i] += vec_dot_q_cuda(vgate, yb, kbx_x, kqs);
+                        }
                     }
                 }
             }
