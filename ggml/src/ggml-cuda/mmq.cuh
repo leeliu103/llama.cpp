@@ -14,7 +14,8 @@ using namespace ggml_cuda_mma;
 #define MMQ_ITER_K_MXFP4_FP4    512
 #define MMQ_NWARPS 8
 
-typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
+typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride,
+                                 const uint32_t soa_q_offset);
 typedef void (*vec_dot_mmq_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
 typedef void (*mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
     float * __restrict__ dst, const int stride, const int i_max, const int j_max);
@@ -296,7 +297,8 @@ static constexpr __device__ int mmq_get_nwarps_device() {
 // ------------------------------------------------------------
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q4_0(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -399,7 +401,8 @@ static __device__ __forceinline__ void vec_dot_q4_0_q8_1_dp4a(
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q4_1(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -502,7 +505,8 @@ static __device__ __forceinline__ void vec_dot_q4_1_q8_1_dp4a(
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q5_0(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -580,7 +584,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q5_1(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -656,7 +661,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q8_0(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -718,7 +724,9 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp4(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t soa_q_offset) {
+    GGML_UNUSED(soa_q_offset);
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -787,7 +795,9 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restr
                                                             int * __restrict__ x_tile,
                                                             const int kbx0,
                                                             const int i_max,
-                                                            const int stride) {
+                                                            const int stride,
+                                                            const uint32_t soa_q_offset) {
+    GGML_UNUSED(soa_q_offset);
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -1450,7 +1460,8 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q2_K(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -1836,7 +1847,8 @@ static __device__ __forceinline__ void vec_dot_q2_K_q8_1_mma(
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q3_K(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -1982,7 +1994,8 @@ static __device__ __forceinline__ int unpack_scales_q45_K(const int * scales, co
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q4_K(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -2126,7 +2139,8 @@ static __device__ __forceinline__ void vec_dot_q4_K_q8_1_dp4a(
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q5_K(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -2283,7 +2297,8 @@ static __device__ __forceinline__ void vec_dot_q5_K_q8_1_dp4a(
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q6_K(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -2617,7 +2632,8 @@ static __device__ __forceinline__ void vec_dot_q6_K_q8_1_mma(
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq4_nl(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -2682,7 +2698,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_xxs(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -2744,7 +2761,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_xs(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -2807,7 +2825,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_s(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -2873,7 +2892,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq3_xxs(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -2935,7 +2955,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq3_s(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -3002,7 +3023,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq1_s(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -3062,7 +3084,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq4_xs(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
+    const uint32_t /*soa_q_offset*/) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -3370,7 +3393,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const uint32_t soa_q_offset) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = mmq_get_nwarps_device();
@@ -3405,7 +3429,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, soa_q_offset);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
@@ -3467,7 +3491,7 @@ static __global__ void mul_mat_q(
         const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int channel_ratio, const int nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ncols_max) {
+        const int ncols_max, const uint32_t soa_q_offset) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -3552,7 +3576,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, ncols_x/qk);
+             tile_x_max_i, tile_y_max_j, 0, ncols_x/qk, soa_q_offset);
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -3632,7 +3656,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, soa_q_offset);
 
         kbc += blocks_per_ne00;
         kbc -= kbc % blocks_per_ne00;
@@ -3699,7 +3723,7 @@ static __global__ void mul_mat_q(
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, soa_q_offset);
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
@@ -3869,7 +3893,7 @@ struct mmq_args {
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
-    bool use_stream_k; int64_t ncols_max;
+    bool use_stream_k; int64_t ncols_max; uint32_t soa_q_offset;
 };
 
 template<ggml_type type>
@@ -3916,7 +3940,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 args.ncols_max);
+                 args.ncols_max, args.soa_q_offset);
         } else {
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -3924,7 +3948,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 args.ncols_max);
+                 args.ncols_max, args.soa_q_offset);
         }
         return;
     }
@@ -3945,7 +3969,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max);
+             args.ncols_max, args.soa_q_offset);
 
         if (!fixup_needed) {
             return;
@@ -3962,7 +3986,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max);
+             args.ncols_max, args.soa_q_offset);
 
         if (!fixup_needed) {
             return;
