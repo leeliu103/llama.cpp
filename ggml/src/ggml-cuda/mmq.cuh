@@ -835,7 +835,6 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp4(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride,
     const uint32_t soa_q_offset) {
-    GGML_UNUSED(soa_q_offset);
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -853,6 +852,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
     const int kbx  = txi / QI_MXFP4;
     const int kqsx = txi % QI_MXFP4;
+    const uint8_t * x_q = (const uint8_t *) x;
+    const uint8_t * x_e = x_q + soa_q_offset;
 
 #pragma unroll
     for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
@@ -862,9 +863,9 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             i = min(i, i_max);
         }
 
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
-
-        const int aux_q4 = get_int_b1(bxi->qs, kqsx);
+        const int ib = kbx0 + i*stride + kbx;
+        const uint8_t * q = x_q + ib*(QK_MXFP4/2);
+        const int aux_q4 = get_int_b1(q, kqsx);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
         const int k0 = kbx * (2 * QI_MXFP4) + kqsx;
 
@@ -889,12 +890,13 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             i = min(i, i_max);
         }
 
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbxd;
+        const int ib = kbx0 + i*stride + kbxd;
+        const uint8_t e = x_e[ib];
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i*MMQ_MMA_TILE_X_K_Q8_1                 + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_1                 + kbxd] = ggml_cuda_e8m0_to_fp32(e)*0.5f;
 #else
-        x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
+        x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = ggml_cuda_e8m0_to_fp32(e)*0.5f;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -906,7 +908,6 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restr
                                                             const int i_max,
                                                             const int stride,
                                                             const uint32_t soa_q_offset) {
-    GGML_UNUSED(soa_q_offset);
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -914,6 +915,8 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restr
     uint32_t * x_sc = (uint32_t *) (x_qs + 2 * MMQ_TILE_NE_K);
 
     const int txi = threadIdx.x;
+    const uint8_t * x_q = (const uint8_t *) x;
+    const uint8_t * x_e = x_q + soa_q_offset;
 
     constexpr int iter_k = get_iter_k(GGML_TYPE_MXFP4);
 
@@ -930,16 +933,16 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restr
             i = min(i, i_max);
         }
 
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i * stride + kbx;
-
+        const int ib = kbx0 + i * stride + kbx;
+        const uint8_t * q = x_q + ib*(QK_MXFP4/2);
         // quantize_mxfp4_mmq permutes nibbles to match the quantized format
         const int k0 = kbx * 4;
-        memcpy(x_qs + i * MMQ_MMA_TILE_X_K_FP4 + k0, bxi->qs, 16);
+        memcpy(x_qs + i * MMQ_MMA_TILE_X_K_FP4 + k0, q, 16);
 
         // Load E8M0 scales: pack 2 consecutive scales into one uint32
         if (kbx % 2 == 0) {
-            uint32_t e = bxi->e;
-            e |= ((bxi + 1)->e << 8);
+            uint32_t e = x_e[ib];
+            e |= ((uint32_t) x_e[ib + 1] << 8);
             x_sc[i * MMQ_MMA_TILE_X_K_FP4 + kbx / 2] = e;
         }
     }
