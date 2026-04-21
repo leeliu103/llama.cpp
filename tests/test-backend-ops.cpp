@@ -478,6 +478,83 @@ static bool backend_has_feature(ggml_backend_t backend, const char * feature_nam
     return false;
 }
 
+static std::vector<ggml_backend_buffer_type_t> get_backend_buft_candidates(ggml_backend_t backend) {
+    std::vector<ggml_backend_buffer_type_t> bufts;
+
+    ggml_backend_buffer_type_t default_buft = ggml_backend_get_default_buffer_type(backend);
+    if (default_buft != nullptr) {
+        bufts.push_back(default_buft);
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return bufts;
+    }
+
+    auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (!get_extra_bufts) {
+        return bufts;
+    }
+
+    ggml_backend_buffer_type_t * extra_bufts = get_extra_bufts(dev);
+    while (extra_bufts && *extra_bufts) {
+        bufts.push_back(*extra_bufts);
+        ++extra_bufts;
+    }
+
+    return bufts;
+}
+
+static bool backend_supports_graph_with_buft(ggml_backend_t backend, ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (buft == nullptr || !ggml_backend_dev_supports_buft(dev, buft)) {
+        return false;
+    }
+
+    ggml_backend_buffer_ptr dummy(ggml_backend_buft_alloc_buffer(buft, 0));
+    if (dummy == nullptr) {
+        return false;
+    }
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        GGML_ASSERT(t->buffer == nullptr);
+        if (t->view_src == nullptr) {
+            t->buffer = dummy.get();
+        }
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src != nullptr) {
+            t->buffer = t->view_src->buffer;
+        }
+    }
+
+    bool supported = true;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (!ggml_backend_supports_op(backend, t)) {
+            supported = false;
+            break;
+        }
+    }
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        t->buffer = nullptr;
+    }
+
+    return supported;
+}
+
+static ggml_backend_buffer_type_t select_backend_buft_for_test(ggml_backend_t backend, ggml_context * ctx) {
+    for (ggml_backend_buffer_type_t buft : get_backend_buft_candidates(backend)) {
+        if (backend_supports_graph_with_buft(backend, ctx, buft)) {
+            return buft;
+        }
+    }
+
+    return nullptr;
+}
+
 enum test_mode {
     MODE_TEST,
     MODE_PERF,
@@ -1303,14 +1380,12 @@ struct test_case {
             return test_status_t::SKIPPED;
         }
 
-        // check if the backends support the ops
-        bool supported = true;
-        for (ggml_backend_t backend : {backend1, backend2}) {
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-                if (!ggml_backend_supports_op(backend, t)) {
-                    supported = false;
-                    break;
-                }
+        ggml_backend_buffer_type_t buft1 = select_backend_buft_for_test(backend1, ctx);
+        bool supported = buft1 != nullptr;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); supported && t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (!ggml_backend_supports_op(backend2, t)) {
+                supported = false;
+                break;
             }
         }
 
@@ -1331,7 +1406,7 @@ struct test_case {
         add_sentinel(ctx);
 
         // allocate
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend1);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft1);
 
         if (buf == NULL) {
             printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
@@ -1470,7 +1545,8 @@ struct test_case {
             return true;
         }
 
-        if (!ggml_backend_supports_op(backend, out)) {
+        ggml_backend_buffer_type_t buft = select_backend_buft_for_test(backend, ctx.get());
+        if (buft == nullptr) {
             // Create test result for unsupported performance test
             test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", false, false,
                                "not supported");
@@ -1481,7 +1557,7 @@ struct test_case {
         }
 
         // allocate
-        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend)); // smart ptr
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft)); // smart ptr
 
         if (buf == NULL) {
             printf("failed to allocate tensors\n");
@@ -1602,7 +1678,7 @@ struct test_case {
             return true;
         }
 
-        bool supported = ggml_backend_supports_op(backend, out);
+        bool supported = select_backend_buft_for_test(backend, ctx.get()) != nullptr;
 
         std::string device_desc = ggml_backend_dev_description(ggml_backend_get_device(backend));
         std::string backend_reg_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
@@ -1652,11 +1728,6 @@ struct test_case {
         std::string failure_reason;
 
         for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
-            if (!ggml_backend_supports_op(backend, t)) {
-                supported      = false;
-                failure_reason = ggml_backend_name(backend);
-                break;
-            }
             if ((t->flags & GGML_TENSOR_FLAG_PARAM)) {
                 any_params = true;
                 if (t->type != GGML_TYPE_F32) {
@@ -1707,28 +1778,19 @@ struct test_case {
             }
         }
 
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
-            if (!ggml_backend_supports_op(backend, t)) {
-                output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
-                                                                    test_status_t::NOT_SUPPORTED,
-                                                                    ggml_backend_name(backend)));
-                supported = false;
-                break;
-            }
-            if ((t->flags & GGML_TENSOR_FLAG_PARAM) && t->type != GGML_TYPE_F32) {
-                output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
-                                                                    test_status_t::NOT_SUPPORTED,
-                                                                    std::string(t->name) + "->type != FP32"));
-                supported = false;
-                break;
-            }
+        ggml_backend_buffer_type_t buft = select_backend_buft_for_test(backend, ctx.get());
+        if (buft == nullptr) {
+            output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
+                                                                test_status_t::NOT_SUPPORTED,
+                                                                ggml_backend_name(backend)));
+            supported = false;
         }
         if (!supported) {
             return true;
         }
 
         // allocate
-        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend)); // smart ptr
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft)); // smart ptr
         if (buf == NULL) {
             test_operation_info info(op_desc(out), vars(), ggml_backend_name(backend));
             info.set_error("allocation", "");
