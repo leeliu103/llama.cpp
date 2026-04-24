@@ -804,31 +804,31 @@ static __global__ void mul_mat_vec_q4_K_q8_1_x4_rowpair_gate(
     for (; kbx + blocks_per_iter < blocks_per_row_x; kbx += 2*blocks_per_iter, kby += 2*kby_step) {
         const q4_k_q8_1_x4_rhs rhs0 = load_q4_K_q8_1_x4_rhs(y_row, kby, subblock0);
         const q4_k_q8_1_x4_rhs rhs1 = load_q4_K_q8_1_x4_rhs(y_row, kby, subblock1);
-        tmp0 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row0, rhs0, rhs1, subblock_pair);
-        tmp0_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row0, rhs0, rhs1, subblock_pair);
+        tmp0 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row0 + kbx, rhs0, rhs1, subblock_pair);
+        tmp0_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row0 + kbx, rhs0, rhs1, subblock_pair);
         if (has_row1) {
-            tmp1 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row1, rhs0, rhs1, subblock_pair);
-            tmp1_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row1, rhs0, rhs1, subblock_pair);
+            tmp1 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row1 + kbx, rhs0, rhs1, subblock_pair);
+            tmp1_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row1 + kbx, rhs0, rhs1, subblock_pair);
         }
 
         const q4_k_q8_1_x4_rhs rhs2 = load_q4_K_q8_1_x4_rhs(y_row, kby + kby_step, subblock0);
         const q4_k_q8_1_x4_rhs rhs3 = load_q4_K_q8_1_x4_rhs(y_row, kby + kby_step, subblock1);
-        tmp0 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row0 + blocks_per_iter, rhs2, rhs3, subblock_pair);
-        tmp0_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row0 + blocks_per_iter, rhs2, rhs3, subblock_pair);
+        tmp0 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row0 + kbx + blocks_per_iter, rhs2, rhs3, subblock_pair);
+        tmp0_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row0 + kbx + blocks_per_iter, rhs2, rhs3, subblock_pair);
         if (has_row1) {
-            tmp1 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row1 + blocks_per_iter, rhs2, rhs3, subblock_pair);
-            tmp1_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row1 + blocks_per_iter, rhs2, rhs3, subblock_pair);
+            tmp1 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row1 + kbx + blocks_per_iter, rhs2, rhs3, subblock_pair);
+            tmp1_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row1 + kbx + blocks_per_iter, rhs2, rhs3, subblock_pair);
         }
     }
 
     for (; kbx < blocks_per_row_x; kbx += blocks_per_iter, kby += kby_step) {
         const q4_k_q8_1_x4_rhs rhs0 = load_q4_K_q8_1_x4_rhs(y_row, kby, subblock0);
         const q4_k_q8_1_x4_rhs rhs1 = load_q4_K_q8_1_x4_rhs(y_row, kby, subblock1);
-        tmp0 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row0, rhs0, rhs1, subblock_pair);
-        tmp0_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row0, rhs0, rhs1, subblock_pair);
+        tmp0 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row0 + kbx, rhs0, rhs1, subblock_pair);
+        tmp0_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row0 + kbx, rhs0, rhs1, subblock_pair);
         if (has_row1) {
-            tmp1 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row1, rhs0, rhs1, subblock_pair);
-            tmp1_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row1, rhs0, rhs1, subblock_pair);
+            tmp1 += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vx_row1 + kbx, rhs0, rhs1, subblock_pair);
+            tmp1_gate += vec_dot_q4_K_q8_1_x4_with_rhs_pair(vgate_row1 + kbx, rhs0, rhs1, subblock_pair);
         }
     }
 
