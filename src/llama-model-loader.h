@@ -29,12 +29,20 @@ enum llama_fver {
 const char * llama_file_version_name(llama_fver version);
 
 struct llama_model_loader {
+    enum llama_tensor_source_kind : uint8_t {
+        LLAMA_TENSOR_SOURCE_FILE = 0,
+        LLAMA_TENSOR_SOURCE_CONCAT_ROWS,
+        LLAMA_TENSOR_SOURCE_CONCAT_VECTOR,
+    };
+
     // Holds information on a model weight
     struct llama_tensor_weight {
+        llama_tensor_source_kind source_kind = LLAMA_TENSOR_SOURCE_FILE;
         uint16_t  idx; // source file index
         size_t   offs; // tensor data offset in the original file
 
         ggml_tensor * tensor;
+        std::vector<std::string> src_names;
 
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
@@ -46,6 +54,24 @@ struct llama_model_loader {
             if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
+        }
+
+        llama_tensor_weight(
+                llama_tensor_source_kind source_kind,
+                ggml_tensor * tensor,
+                std::vector<std::string> src_names) :
+            source_kind(source_kind),
+            idx(0),
+            offs(0),
+            tensor(tensor),
+            src_names(std::move(src_names)) {}
+
+        bool is_file_backed() const {
+            return source_kind == LLAMA_TENSOR_SOURCE_FILE;
+        }
+
+        bool is_synthetic() const {
+            return !is_file_backed();
         }
     };
 
@@ -178,6 +204,16 @@ struct llama_model_loader {
 
     const struct ggml_tensor * check_tensor_dims(const std::string & name, const std::vector<int64_t> & ne, bool required) const;
 
+    struct ggml_tensor * register_concat_rows(
+            const std::string & name,
+            const std::initializer_list<int64_t> & ne,
+            const std::vector<std::string> & src_names);
+
+    struct ggml_tensor * register_concat_vector(
+            const std::string & name,
+            const std::initializer_list<int64_t> & ne,
+            const std::vector<std::string> & src_names);
+
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
@@ -200,6 +236,8 @@ struct llama_model_loader {
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
+
+    bool ctx_has_synthetic_tensors(const struct ggml_context * ctx) const;
 
     std::string ftype_name() const;
 

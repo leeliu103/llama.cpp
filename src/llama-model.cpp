@@ -1446,7 +1446,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !ml.ctx_has_synthetic_tensors(ctx)) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -2514,4 +2514,75 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
         layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
     }
+}
+
+void llama_model_base::create_attn_proj_group(llama_layer & layer, int bid, bool enable_fusion) {
+    GGML_ASSERT(ml != nullptr);
+
+    auto & group = layer.proj_group(LLM_PROJ_SOURCE_SELF_ATTN);
+    group.clear(LLM_PROJ_SOURCE_SELF_ATTN);
+
+    const int64_t q_width = layer.wq ? layer.wq->ne[1] : 0;
+    const int64_t k_width = layer.wk ? layer.wk->ne[1] : 0;
+    const int64_t v_width = layer.wv ? layer.wv->ne[1] : 0;
+
+    group.set_member(LLM_PROJ_Q, layer.wq, layer.bq, q_width, 0);
+    group.set_member(LLM_PROJ_K, layer.wk, layer.bk, k_width, q_width);
+    group.set_member(LLM_PROJ_V, layer.wv, layer.bv, v_width, q_width + k_width);
+    group.disable_fused_with_lora = true;
+
+    if (!enable_fusion || layer.wq == nullptr || layer.wk == nullptr || layer.wv == nullptr) {
+        return;
+    }
+
+    const bool same_type =
+            layer.wq->type == layer.wk->type &&
+            layer.wq->type == layer.wv->type;
+    const bool same_input_width =
+            layer.wq->ne[0] == layer.wk->ne[0] &&
+            layer.wq->ne[0] == layer.wv->ne[0];
+
+    if (!same_type || !same_input_width) {
+        return;
+    }
+
+    group.eligible = true;
+
+    const int64_t total_width = q_width + k_width + v_width;
+
+    if (layer.wqkv == nullptr) {
+        const auto fused_weight_name = tn(LLM_TENSOR_ATTN_QKV, "weight", bid);
+        ml->register_concat_rows(
+                fused_weight_name.str(),
+                { layer.wq->ne[0], total_width },
+                {
+                    tn(LLM_TENSOR_ATTN_Q, "weight", bid).str(),
+                    tn(LLM_TENSOR_ATTN_K, "weight", bid).str(),
+                    tn(LLM_TENSOR_ATTN_V, "weight", bid).str(),
+                });
+        layer.wqkv = create_tensor(fused_weight_name, { layer.wq->ne[0], total_width }, 0);
+    }
+    group.fused_weight = layer.wqkv;
+
+    const bool has_all_biases =
+            layer.bq != nullptr &&
+            layer.bk != nullptr &&
+            layer.bv != nullptr;
+    const bool same_bias_type =
+            !has_all_biases ||
+            (layer.bq->type == layer.bk->type && layer.bq->type == layer.bv->type);
+
+    if (has_all_biases && same_bias_type && layer.bqkv == nullptr) {
+        const auto fused_bias_name = tn(LLM_TENSOR_ATTN_QKV, "bias", bid);
+        ml->register_concat_vector(
+                fused_bias_name.str(),
+                { total_width },
+                {
+                    tn(LLM_TENSOR_ATTN_Q, "bias", bid).str(),
+                    tn(LLM_TENSOR_ATTN_K, "bias", bid).str(),
+                    tn(LLM_TENSOR_ATTN_V, "bias", bid).str(),
+                });
+        layer.bqkv = create_tensor(fused_bias_name, { total_width }, 0);
+    }
+    group.fused_bias = has_all_biases && same_bias_type ? layer.bqkv : nullptr;
 }

@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <string>
@@ -210,6 +211,80 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_norm = nullptr;
 };
 
+enum llm_proj_member : uint32_t {
+    LLM_PROJ_Q = 0,
+    LLM_PROJ_K,
+    LLM_PROJ_V,
+    LLM_PROJ_GATE,
+    LLM_PROJ_MEMBER_COUNT,
+};
+
+enum llm_proj_source : uint32_t {
+    LLM_PROJ_SOURCE_SELF_ATTN = 0,
+    LLM_PROJ_SOURCE_CROSS_Q,
+    LLM_PROJ_SOURCE_CROSS_KV,
+    LLM_PROJ_SOURCE_COUNT,
+};
+
+struct llm_proj_group {
+    explicit llm_proj_group(llm_proj_source source = LLM_PROJ_SOURCE_SELF_ATTN) : source(source) {}
+
+    llm_proj_source source = LLM_PROJ_SOURCE_SELF_ATTN;
+
+    std::array<struct ggml_tensor *, LLM_PROJ_MEMBER_COUNT> weights = {};
+    std::array<struct ggml_tensor *, LLM_PROJ_MEMBER_COUNT> biases  = {};
+
+    struct ggml_tensor * fused_weight = nullptr;
+    struct ggml_tensor * fused_bias   = nullptr;
+
+    std::array<int64_t, LLM_PROJ_MEMBER_COUNT> widths  = {};
+    std::array<int64_t, LLM_PROJ_MEMBER_COUNT> offsets = {};
+
+    uint32_t member_mask = 0;
+    bool eligible = false;
+    bool disable_fused_with_lora = true;
+
+    void clear(llm_proj_source new_source) {
+        source = new_source;
+        weights.fill(nullptr);
+        biases.fill(nullptr);
+        fused_weight = nullptr;
+        fused_bias = nullptr;
+        widths.fill(0);
+        offsets.fill(0);
+        member_mask = 0;
+        eligible = false;
+        disable_fused_with_lora = true;
+    }
+
+    void set_member(
+            llm_proj_member member,
+            struct ggml_tensor * weight,
+            struct ggml_tensor * bias,
+            int64_t width,
+            int64_t offset) {
+        const size_t idx = static_cast<size_t>(member);
+        weights[idx] = weight;
+        biases[idx]  = bias;
+        widths[idx]  = width;
+        offsets[idx] = offset;
+
+        if (weight != nullptr && width > 0) {
+            member_mask |= 1u << idx;
+        } else {
+            member_mask &= ~(1u << idx);
+        }
+    }
+
+    bool has_member(llm_proj_member member) const {
+        return (member_mask & (1u << static_cast<size_t>(member))) != 0;
+    }
+
+    bool can_use_fused() const {
+        return eligible && fused_weight != nullptr;
+    }
+};
+
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -257,6 +332,13 @@ struct llama_layer {
     struct ggml_tensor * wv_enc    = nullptr;
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
+
+    // attention bias
+    struct ggml_tensor * bq   = nullptr;
+    struct ggml_tensor * bk   = nullptr;
+    struct ggml_tensor * bv   = nullptr;
+    struct ggml_tensor * bo   = nullptr;
+    struct ggml_tensor * bqkv = nullptr;
 
     // relative position bias
     struct ggml_tensor * attn_rel_b       = nullptr;
@@ -487,6 +569,20 @@ struct llama_layer {
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
 
+    std::array<llm_proj_group, LLM_PROJ_SOURCE_COUNT> proj_groups = {{
+        llm_proj_group(LLM_PROJ_SOURCE_SELF_ATTN),
+        llm_proj_group(LLM_PROJ_SOURCE_CROSS_Q),
+        llm_proj_group(LLM_PROJ_SOURCE_CROSS_KV),
+    }};
+
+    llm_proj_group & proj_group(llm_proj_source source) {
+        return proj_groups.at(static_cast<size_t>(source));
+    }
+
+    const llm_proj_group & proj_group(llm_proj_source source) const {
+        return proj_groups.at(static_cast<size_t>(source));
+    }
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;
@@ -668,6 +764,8 @@ struct llama_model_base : public llama_model {
     void create_tensor_qkv(llama_layer & layer, int bid,
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);
+
+    void create_attn_proj_group(llama_layer & layer, int bid, bool enable_fusion);
 
     void load_stats  (llama_model_loader & ml) override;
     void load_hparams(llama_model_loader & ml) override;
