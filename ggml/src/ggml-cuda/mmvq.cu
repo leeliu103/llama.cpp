@@ -1027,8 +1027,8 @@ static int calc_q6_K_q8_1_x4_nwarps(
 }
 
 struct q6_k_q8_1_x4_rhs {
-    int   u[QR6_K];
-    float d8[QR6_K];
+    int2 u;
+    float2 d8;
 };
 
 static __device__ __forceinline__ q6_k_q8_1_x4_rhs load_q6_K_q8_1_x4_rhs(
@@ -1037,15 +1037,69 @@ static __device__ __forceinline__ q6_k_q8_1_x4_rhs load_q6_K_q8_1_x4_rhs(
     // multiples of 8, both loads stay within the same x4-packed block.
     const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
     const int block_offset = kby + bq8_offset;
-    const block_q8_1_x4 * by = yx4 + (block_offset >> 2);
+    const int block_outer = block_offset >> 2;
+    const block_q8_1_x4 * by = yx4 + block_outer;
     const int block_inner = block_offset & 3;
     const int qword_idx = iqs % QI8_1;
+    const int2* qs = (const int2*)by->qs;
 
     q6_k_q8_1_x4_rhs rhs;
-    rhs.u[0]  = by->qs[(block_inner + 0) * 8 + qword_idx];
-    rhs.u[1]  = by->qs[(block_inner + 2) * 8 + qword_idx];
-    rhs.d8[0] = __low2float(by->ds[block_inner + 0]);
-    rhs.d8[1] = __low2float(by->ds[block_inner + 2]);
+
+    // If iqs are in [0, 1, 2, ..., 31], then we want to read such pairs of q8_1_x4->qs:
+    // [(0, 16), (1, 17), (2, 18), ..., (15, 31)]
+    // To improve loading times, we read each consecutive 2 ints and permute data intrawarp then.
+    // Also we're loading d8 only for one lane for the same reasons, though it doesn't improve perf much.
+    // One could really improve loading times by reworking Q6_K x Q8_1 dot product.
+    // TODO derivate all numbers below from constexpr params
+    rhs.u = qs[block_inner * QI8_1 + qword_idx];
+    half2 d8_lows[2];
+    if (iqs % 8 == 0) {
+        d8_lows[0] = by->ds[block_inner + 0];
+        d8_lows[1] = by->ds[block_inner + 2];
+    }
+    int2 exchange;
+    int tmp;
+
+    tmp = __shfl_sync((int64_t)0xFFFFFFFFFFFFFFFF, rhs.u.x, (16 * block_outer + (iqs % 16) / 2) % 32, 32);
+    if (iqs % 2 == 0) {
+        exchange.x = tmp;
+    }
+    tmp = __shfl_sync((int64_t)0xFFFFFFFFFFFFFFFF, rhs.u.y, (16 * block_outer + (iqs % 16) / 2) % 32, 32);
+    if (iqs % 2 == 1) {
+        exchange.x = tmp;
+    }
+
+    tmp = __shfl_sync((int64_t)0xFFFFFFFFFFFFFFFF, rhs.u.x, (16 * block_outer + (iqs % 16) + 8 - ((iqs % 16) / 2)) % 32, 32);
+    if (iqs % 2 == 0) {
+        exchange.y = tmp;
+    }
+    tmp = __shfl_sync((int64_t)0xFFFFFFFFFFFFFFFF, rhs.u.y, (16 * block_outer + (iqs % 16) + 7 - ((iqs % 16) / 2)) % 32, 32);
+    if (iqs % 2 == 1) {
+        exchange.y = tmp;
+    }
+    rhs.u = exchange;
+
+    tmp = __shfl_sync((int64_t)0xFFFFFFFFFFFFFFFF, rhs.u.y, (16 * block_outer + (iqs % 16) + 7 - ((iqs % 16) / 2)) % 32, 32);
+    if (iqs % 2 == 1) {
+        exchange.y = tmp;
+    }
+
+    constexpr int group_size = 8;
+    constexpr int ngroups = 32 / group_size;
+    const int group_id = iqs / group_size;
+#pragma unroll
+    for (int i = 0; i < ngroups; ++i) {
+        half2 tmp2[2];
+        tmp2[0] = __shfl_sync((int64_t)0xFFFFFFFFFFFFFFFF, d8_lows[0], i * group_size, 32);
+        tmp2[1] = __shfl_sync((int64_t)0xFFFFFFFFFFFFFFFF, d8_lows[1], i * group_size, 32);
+        if (group_id == i) {
+            d8_lows[0] = tmp2[0];
+            d8_lows[1] = tmp2[1];
+        }
+    }
+    rhs.d8.x = __low2float(d8_lows[0]);
+    rhs.d8.y = __low2float(d8_lows[1]);
+
     return rhs;
 }
 
@@ -1057,8 +1111,10 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_x4_with_rhs(
 
     const int vl = get_int_b2(bq6_K->ql, iqs);
     const int vh = get_int_b2(bq6_K->qh, vh_idx) >> vh_shift;
+    const int q4_u[QR6_K] = {rhs.u.x, rhs.u.y};
+    const float q4_d8[QR6_K] = {rhs.d8.x, rhs.d8.y};
 
-    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, rhs.u, bq6_K->scales + scale_offset, bq6_K->d, rhs.d8);
+    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, q4_u, bq6_K->scales + scale_offset, bq6_K->d, q4_d8);
 }
 
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_x4(
