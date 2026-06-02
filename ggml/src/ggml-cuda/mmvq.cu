@@ -5,33 +5,60 @@
 
 #include <cstdint>
 
-typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
-
-static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
-        case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
-        case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
-        case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
-        case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
-        case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
-        case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
-        case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
-        case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
-        case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
-        case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
-        case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
-        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
-        case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
-        case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
-        case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
-        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
-        case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
-        case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
-        case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
-        case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
-        case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
-        default:                return nullptr;
+// Dispatch vecdot at compile time so the Q8 activation view type is visible to
+// the compiler. This replaces the old function pointer table, which could only
+// pass raw block_q8_1 pointers and could not specialize for x4 storage later.
+template <ggml_type type, class Q8View>
+static __device__ __forceinline__ float vec_dot_q_cuda(
+        const void * __restrict__ vbq, const Q8View & q8_1, const int & kbx, const int & iqs) {
+    if constexpr (type == GGML_TYPE_Q1_0) {
+        return vec_dot_q1_0_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q4_0) {
+        return vec_dot_q4_0_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q4_1) {
+        return vec_dot_q4_1_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q5_0) {
+        return vec_dot_q5_0_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q5_1) {
+        return vec_dot_q5_1_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q8_0) {
+        return vec_dot_q8_0_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_MXFP4) {
+        return vec_dot_mxfp4_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_NVFP4) {
+        return vec_dot_nvfp4_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q2_K) {
+        return vec_dot_q2_K_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q3_K) {
+        return vec_dot_q3_K_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q4_K) {
+        return vec_dot_q4_K_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q5_K) {
+        return vec_dot_q5_K_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q6_K) {
+        return vec_dot_q6_K_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
+        return vec_dot_iq2_xxs_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_IQ2_XS) {
+        return vec_dot_iq2_xs_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_IQ2_S) {
+        return vec_dot_iq2_s_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        return vec_dot_iq3_xxs_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_IQ1_S) {
+        return vec_dot_iq1_s_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_IQ1_M) {
+        return vec_dot_iq1_m_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_IQ4_NL) {
+        return vec_dot_iq4_nl_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+        return vec_dot_iq4_xs_q8_1(vbq, q8_1, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_IQ3_S) {
+        return vec_dot_iq3_s_q8_1(vbq, q8_1, kbx, iqs);
+    } else {
+        // Unreachable for MMVQ-supported types; keeps the template well-formed.
+        GGML_UNUSED_VARS(vbq, q8_1, kbx, iqs);
+        return 0.0f;
     }
 }
 
@@ -491,8 +518,6 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
-
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
@@ -563,7 +588,9 @@ static __global__ void mul_mat_vec_q(
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
-    const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    // Current behavior still uses standard Q8_1 activation storage. The view
+    // makes the vecdot code independent of that physical layout.
+    const q8_1_std_view y((const block_q8_1 *) vy, sample_y*stride_sample_y + channel_y*stride_channel_y);
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
@@ -574,14 +601,19 @@ static __global__ void mul_mat_vec_q(
 
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
+            // Select the logical Q8_1 block range for this destination column
+            // and k-block. Later x4 support only changes the view type here.
+            const q8_1_std_view y_k = y.offset(j*stride_col_y + kby);
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                // vec_dot_q_cuda sees only logical Q8_1 blocks via y_k.
+                tmp[j][i] += vec_dot_q_cuda<type>(
+                    vx, y_k, kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        // The gated branch uses the same Q8_1 activation view.
+                        tmp_gate[j][i] += vec_dot_q_cuda<type>(
+                            vgate, y_k, kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
             }
@@ -695,8 +727,6 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
-
     const uint32_t token_idx   = threadIdx.y;
     const int      row0        = c_rows_per_block*blockIdx.x;
     const int      blocks_per_row_x = ncols_x / qk;
@@ -711,7 +741,9 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
-    const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+    // MoE still reads standard Q8_1 storage in this commit; the view keeps this
+    // path aligned with the regular MMVQ vecdot abstraction.
+    const q8_1_std_view y((const block_q8_1 *) vy, channel_y*stride_channel_y + token_idx*stride_col_y);
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
 
     // partial sum for each thread
@@ -723,7 +755,8 @@ static __global__ void mul_mat_vec_q_moe(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            // kby is a logical Q8_1 block offset regardless of storage layout.
+            tmp[i] += vec_dot_q_cuda<type>(vx, y.offset(kby), kbx_offset + i*stride_row_x + kbx, kqs);
         }
     }
 
