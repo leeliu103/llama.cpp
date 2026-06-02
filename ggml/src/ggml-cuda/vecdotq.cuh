@@ -28,6 +28,78 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
+// Q8_1 activation views expose standard Q8_1 block indexing regardless of
+// the backing storage layout. q8_base and block_offset are both counted in
+// standard block_q8_1 units; only the x4 view translates them to grouped storage.
+struct q8_1_std_view {
+    const block_q8_1 * data; // Base pointer to standard Q8_1 activation blocks.
+    int q8_base;             // Logical base offset, counted in standard block_q8_1 units.
+
+    // Construct a view over standard Q8_1 storage with an optional logical block offset.
+    __device__ __forceinline__ q8_1_std_view(const block_q8_1 * data, const int q8_base = 0) :
+        data(data), q8_base(q8_base) { // Store the raw block pointer and logical base offset.
+    }
+
+    // Return the same storage view shifted by block_offset standard Q8_1 blocks.
+    __device__ __forceinline__ q8_1_std_view offset(const int block_offset) const {
+        return q8_1_std_view(data, q8_base + block_offset); // Keep data fixed and advance the logical base.
+    }
+
+    // Return the packed int32 Q8_1 data for a logical block offset.
+    __device__ __forceinline__ const int32_t * q8_ptr(const int block_offset = 0) const {
+        return (const int32_t *) data[q8_base + block_offset].qs; // Standard layout stores qs inside each block.
+    }
+
+    // Return one packed int32 word from a logical Q8_1 block.
+    __device__ __forceinline__ int32_t qs(const int block_offset, const int word_idx) const {
+        return q8_ptr(block_offset)[word_idx]; // word_idx selects one of QI8_1 packed int32 words.
+    }
+
+    // Return the half2 scale/sum pair for a logical Q8_1 block.
+    __device__ __forceinline__ half2 ds(const int block_offset = 0) const {
+        return data[q8_base + block_offset].ds; // Standard layout stores ds beside qs in the same block.
+    }
+};
+
+struct q8_1_x4_view {
+    static constexpr int blocks_per_layout = 4; // x4 storage groups four standard Q8_1 blocks.
+
+    const block_q8_1_layout<blocks_per_layout * QK8_1> * data; // Base pointer to grouped x4 Q8_1 blocks.
+    int q8_base;                                                // Logical base offset in standard block_q8_1 units.
+
+    // Construct a view over x4 grouped Q8_1 storage with an optional logical block offset.
+    __device__ __forceinline__ q8_1_x4_view(
+            const block_q8_1_layout<blocks_per_layout * QK8_1> * data, const int q8_base = 0) :
+        data(data), q8_base(q8_base) { // Store grouped storage pointer and logical standard-block offset.
+    }
+
+    // Return the same x4 storage view shifted by block_offset standard Q8_1 blocks.
+    __device__ __forceinline__ q8_1_x4_view offset(const int block_offset) const {
+        return q8_1_x4_view(data, q8_base + block_offset); // Keep grouped storage fixed and advance the base.
+    }
+
+    // Return the packed int32 Q8_1 data for a logical block offset.
+    __device__ __forceinline__ const int32_t * q8_ptr(const int block_offset = 0) const {
+        const int q8_block = q8_base + block_offset;      // Absolute logical Q8_1 block index.
+        const int layout   = q8_block / blocks_per_layout; // Grouped x4 block containing q8_block.
+        const int inner    = q8_block % blocks_per_layout; // Sub-block index inside the grouped x4 block.
+        return data[layout].qs + inner * QI8_1;            // Each sub-block owns QI8_1 packed int32 words.
+    }
+
+    // Return one packed int32 word from a logical Q8_1 block.
+    __device__ __forceinline__ int32_t qs(const int block_offset, const int word_idx) const {
+        return q8_ptr(block_offset)[word_idx]; // word_idx selects one packed int32 after x4 address translation.
+    }
+
+    // Return the half2 scale/sum pair for a logical Q8_1 block.
+    __device__ __forceinline__ half2 ds(const int block_offset = 0) const {
+        const int q8_block = q8_base + block_offset;      // Absolute logical Q8_1 block index.
+        const int layout   = q8_block / blocks_per_layout; // Grouped x4 block containing q8_block.
+        const int inner    = q8_block % blocks_per_layout; // Sub-block index that owns the requested ds value.
+        return data[layout].ds[inner];                     // x4 layout stores all four ds values before qs.
+    }
+};
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
