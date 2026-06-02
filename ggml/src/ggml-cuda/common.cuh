@@ -40,6 +40,24 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+// Layout wrapper for one or more consecutive Q8_1 activation blocks.
+// The scale/sum pairs are grouped first so x4 consumers can address ds[0..3]
+// independently while keeping the same total storage size as block_q8_1[4].
+template<int q8_1_layout_block_size>
+struct block_q8_1_layout {
+    static_assert(q8_1_layout_block_size % QK8_1 == 0, "q8_1 layout block size must contain whole q8_1 blocks");
+
+    static constexpr int q8_1_blocks = q8_1_layout_block_size / QK8_1;
+
+    // One scale/sum pair per standard Q8_1 sub-block.
+    half2   ds[q8_1_blocks];
+    // Quantized int8 values packed into 32-bit words for coalesced loads.
+    int32_t qs[q8_1_layout_block_size / sizeof(int32_t)];
+};
+
+static_assert(sizeof(block_q8_1_layout<QK8_1>) == sizeof(block_q8_1), "Unexpected block_q8_1 layout size");
+static_assert(sizeof(block_q8_1_layout<4 * QK8_1>) == 4 * sizeof(block_q8_1), "Unexpected q8_1 x4 layout size");
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
