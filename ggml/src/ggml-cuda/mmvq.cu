@@ -111,7 +111,7 @@ MMVQ_TRAITS_VDR(GGML_TYPE_IQ4_XS,  VDR_IQ4_XS_Q8_1_MMVQ);
         return mmvq_traits<type_>::supports_q8_1_x4
 
 // Host-side mirror of the compile-time trait for code that only has ggml_type.
-[[maybe_unused]] static bool mmvq_supports_q8_1_x4(const ggml_type type) {
+static bool mmvq_supports_q8_1_x4(const ggml_type type) {
     switch (type) {
         MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q1_0);
         MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q4_0);
@@ -1227,17 +1227,27 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
+    // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
+    const int64_t ncols_dst = ids ? ne2 : ne1;
+
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const bool use_q8_1_x4 = ncols_dst == 1 && mmvq_supports_q8_1_x4(src0->type);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        if (use_q8_1_x4) {
+            quantize_row_q8_1_layout_cuda<4 * QK8_1>(
+                src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        } else {
+            quantize_row_q8_1_cuda(
+                src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
-    const int64_t s11 = ne10_padded / QK8_1;
+    const int64_t s11 = use_q8_1_x4 ? ne10_padded / (4 * QK8_1) : ne10_padded / QK8_1;
     const int64_t s1  =  dst->nb[1] / ts_dst;
     const int64_t s02 = src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;
@@ -1247,8 +1257,6 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t s12 = ne11*s11;
     const int64_t s13 = ne12*s12;
 
-    // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
-    const int64_t ncols_dst          = ids ? ne2  : ne1;
     const int64_t nchannels_y        = ids ? ne11 : ne12;
     const int64_t nchannels_dst      = ids ? ne1  : ne2;
     const int64_t stride_col_dst     = ids ? s2   : s1;
@@ -1262,7 +1270,7 @@ void ggml_cuda_mul_mat_vec_q(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, false, stream);
+        ne03,              ne3,           s03, s13,              s3,               ids_stride, use_q8_1_x4, stream);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
