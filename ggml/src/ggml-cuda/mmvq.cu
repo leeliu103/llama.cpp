@@ -62,31 +62,49 @@ static __device__ __forceinline__ float vec_dot_q_cuda(
     }
 }
 
-static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
-        case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
-        case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
-        case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
-        case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
-        case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q5_K:    return VDR_Q5_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q6_K:    return VDR_Q6_K_Q8_1_MMVQ;
-        case GGML_TYPE_IQ2_XXS: return VDR_IQ2_XXS_Q8_1_MMVQ;
-        case GGML_TYPE_IQ2_XS:  return VDR_IQ2_XS_Q8_1_MMVQ;
-        case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
-        case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
-        case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
-        case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
-        case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
-        default:                return 1;
+template <ggml_type type>
+struct mmvq_traits {
+    static constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    static constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    static constexpr int vdr = 1;
+
+    // The x4 Q8_1 activation layout groups whole standard Q8_1 blocks.
+    static constexpr bool supports_q8_1_x4 = qk % QK8_1 == 0;
+};
+
+#define MMVQ_TRAITS_VDR(type_, vdr_)                                  \
+    template <>                                                        \
+    struct mmvq_traits<type_> {                                        \
+        static constexpr int qk  = ggml_cuda_type_traits<type_>::qk;   \
+        static constexpr int qi  = ggml_cuda_type_traits<type_>::qi;   \
+        static constexpr int vdr = vdr_;                               \
+        static constexpr bool supports_q8_1_x4 = qk % QK8_1 == 0;      \
     }
-}
+
+MMVQ_TRAITS_VDR(GGML_TYPE_Q1_0,    VDR_Q1_0_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_Q4_0,    VDR_Q4_0_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_Q4_1,    VDR_Q4_1_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_Q5_0,    VDR_Q5_0_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_Q5_1,    VDR_Q5_1_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_Q8_0,    VDR_Q8_0_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_MXFP4,   VDR_MXFP4_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_NVFP4,   VDR_NVFP4_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_Q2_K,    VDR_Q2_K_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_Q3_K,    VDR_Q3_K_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_Q4_K,    VDR_Q4_K_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_Q5_K,    VDR_Q5_K_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_Q6_K,    VDR_Q6_K_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_IQ1_S,   VDR_IQ1_S_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_IQ1_M,   VDR_IQ1_M_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_IQ2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_IQ2_XS,  VDR_IQ2_XS_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_IQ2_S,   VDR_IQ2_S_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_IQ3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_IQ3_S,   VDR_IQ3_S_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_IQ4_NL,  VDR_IQ4_NL_Q8_1_MMVQ);
+MMVQ_TRAITS_VDR(GGML_TYPE_IQ4_XS,  VDR_IQ4_XS_Q8_1_MMVQ);
+
+#undef MMVQ_TRAITS_VDR
 
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
@@ -510,9 +528,9 @@ static __global__ void mul_mat_vec_q(
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const uint32_t ids_stride) {
 
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int qk  = mmvq_traits<type>::qk;
+    constexpr int qi  = mmvq_traits<type>::qi;
+    constexpr int vdr = mmvq_traits<type>::vdr;
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
@@ -722,9 +740,9 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride) {
 
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int qk  = mmvq_traits<type>::qk;
+    constexpr int qi  = mmvq_traits<type>::qi;
+    constexpr int vdr = mmvq_traits<type>::vdr;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const uint32_t token_idx   = threadIdx.y;
@@ -864,9 +882,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const auto should_use_small_k = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
-        constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
-        constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
-        constexpr int vdr                   = get_vdr_mmvq(type);
+        constexpr int qk                    = mmvq_traits<type>::qk;
+        constexpr int qi                    = mmvq_traits<type>::qi;
+        constexpr int vdr                   = mmvq_traits<type>::vdr;
         const int     blocks_per_row_x      = ncols_x / qk;
         const int     blocks_per_iter_1warp = vdr * warp_size / qi;
         const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
