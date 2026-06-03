@@ -106,6 +106,42 @@ MMVQ_TRAITS_VDR(GGML_TYPE_IQ4_XS,  VDR_IQ4_XS_Q8_1_MMVQ);
 
 #undef MMVQ_TRAITS_VDR
 
+#define MMVQ_SUPPORTS_Q8_1_X4(type_)                      \
+    case type_:                                           \
+        return mmvq_traits<type_>::supports_q8_1_x4
+
+// Host-side mirror of the compile-time trait for code that only has ggml_type.
+[[maybe_unused]] static bool mmvq_supports_q8_1_x4(const ggml_type type) {
+    switch (type) {
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q1_0);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q4_0);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q4_1);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q5_0);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q5_1);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q8_0);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_MXFP4);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_NVFP4);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q2_K);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q3_K);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q4_K);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q5_K);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_Q6_K);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_IQ1_S);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_IQ1_M);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_IQ2_XXS);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_IQ2_XS);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_IQ2_S);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_IQ3_XXS);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_IQ3_S);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_IQ4_NL);
+        MMVQ_SUPPORTS_Q8_1_X4(GGML_TYPE_IQ4_XS);
+        default:
+            return false;
+    }
+}
+
+#undef MMVQ_SUPPORTS_Q8_1_X4
+
 template <bool use_q8_1_x4>
 struct mmvq_q8_1_view_type {
     using type = q8_1_std_view;
