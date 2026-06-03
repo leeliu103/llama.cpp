@@ -106,6 +106,37 @@ MMVQ_TRAITS_VDR(GGML_TYPE_IQ4_XS,  VDR_IQ4_XS_Q8_1_MMVQ);
 
 #undef MMVQ_TRAITS_VDR
 
+template <ggml_type type>
+struct mmvq_x4_policy {
+    static constexpr int native_lanes_per_block = mmvq_traits<type>::qi / mmvq_traits<type>::vdr;
+    static constexpr int lanes_per_block        = native_lanes_per_block < q8_1_x4_view::blocks_per_layout ?
+        native_lanes_per_block : q8_1_x4_view::blocks_per_layout;
+    static constexpr int native_lanes_per_x4_lane = native_lanes_per_block / lanes_per_block;
+    static constexpr int nwarps = 1;
+    static constexpr int rows_per_cuda_block = 1;
+
+    static_assert(native_lanes_per_block % lanes_per_block == 0,
+            "MMVQ x4 lane grouping requires evenly split native vecdot lanes");
+};
+
+template <ggml_type type, bool use_q8_1_x4, class Q8View>
+static __device__ __forceinline__ float vec_dot_q_mmvq(
+        const void * __restrict__ vbq, const Q8View & q8_1, const int & kbx, const int & lane) {
+    if constexpr (use_q8_1_x4) {
+        float sum = 0.0f;
+
+#pragma unroll
+        for (int i = 0; i < mmvq_x4_policy<type>::native_lanes_per_x4_lane; ++i) {
+            const int native_lane = lane * mmvq_x4_policy<type>::native_lanes_per_x4_lane + i;
+            sum += vec_dot_q_cuda<type>(vbq, q8_1, kbx, mmvq_traits<type>::vdr * native_lane);
+        }
+
+        return sum;
+    } else {
+        return vec_dot_q_cuda<type>(vbq, q8_1, kbx, mmvq_traits<type>::vdr * lane);
+    }
+}
+
 #define MMVQ_SUPPORTS_Q8_1_X4(type_)                      \
     case type_:                                           \
         return mmvq_traits<type_>::supports_q8_1_x4
@@ -577,6 +608,29 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+template <ggml_type type, bool use_q8_1_x4>
+static constexpr __host__ __device__ int calc_mmvq_kernel_nwarps(const int ncols_dst, const mmvq_parameter_table_id table_id) {
+    if constexpr (use_q8_1_x4) {
+        return mmvq_x4_policy<type>::nwarps;
+    } else {
+        return calc_nwarps(type, ncols_dst, table_id);
+    }
+}
+
+template <ggml_type type, bool use_q8_1_x4>
+static constexpr __host__ __device__ int calc_mmvq_kernel_rows_per_block(
+        const int ncols_dst, const mmvq_parameter_table_id table_id, const bool small_k, const int nwarps) {
+    if constexpr (use_q8_1_x4) {
+        GGML_UNUSED(ncols_dst);
+        GGML_UNUSED(table_id);
+        GGML_UNUSED(small_k);
+        GGML_UNUSED(nwarps);
+        return mmvq_x4_policy<type>::rows_per_cuda_block;
+    } else {
+        return calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    }
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool use_q8_1_x4 = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -593,14 +647,15 @@ static __global__ void mul_mat_vec_q(
     static_assert(!use_q8_1_x4 || mmvq_traits<type>::supports_q8_1_x4,
             "MMVQ x4 Q8_1 activation layout requires whole Q8_1 blocks");
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int nwarps = calc_mmvq_kernel_nwarps<type, use_q8_1_x4>(ncols_dst, table_id);
+    constexpr int rows_per_cuda_block = calc_mmvq_kernel_rows_per_block<type, use_q8_1_x4>(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int lanes_per_block = use_q8_1_x4 ? mmvq_x4_policy<type>::lanes_per_block : mmvq_traits<type>::qi / mmvq_traits<type>::vdr;
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
-    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+    constexpr int blocks_per_iter = nwarps*warp_size / lanes_per_block;
 
     const uint32_t channel_dst = blockIdx.y;
 
@@ -675,11 +730,10 @@ static __global__ void mul_mat_vec_q(
     const auto y = make_mmvq_q8_1_view<use_q8_1_x4>(vy, q8_1_base);
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = tid / lanes_per_block; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
-        // x block quant index when casting the quants to int
-        const int kqs = vdr * (tid % (qi/vdr));
+        const int lane = tid % lanes_per_block;
 
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
@@ -688,14 +742,14 @@ static __global__ void mul_mat_vec_q(
             const auto y_k = y.offset(j*q8_1_stride_col_y + kby);
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                // vec_dot_q_cuda sees only logical Q8_1 blocks via y_k.
-                tmp[j][i] += vec_dot_q_cuda<type>(
-                    vx, y_k, kbx_offset + i*stride_row_x + kbx, kqs);
+                // x4 mode groups several native vecdot chunks behind each lane.
+                tmp[j][i] += vec_dot_q_mmvq<type, use_q8_1_x4>(
+                    vx, y_k, kbx_offset + i*stride_row_x + kbx, lane);
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         // The gated branch uses the same Q8_1 activation view.
-                        tmp_gate[j][i] += vec_dot_q_cuda<type>(
-                            vgate, y_k, kbx_offset + i*stride_row_x + kbx, kqs);
+                        tmp_gate[j][i] += vec_dot_q_mmvq<type, use_q8_1_x4>(
+                            vgate, y_k, kbx_offset + i*stride_row_x + kbx, lane);
                     }
                 }
             }
@@ -854,12 +908,12 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
-template<ggml_type type>
+template<ggml_type type, bool use_q8_1_x4 = false>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int nwarps = calc_mmvq_kernel_nwarps<type, use_q8_1_x4>(ncols_dst, table_id);
+    const int rpb = calc_mmvq_kernel_rows_per_block<type, use_q8_1_x4>(ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1002,10 +1056,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 1: {
             constexpr int c_ncols_dst = 1;
 
-            bool use_small_k = should_use_small_k(c_ncols_dst);
+            bool use_small_k = !use_q8_1_x4 && should_use_small_k(c_ncols_dst);
 
             if (use_small_k) {
-                std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+                std::pair<dim3, dim3> dims = calc_launch_params<type, use_q8_1_x4>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                         nsamples_dst, warp_size, table_id, true);
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true, use_q8_1_x4>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1013,7 +1067,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                     stream);
             } else {
-                std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+                std::pair<dim3, dim3> dims = calc_launch_params<type, use_q8_1_x4>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                         nsamples_dst, warp_size, table_id);
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, use_q8_1_x4>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1024,7 +1078,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 2: {
             constexpr int c_ncols_dst = 2;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+            std::pair<dim3, dim3> dims = calc_launch_params<type, use_q8_1_x4>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, use_q8_1_x4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
@@ -1032,7 +1086,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 3: {
             constexpr int c_ncols_dst = 3;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+            std::pair<dim3, dim3> dims = calc_launch_params<type, use_q8_1_x4>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, use_q8_1_x4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
@@ -1040,7 +1094,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 4: {
             constexpr int c_ncols_dst = 4;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+            std::pair<dim3, dim3> dims = calc_launch_params<type, use_q8_1_x4>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, use_q8_1_x4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
@@ -1048,7 +1102,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 5: {
             constexpr int c_ncols_dst = 5;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+            std::pair<dim3, dim3> dims = calc_launch_params<type, use_q8_1_x4>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, use_q8_1_x4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
@@ -1056,7 +1110,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 6: {
             constexpr int c_ncols_dst = 6;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+            std::pair<dim3, dim3> dims = calc_launch_params<type, use_q8_1_x4>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, use_q8_1_x4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
@@ -1064,7 +1118,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 7: {
             constexpr int c_ncols_dst = 7;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+            std::pair<dim3, dim3> dims = calc_launch_params<type, use_q8_1_x4>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, use_q8_1_x4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
@@ -1072,7 +1126,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 8: {
             constexpr int c_ncols_dst = 8;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+            std::pair<dim3, dim3> dims = calc_launch_params<type, use_q8_1_x4>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, use_q8_1_x4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
