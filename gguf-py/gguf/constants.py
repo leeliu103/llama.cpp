@@ -4519,6 +4519,7 @@ class VisionProjectorType:
     GEMMA4UV = "gemma4uv" # "unified" variant
     GEMMA4UA = "gemma4ua" # "unified" variant
     PHI4 = "phi4"
+    PHI4MM = "phi4mm"
     IDEFICS3 = "idefics3"
     PIXTRAL = "pixtral"
     LLAMA4 = "llama4"

@@ -209,6 +209,215 @@ class Phi3MiniModel(TextModel):
         yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_SHORT), torch.tensor(short_factors, dtype=torch.float32))
 
 
+@ModelBase.register("Phi4MMForCausalLM")
+class Phi4MMTextModel(Phi3MiniModel):
+    model_arch = gguf.MODEL_ARCH.PHI3
+
+    def __init__(self, *args, **kwargs):
+        self._vision_lora_scale: float | None = None
+        super().__init__(*args, **kwargs)
+
+    def set_vocab(self):
+        self._set_vocab_gpt2()
+
+    def get_vision_lora_scale(self) -> float:
+        if self._vision_lora_scale is not None:
+            return self._vision_lora_scale
+
+        vision_lora = self.hparams.get("vision_lora") or {}
+        lora_alpha = vision_lora.get("lora_alpha")
+        rank = vision_lora.get("r")
+        if lora_alpha is None or rank is None:
+            logger.warning("Phi4MM vision LoRA config is missing lora_alpha/r; falling back to scale 2.0")
+            self._vision_lora_scale = 2.0
+        else:
+            self._vision_lora_scale = float(lora_alpha) / float(rank)
+
+        logger.info(f"Phi4MM vision LoRA merge scale = {self._vision_lora_scale}")
+        return self._vision_lora_scale
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, _ = item
+
+        if name.startswith("model.embed_tokens_extend."):
+            return None
+
+        if ".lora_A.speech." in name or ".lora_B.speech." in name:
+            return None
+
+        if ".lora_A.vision." in name or ".lora_B.vision." in name:
+            return ModelBase.filter_tensors(item)
+
+        return super().filter_tensors(item)
+
+    def merge_vision_lora(self, base: Tensor, name: str) -> Tensor:
+        prefix = name.removesuffix(".base_layer.weight")
+        lora_a_name = f"{prefix}.lora_A.vision.weight"
+        lora_b_name = f"{prefix}.lora_B.vision.weight"
+
+        if lora_a_name not in self.model_tensors or lora_b_name not in self.model_tensors:
+            raise KeyError(f"Missing Phi4MM vision LoRA tensors for {name!r}")
+
+        lora_a = self.model_tensors[lora_a_name]().float()
+        lora_b = self.model_tensors[lora_b_name]().float()
+
+        if lora_a.ndim != 2 or lora_b.ndim != 2 or base.ndim != 2:
+            raise ValueError(f"Unexpected Phi4MM LoRA tensor rank for {name!r}")
+        if lora_b.shape[1] != lora_a.shape[0] or lora_b.shape[0] != base.shape[0] or lora_a.shape[1] != base.shape[1]:
+            raise ValueError(
+                f"Phi4MM LoRA shape mismatch for {name!r}: "
+                f"base={tuple(base.shape)}, A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}"
+            )
+
+        return base.float() + self.get_vision_lora_scale() * (lora_b @ lora_a)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith(".base_layer.weight"):
+            merged_name = name.removesuffix(".base_layer.weight") + ".weight"
+            data_torch = self.merge_vision_lora(data_torch, name)
+            yield from super().modify_tensors(data_torch, merged_name, bid)
+            return
+
+        if ".lora_A." in name or ".lora_B." in name:
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Phi4MMForCausalLM")
+class Phi4MMVisionMmprojModel(MmprojModel):
+    _IMAGE_PREFIX = "model.embed_tokens_extend.image_embed."
+    _IMG_PROCESSOR_PREFIX = _IMAGE_PREFIX + "img_processor."
+    _IMG_PROJECTION_PREFIX = _IMAGE_PREFIX + "img_projection."
+    _LOCAL_IMG_PROCESSOR_PREFIX = "model.vision_model."
+    _LOCAL_IMG_PROJECTION_PREFIX = "phi4mm.img_projection."
+    _LOCAL_GLB_GN = "phi4mm.glb_GN"
+    _LOCAL_SUB_GN = "phi4mm.sub_GN"
+
+    _IMAGE_SIZE = 448
+    _PATCH_SIZE = 14
+    _HIDDEN_SIZE = 1152
+    _INTERMEDIATE_SIZE = 4304
+    _HEAD_COUNT = 16
+    _LAYER_NORM_EPS = 1e-6
+    _EXPORT_LAYERS = 26
+    _DYNAMIC_HD = 36
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.hparams_vision is not None
+
+        self.dynamic_hd = int(self.preprocessor_config.get("dynamic_hd", self._DYNAMIC_HD))
+        if self.dynamic_hd != self._DYNAMIC_HD:
+            raise ValueError(f"Phi4MM mmproj converter expects dynamic_hd={self._DYNAMIC_HD}, got {self.dynamic_hd}")
+
+        self.preprocessor_config.setdefault("image_mean", [0.5, 0.5, 0.5])
+        self.preprocessor_config.setdefault("image_std", [0.5, 0.5, 0.5])
+
+        self.block_count = self._EXPORT_LAYERS
+        self.tensor_map = gguf.get_tensor_name_map(gguf.MODEL_ARCH.MMPROJ, self.block_count)
+
+    def get_vision_config(self):
+        vision_config = super().get_vision_config()
+        if vision_config is not None:
+            return vision_config
+
+        image_config = self.global_config.get("embd_layer", {}).get("image_embd_layer", {})
+        expected_image_config = {
+            "crop_size": self._IMAGE_SIZE,
+            "image_token_compression_cls": "avg_pool_2d",
+            "projection_cls": "mlp",
+            "use_hd_transform": True,
+            "with_learnable_separator": True,
+            "hd_transform_order": "sub_glb",
+        }
+        for key, expected in expected_image_config.items():
+            value = image_config.get(key)
+            if value is not None and value != expected:
+                raise ValueError(f"Phi4MM mmproj converter expects image_embd_layer.{key}={expected!r}, got {value!r}")
+
+        return {
+            "architectures": ["Phi4MMVisionMmprojModel"],
+            "image_size": self._IMAGE_SIZE,
+            "patch_size": self._PATCH_SIZE,
+            "hidden_size": self._HIDDEN_SIZE,
+            "intermediate_size": self._INTERMEDIATE_SIZE,
+            "num_attention_heads": self._HEAD_COUNT,
+            "num_hidden_layers": self._EXPORT_LAYERS,
+            "layer_norm_eps": self._LAYER_NORM_EPS,
+        }
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        assert self.hparams_vision is not None
+
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.PHI4MM)
+        self.gguf_writer.add_vision_use_gelu(True)
+        self.gguf_writer.add_vision_attention_layernorm_eps(self._LAYER_NORM_EPS)
+        self.gguf_writer.add_vision_preproc_max_tiles(self.dynamic_hd)
+
+    @classmethod
+    def _is_dropped_img_processor_tensor(cls, local_name: str) -> bool:
+        if local_name.startswith(("post_layernorm.", "head.")):
+            return True
+
+        layer_prefix = "encoder.layers."
+        if not local_name.startswith(layer_prefix):
+            return False
+
+        rest = local_name[len(layer_prefix):]
+        layer_idx, has_sep, _ = rest.partition(".")
+        return has_sep and layer_idx.isdecimal() and int(layer_idx) >= cls._EXPORT_LAYERS
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+
+        if name.startswith(cls._IMG_PROCESSOR_PREFIX):
+            local_name = name.removeprefix(cls._IMG_PROCESSOR_PREFIX)
+            if cls._is_dropped_img_processor_tensor(local_name):
+                return None
+            return super().filter_tensors((cls._LOCAL_IMG_PROCESSOR_PREFIX + local_name, gen))
+
+        if name.startswith(cls._IMG_PROJECTION_PREFIX):
+            local_name = name.removeprefix(cls._IMG_PROJECTION_PREFIX)
+            layer_idx, has_sep, _ = local_name.partition(".")
+            if not has_sep or layer_idx not in {"0", "2"}:
+                return None
+            return super().filter_tensors((cls._LOCAL_IMG_PROJECTION_PREFIX + local_name, gen))
+
+        if name == cls._IMAGE_PREFIX + "glb_GN":
+            return super().filter_tensors((cls._LOCAL_GLB_GN, gen))
+
+        if name == cls._IMAGE_PREFIX + "sub_GN":
+            return super().filter_tensors((cls._LOCAL_SUB_GN, gen))
+
+        return None
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith(self._LOCAL_IMG_PROCESSOR_PREFIX):
+            yield from super().modify_tensors(data_torch, name, bid)
+            return
+
+        if name.startswith(self._LOCAL_IMG_PROJECTION_PREFIX):
+            local_name = name.removeprefix(self._LOCAL_IMG_PROJECTION_PREFIX)
+            layer_idx = int(local_name.split(".", maxsplit=1)[0])
+            suffix = ".bias" if local_name.endswith(".bias") else ".weight"
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.V_MMPROJ, layer_idx, suffix=suffix), data_torch)
+            return
+
+        if name == self._LOCAL_GLB_GN:
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.V_ENC_EMBD_VSEP, suffix=""), data_torch)
+            return
+
+        if name == self._LOCAL_SUB_GN:
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.V_ENC_EMBD_IMGNL, suffix=""), data_torch)
+            return
+
+        return
+
+
 @ModelBase.register("Phi4ForCausalLMV")
 class Phi4VisionMmprojModel(MmprojModel):
     def __init__(self, *args, **kwargs):
