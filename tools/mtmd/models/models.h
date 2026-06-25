@@ -12,6 +12,15 @@ struct clip_graph_siglip : clip_graph {
     ggml_cgraph * build() override;
 };
 
+struct clip_graph_phi4mm : clip_graph {
+    clip_graph_phi4mm(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+    ggml_tensor * pool_crop(ggml_tensor * hidden_states, int crop_idx);
+    ggml_tensor * build_global_sequence(ggml_tensor * global_pooled);
+    ggml_tensor * build_sub_sequence(const std::vector<ggml_tensor *> & pooled_crops);
+    ggml_tensor * build_projector(ggml_tensor * image_tokens);
+};
+
 struct clip_graph_gemma4v : clip_graph {
     clip_graph_gemma4v(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;

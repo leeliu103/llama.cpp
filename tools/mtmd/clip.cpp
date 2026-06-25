@@ -18,6 +18,7 @@
 #include <fstream>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <vector>
 #include <cinttypes>
@@ -27,6 +28,55 @@
 #include <float.h>
 
 struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
+
+static std::string clip_debug_join_path(const std::string & dir, const char * name) {
+    if (dir.empty() || dir.back() == '/' || dir.back() == '\\') {
+        return dir + name;
+    }
+    return dir + "/" + name;
+}
+
+static bool clip_debug_dump_phi4mm_hidden_states(ggml_tensor * hidden_states, const char * dump_dir_cstr) {
+    if (!dump_dir_cstr || dump_dir_cstr[0] == '\0') {
+        return false;
+    }
+    if (hidden_states->type != GGML_TYPE_F32) {
+        LOG_ERR("%s: Phi-4-MM hidden-state dump expects F32 output, got %s\n",
+                __func__, ggml_type_name(hidden_states->type));
+        return false;
+    }
+
+    const std::string dump_dir(dump_dir_cstr);
+    const std::string data_path = clip_debug_join_path(dump_dir, "hidden_states_minus2.f32");
+    std::vector<float> data(ggml_nelements(hidden_states));
+    ggml_backend_tensor_get(hidden_states, data.data(), 0, ggml_nbytes(hidden_states));
+
+    std::ofstream out(data_path, std::ios::binary);
+    if (!out) {
+        LOG_ERR("%s: failed to open %s for writing\n", __func__, data_path.c_str());
+        return false;
+    }
+    out.write(reinterpret_cast<const char *>(data.data()), data.size() * sizeof(float));
+    if (!out) {
+        LOG_ERR("%s: failed to write %s\n", __func__, data_path.c_str());
+        return false;
+    }
+
+    const std::string manifest_path = clip_debug_join_path(dump_dir, "hidden_states_minus2.json");
+    std::ofstream manifest(manifest_path);
+    if (!manifest) {
+        LOG_ERR("%s: failed to open %s for writing\n", __func__, manifest_path.c_str());
+        return false;
+    }
+    manifest
+        << "{\n"
+        << "  \"hidden_states_minus2\": {\"file\": \"hidden_states_minus2.f32\", \"dtype\": \"float32\", \"shape\": ["
+        << hidden_states->ne[2] << ", " << hidden_states->ne[1] << ", " << hidden_states->ne[0] << "]}\n"
+        << "}\n";
+
+    LOG_INF("%s: dumped Phi-4-MM hidden_states[-2] to %s\n", __func__, dump_dir.c_str());
+    return true;
+}
 
 //#define CLIP_DEBUG_FUNCTIONS
 
@@ -711,10 +761,16 @@ ggml_tensor * clip_graph::build_attn(
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         // F32 may not needed for vision encoders?
         // ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        if (proj_type == PROJECTOR_TYPE_PHI4MM) {
+            cb(kq, "attn_scores_raw", il);
+        }
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, 0.0f);
         if (sinks != nullptr) {
             ggml_soft_max_add_sinks(kq, sinks);
+        }
+        if (proj_type == PROJECTOR_TYPE_PHI4MM) {
+            cb(kq, "attn_probs", il);
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
@@ -876,6 +932,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
         case PROJECTOR_TYPE_PHI4:
             {
                 builder = std::make_unique<clip_graph_siglip>(ctx, img);
+            } break;
+        case PROJECTOR_TYPE_PHI4MM:
+            {
+                builder = std::make_unique<clip_graph_phi4mm>(ctx, img);
             } break;
         case PROJECTOR_TYPE_GEMMA3NV:
             {
@@ -1355,6 +1415,27 @@ struct clip_model_loader {
                         get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
                         get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
                         hparams.set_warmup_n_tokens(16*16);
+                    } break;
+                case PROJECTOR_TYPE_PHI4MM:
+                    {
+                        hparams.n_merge = 1;
+                        hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
+                        hparams.image_resize_pad = PAD_NONE;
+                        hparams.image_pad_color = {255, 255, 255};
+                        hparams.preproc_min_tiles = 1;
+                        hparams.preproc_max_tiles = 36;
+                        get_u32(KEY_PREPROC_MAX_TILES, hparams.preproc_max_tiles, false);
+                        if (hparams.image_size != 448 || hparams.patch_size != 14) {
+                            throw std::runtime_error(string_format(
+                                "%s: Phi-4-MM expects image_size=448 and patch_size=14, got image_size=%d patch_size=%d\n",
+                                __func__, hparams.image_size, hparams.patch_size));
+                        }
+                        if (hparams.preproc_max_tiles != 36) {
+                            throw std::runtime_error(string_format(
+                                "%s: Phi-4-MM expects preproc_max_tiles=36, got %d\n",
+                                __func__, hparams.preproc_max_tiles));
+                        }
+                        hparams.set_warmup_n_tokens(32*32);
                     } break;
                 case PROJECTOR_TYPE_PIXTRAL:
                     {
@@ -2495,6 +2576,15 @@ struct clip_model_loader {
                     model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
                 } break;
+            case PROJECTOR_TYPE_PHI4MM:
+                {
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                    model.image_newline = get_tensor(TN_IMAGE_NEWLINE);
+                    model.view_seperator = get_tensor(TN_IMAGE_SEPERATOR);
+                } break;
             case PROJECTOR_TYPE_DEEPSEEKOCR:
             case PROJECTOR_TYPE_DEEPSEEKOCR2:
                 {
@@ -3147,8 +3237,10 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
-            if (ctx_params.warmup) {
+            if (ctx_params.warmup && ctx_vision->model.proj_type != PROJECTOR_TYPE_PHI4MM) {
                 loader.warmup(*ctx_vision);
+            } else if (ctx_params.warmup) {
+                LOG_WRN("%s: skipping Phi-4-MM warmup because dummy inputs do not carry Dynamic-HD metadata yet\n", __func__);
             }
 
             // TODO: we don't support audio for Gemma 3N, but GGUF contains audio tensors
@@ -3258,6 +3350,13 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_PHI4:
             {
                 // do nothing
+            } break;
+        case PROJECTOR_TYPE_PHI4MM:
+            {
+                if (img->phi4mm_num_img_tokens <= 0) {
+                    throw std::runtime_error(string_format("%s: Phi-4-MM output token count requires Dynamic-HD metadata\n", __func__));
+                }
+                n_patches = img->phi4mm_num_img_tokens;
             } break;
         case PROJECTOR_TYPE_YASA2:
             {
@@ -3505,7 +3604,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     int n_batch_cur = imgs.entries.size();
 
     // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames
-    if (!ctx->support_batch && n_batch_cur > clip_model_n_temporal_merge(ctx)) {
+    if (!ctx->support_batch && ctx->proj_type() != PROJECTOR_TYPE_PHI4MM && n_batch_cur > clip_model_n_temporal_merge(ctx)) {
         LOG_ERR("%s: batch size %d exceeds maximum supported batch/temporal-merge size %d\n", __func__, n_batch_cur, clip_model_n_temporal_merge(ctx));
         return false;
     }
@@ -4063,6 +4162,95 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
                 set_input_i32("pos_x", pos_x);
                 set_input_i32("pos_y", pos_y);
             } break;
+        case PROJECTOR_TYPE_PHI4MM:
+            {
+                GGML_ASSERT(model.position_embeddings != nullptr);
+                GGML_ASSERT(num_patches == 32 * 32);
+
+                const auto & img0 = imgs.entries[0];
+                const int mask_w = img0.phi4mm_mask_width;
+                const int mask_h = img0.phi4mm_mask_height;
+                const auto & image_attention_mask = img0.phi4mm_image_attention_mask;
+                if (mask_w != pos_w || mask_h != pos_h) {
+                    throw std::runtime_error(string_format(
+                        "%s: Phi-4-MM attention mask shape %dx%d does not match patch grid %dx%d\n",
+                        __func__, mask_w, mask_h, pos_w, pos_h));
+                }
+                if (image_attention_mask.size() != (size_t)n_batch_cur * mask_w * mask_h) {
+                    throw std::runtime_error(string_format(
+                        "%s: Phi-4-MM attention mask has %zu values, expected %d\n",
+                        __func__, image_attention_mask.size(), n_batch_cur * mask_w * mask_h));
+                }
+
+                std::vector<int32_t> positions(n_batch_cur * num_patches, 0);
+                std::vector<float> attn_mask((size_t)n_batch_cur * num_patches * num_patches, 0.0f);
+
+                for (int b = 0; b < n_batch_cur; ++b) {
+                    const uint8_t * patch_mask = image_attention_mask.data() + (size_t)b * num_patches;
+
+                    int valid_h = 0;
+                    for (int y = 0; y < mask_h; ++y) {
+                        valid_h += patch_mask[y * mask_w] ? 1 : 0;
+                    }
+                    int valid_w = 0;
+                    for (int x = 0; x < mask_w; ++x) {
+                        valid_w += patch_mask[x] ? 1 : 0;
+                    }
+                    if (valid_h <= 0 || valid_w <= 0) {
+                        throw std::runtime_error(string_format(
+                            "%s: Phi-4-MM attention mask %d is empty\n", __func__, b));
+                    }
+
+                    std::vector<int32_t> bucket_h(valid_h);
+                    std::vector<int32_t> bucket_w(valid_w);
+                    for (int i = 0; i < valid_h; ++i) {
+                        bucket_h[i] = (int32_t)((int64_t)i * mask_h / valid_h);
+                    }
+                    for (int i = 0; i < valid_w; ++i) {
+                        bucket_w[i] = (int32_t)((int64_t)i * mask_w / valid_w);
+                    }
+
+                    std::vector<int> row_rank(mask_h, -1);
+                    std::vector<int> col_rank(mask_w, -1);
+                    for (int y = 0, r = 0; y < mask_h; ++y) {
+                        if (patch_mask[y * mask_w]) {
+                            row_rank[y] = r++;
+                        }
+                    }
+                    for (int x = 0, r = 0; x < mask_w; ++x) {
+                        if (patch_mask[x]) {
+                            col_rank[x] = r++;
+                        }
+                    }
+
+                    for (int y = 0; y < mask_h; ++y) {
+                        for (int x = 0; x < mask_w; ++x) {
+                            const int patch_idx = y * mask_w + x;
+                            if (!patch_mask[patch_idx]) {
+                                continue;
+                            }
+                            if (row_rank[y] < 0 || col_rank[x] < 0) {
+                                throw std::runtime_error(string_format(
+                                    "%s: Phi-4-MM attention mask %d is not a top-left rectangle\n", __func__, b));
+                            }
+                            positions[b * num_patches + patch_idx] = bucket_h[row_rank[y]] * mask_w + bucket_w[col_rank[x]];
+                        }
+                    }
+
+                    const size_t mask_offset = (size_t)b * num_patches * num_patches;
+                    for (int k = 0; k < num_patches; ++k) {
+                        if (patch_mask[k]) {
+                            continue;
+                        }
+                        for (int q = 0; q < num_patches; ++q) {
+                            attn_mask[mask_offset + (size_t)q * num_patches + k] = std::numeric_limits<float>::lowest();
+                        }
+                    }
+                }
+
+                set_input_i32("phi4mm_positions", positions);
+                set_input_f32("phi4mm_attn_mask", attn_mask);
+            } break;
         case PROJECTOR_TYPE_DEEPSEEKOCR:
         case PROJECTOR_TYPE_DEEPSEEKOCR2:
             {
@@ -4421,6 +4609,19 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
 
+    if (ctx->model.proj_type == PROJECTOR_TYPE_PHI4MM) {
+        const char * dump_dir = std::getenv("MTMD_DEBUG_PHI4MM_HIDDEN_STATES_DUMP");
+        if (dump_dir && dump_dir[0] != '\0') {
+            ggml_tensor * hidden_states = ggml_graph_get_tensor(gf, "phi4mm_hidden_states_minus2");
+            if (hidden_states == nullptr || !clip_debug_dump_phi4mm_hidden_states(hidden_states, dump_dir)) {
+                return false;
+            }
+            if (out_batch_embd.empty()) {
+                return true;
+            }
+        }
+    }
+
     // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)
     const int n_tokens_out = embeddings->ne[1];
     const int expected_n_tokens_out = clip_n_output_tokens(ctx, &imgs.entries[0]);
@@ -4496,6 +4697,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_model_peg_0_b->ne[0];
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_PHI4:
+        case PROJECTOR_TYPE_PHI4MM:
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_LIGHTONOCR:
         case PROJECTOR_TYPE_DOTS_OCR:

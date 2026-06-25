@@ -14,6 +14,10 @@
 #include <limits.h>
 #include <cinttypes>
 #include <clocale>
+#include <cstdlib>
+#include <fstream>
+#include <filesystem>
+#include <sstream>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -242,6 +246,146 @@ static std::string chat_add_and_format(mtmd_cli_context & ctx, common_chat_msg &
     return formatted;
 }
 
+struct phi4mm_debug_logits_file {
+    int step;
+    llama_token token;
+    std::string label;
+    std::string file;
+};
+
+static bool phi4mm_debug_parse_forced_tokens(const char * env, std::vector<llama_token> & tokens) {
+    tokens.clear();
+    if (env == nullptr || env[0] == '\0') {
+        return true;
+    }
+
+    std::stringstream ss(env);
+    std::string part;
+    while (std::getline(ss, part, ',')) {
+        const char * begin = part.c_str();
+        char * end = nullptr;
+        long value = std::strtol(begin, &end, 10);
+        if (begin == end || *end != '\0') {
+            LOG_ERR("MTMD_DEBUG_PHI4MM_FORCE_TOKENS contains a non-integer entry: %s\n", part.c_str());
+            return false;
+        }
+        tokens.push_back((llama_token) value);
+    }
+    return true;
+}
+
+static bool phi4mm_debug_write_logits(
+        mtmd_cli_context & ctx,
+        const std::filesystem::path & dir,
+        const std::string & file_name) {
+    const float * logits = llama_get_logits_ith(ctx.lctx, -1);
+    if (logits == nullptr) {
+        LOG_ERR("failed to get logits for Phi-4-MM debug dump\n");
+        return false;
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(ctx.vocab);
+    const auto path = dir / file_name;
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        LOG_ERR("failed to open Phi-4-MM logits dump: %s\n", path.string().c_str());
+        return false;
+    }
+    out.write(reinterpret_cast<const char *>(logits), sizeof(float) * n_vocab);
+    return (bool) out;
+}
+
+static bool phi4mm_debug_write_logits_manifest(
+        mtmd_cli_context & ctx,
+        const std::filesystem::path & dir,
+        const std::vector<llama_token> & forced_tokens,
+        const std::vector<phi4mm_debug_logits_file> & files) {
+    const auto path = dir / "logits_manifest.json";
+    std::ofstream out(path);
+    if (!out) {
+        LOG_ERR("failed to open Phi-4-MM logits manifest: %s\n", path.string().c_str());
+        return false;
+    }
+
+    out << "{\n";
+    out << "  \"n_vocab\": " << llama_vocab_n_tokens(ctx.vocab) << ",\n";
+    out << "  \"n_past\": " << ctx.n_past << ",\n";
+    out << "  \"forced_tokens\": [";
+    for (size_t i = 0; i < forced_tokens.size(); ++i) {
+        if (i > 0) {
+            out << ", ";
+        }
+        out << forced_tokens[i];
+    }
+    out << "],\n";
+    out << "  \"files\": [\n";
+    for (size_t i = 0; i < files.size(); ++i) {
+        const auto & f = files[i];
+        out << "    {\"step\": " << f.step
+            << ", \"token\": " << f.token
+            << ", \"label\": \"" << f.label
+            << "\", \"file\": \"" << f.file
+            << "\", \"dtype\": \"float32\", \"shape\": [" << llama_vocab_n_tokens(ctx.vocab) << "]}";
+        if (i + 1 < files.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+    return (bool) out;
+}
+
+static int phi4mm_debug_dump_logits(mtmd_cli_context & ctx) {
+    const char * dump_dir_env = std::getenv("MTMD_DEBUG_PHI4MM_LOGITS_DUMP");
+    if (dump_dir_env == nullptr || dump_dir_env[0] == '\0') {
+        return 0;
+    }
+
+    std::filesystem::path dump_dir(dump_dir_env);
+    std::error_code ec;
+    std::filesystem::create_directories(dump_dir, ec);
+    if (ec) {
+        LOG_ERR("failed to create Phi-4-MM logits dump dir %s: %s\n", dump_dir.string().c_str(), ec.message().c_str());
+        return 1;
+    }
+
+    std::vector<llama_token> forced_tokens;
+    if (!phi4mm_debug_parse_forced_tokens(std::getenv("MTMD_DEBUG_PHI4MM_FORCE_TOKENS"), forced_tokens)) {
+        return 1;
+    }
+    std::vector<phi4mm_debug_logits_file> files;
+
+    const std::string prefill_file = "logits_000_prefill.f32";
+    if (!phi4mm_debug_write_logits(ctx, dump_dir, prefill_file)) {
+        return 1;
+    }
+    files.push_back({0, LLAMA_TOKEN_NULL, "prefill", prefill_file});
+
+    for (size_t i = 0; i < forced_tokens.size(); ++i) {
+        const llama_token token_id = forced_tokens[i];
+        common_batch_clear(ctx.batch);
+        common_batch_add(ctx.batch, token_id, ctx.n_past++, {0}, true);
+        if (llama_decode(ctx.lctx, ctx.batch)) {
+            LOG_ERR("failed to decode forced token for Phi-4-MM logits dump: %d\n", token_id);
+            return 1;
+        }
+
+        const std::string file_name = string_format("logits_%03zu_after_%d.f32", i + 1, token_id);
+        if (!phi4mm_debug_write_logits(ctx, dump_dir, file_name)) {
+            return 1;
+        }
+        files.push_back({(int) i + 1, token_id, "after_forced_token", file_name});
+    }
+
+    if (!phi4mm_debug_write_logits_manifest(ctx, dump_dir, forced_tokens, files)) {
+        return 1;
+    }
+
+    LOG_INF("dumped Phi-4-MM logits to %s\n", dump_dir.string().c_str());
+    return 0;
+}
+
 static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     inject_test_response_marker();
 
@@ -456,6 +600,9 @@ int main(int argc, char ** argv) {
         if (eval_message(ctx, msg)) {
             return 1;
         }
+        if (phi4mm_debug_dump_logits(ctx)) {
+            return 1;
+        }
         if (!g_is_interrupted && generate_response(ctx, n_predict)) {
             return 1;
         }
@@ -526,6 +673,9 @@ int main(int argc, char ** argv) {
             msg.content = content;
             int ret = eval_message(ctx, msg);
             if (ret) {
+                return 1;
+            }
+            if (phi4mm_debug_dump_logits(ctx)) {
                 return 1;
             }
             if (g_is_interrupted) break;

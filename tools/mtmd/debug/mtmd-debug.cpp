@@ -11,9 +11,14 @@
 
 #include <vector>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <limits.h>
 #include <cinttypes>
 #include <clocale>
+#include <map>
+#include <string>
+#include <unordered_set>
 
 // INTERNAL TOOL FOR DEBUGGING PURPOSES ONLY
 // NOT INTENDED FOR PUBLIC USE
@@ -41,12 +46,156 @@ static void show_additional_info(int /*argc*/, char ** argv) {
         "        --image can be:\n"
         "          \"white\", \"black\", \"gray\": filled image with respective colors\n"
         "          \"cb\": checkerboard pattern\n"
+        "          or a path to an image file\n"
         "        --audio can be:\n"
         "          \"one\", \"zero\", \"half\": filled 1.0f, 0.0f and 0.5f respectively\n"
         "          \"440\": sine wave with 440 Hz frequency\n"
         "\n",
         argv[0]
     );
+}
+
+static std::string mtmd_debug_join_path(const std::string & dir, const std::string & name) {
+    if (dir.empty() || dir.back() == '/' || dir.back() == '\\') {
+        return dir + name;
+    }
+    return dir + "/" + name;
+}
+
+static std::vector<std::string> mtmd_debug_split_csv(const char * csv) {
+    std::vector<std::string> names;
+    if (!csv || csv[0] == '\0') {
+        return names;
+    }
+
+    std::string cur;
+    for (const char * p = csv; *p; ++p) {
+        if (*p == ',') {
+            if (!cur.empty()) {
+                names.push_back(cur);
+                cur.clear();
+            }
+        } else if (*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+            cur.push_back(*p);
+        }
+    }
+    if (!cur.empty()) {
+        names.push_back(cur);
+    }
+    return names;
+}
+
+static std::string mtmd_debug_safe_file_stem(const std::string & name) {
+    std::string stem = name;
+    for (char & ch : stem) {
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+        if (!ok) {
+            ch = '_';
+        }
+    }
+    return stem;
+}
+
+struct phi4mm_layer_dump_cb_data {
+    std::string dump_dir;
+    std::unordered_set<std::string> wanted;
+    std::unordered_set<std::string> dumped;
+    std::map<std::string, std::string> manifest_entries;
+    int64_t n_patches = 1024;
+};
+
+static std::string mtmd_debug_shape_json(const std::vector<int64_t> & shape) {
+    std::string shape_json = "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) {
+            shape_json += ", ";
+        }
+        shape_json += std::to_string(shape[i]);
+    }
+    shape_json += "]";
+    return shape_json;
+}
+
+static void phi4mm_layer_dump_write_manifest(phi4mm_layer_dump_cb_data * cb_data) {
+    const std::string manifest_path = mtmd_debug_join_path(cb_data->dump_dir, "phi4mm_layer_dumps.json");
+    std::ofstream manifest(manifest_path);
+    if (!manifest) {
+        LOG_ERR("%s: failed to open %s for writing\n", __func__, manifest_path.c_str());
+        return;
+    }
+
+    manifest << "{\n  \"tensors\": {\n";
+    size_t i = 0;
+    for (const auto & entry : cb_data->manifest_entries) {
+        manifest << "    \"" << entry.first << "\": " << entry.second;
+        manifest << (++i < cb_data->manifest_entries.size() ? "," : "") << "\n";
+    }
+    manifest << "  }\n}\n";
+}
+
+static bool phi4mm_layer_dump_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
+    auto * cb_data = static_cast<phi4mm_layer_dump_cb_data *>(user_data);
+    const std::string name(t->name);
+
+    if (cb_data->wanted.find(name) == cb_data->wanted.end() ||
+            cb_data->dumped.find(name) != cb_data->dumped.end()) {
+        return !ask;
+    }
+
+    if (ask) {
+        return true;
+    }
+
+    cb_data->dumped.insert(name);
+    std::vector<int64_t> shape;
+    const int n_dims = ggml_n_dims(t);
+    if (n_dims == 2 && cb_data->n_patches > 0 && t->ne[1] % cb_data->n_patches == 0) {
+        shape = { t->ne[1] / cb_data->n_patches, cb_data->n_patches, t->ne[0] };
+    } else if (n_dims == 3) {
+        shape = { t->ne[2], t->ne[1], t->ne[0] };
+    } else if (n_dims == 4) {
+        shape = { t->ne[3], t->ne[2], t->ne[1], t->ne[0] };
+    } else {
+        shape.assign(t->ne, t->ne + n_dims);
+    }
+
+    const std::string file_name = mtmd_debug_safe_file_stem(name) + ".f32";
+    const std::string data_path = mtmd_debug_join_path(cb_data->dump_dir, file_name);
+    std::vector<float> data(ggml_nelements(t));
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+    } else if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp(ggml_nelements(t));
+        ggml_backend_tensor_get(t, tmp.data(), 0, ggml_nbytes(t));
+        ggml_fp16_to_fp32_row(tmp.data(), data.data(), tmp.size());
+    } else if (t->type == GGML_TYPE_BF16) {
+        std::vector<ggml_bf16_t> tmp(ggml_nelements(t));
+        ggml_backend_tensor_get(t, tmp.data(), 0, ggml_nbytes(t));
+        ggml_bf16_to_fp32_row(tmp.data(), data.data(), tmp.size());
+    } else {
+        LOG_WRN("%s: requested tensor %s is %s, only F32/F16/BF16 dumps are supported\n",
+                __func__, name.c_str(), ggml_type_name(t->type));
+        return true;
+    }
+
+    std::ofstream out(data_path, std::ios::binary);
+    if (!out) {
+        LOG_ERR("%s: failed to open %s for writing\n", __func__, data_path.c_str());
+        return true;
+    }
+    out.write(reinterpret_cast<const char *>(data.data()), data.size() * sizeof(float));
+    if (!out) {
+        LOG_ERR("%s: failed to write %s\n", __func__, data_path.c_str());
+        return true;
+    }
+
+    cb_data->manifest_entries[name] =
+        "{\"file\": \"" + file_name + "\", \"dtype\": \"float32\", \"shape\": " +
+        mtmd_debug_shape_json(shape) + "}";
+    phi4mm_layer_dump_write_manifest(cb_data);
+
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -77,6 +226,7 @@ int main(int argc, char ** argv) {
     mtmd::context_ptr ctx_mtmd;
     common_init_result_ptr llama_init;
     common_debug_cb_user_data cb_data;
+    phi4mm_layer_dump_cb_data phi4mm_layer_cb_data;
 
     llama_init = common_init_from_params(params);
     {
@@ -90,7 +240,19 @@ int main(int argc, char ** argv) {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
-        {
+        const char * phi4mm_layer_dump_dir = std::getenv("MTMD_DEBUG_PHI4MM_LAYER_DUMP");
+        if (phi4mm_layer_dump_dir != nullptr && phi4mm_layer_dump_dir[0] != '\0') {
+            phi4mm_layer_cb_data.dump_dir = phi4mm_layer_dump_dir;
+            for (const std::string & name : mtmd_debug_split_csv(std::getenv("MTMD_DEBUG_PHI4MM_LAYER_DUMP_NAMES"))) {
+                phi4mm_layer_cb_data.wanted.insert(name);
+            }
+            if (const char * n_patches = std::getenv("MTMD_DEBUG_PHI4MM_LAYER_DUMP_N_PATCHES")) {
+                phi4mm_layer_cb_data.n_patches = std::strtoll(n_patches, nullptr, 10);
+            }
+            mparams.cb_eval_user_data = &phi4mm_layer_cb_data;
+            mparams.cb_eval = phi4mm_layer_dump_cb_eval;
+        } else if (std::getenv("MTMD_DEBUG_PHI4MM_HIDDEN_STATES_DUMP") == nullptr
+                && std::getenv("MTMD_DEBUG_PHI4MM_PROJECTED_EMBEDDINGS_DUMP") == nullptr) {
             // always enable debug callback
             mparams.cb_eval_user_data = &cb_data;
             mparams.cb_eval = common_debug_cb_eval;
@@ -109,8 +271,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (inp_size <= 0) {
-        LOG_ERR("ERR: Invalid size specified with -n, must be greater than 0\n");
-        return 1;
+        if (params.prompt.empty() || params.prompt == "encode") {
+            LOG_ERR("ERR: Invalid size specified with -n, must be greater than 0\n");
+            return 1;
+        }
+        inp_size = 1;
     }
     input = params.image[0];
 
@@ -267,9 +432,33 @@ int main(int argc, char ** argv) {
                 pcm_samples[i] = sinf(2 * pi * freq * i / sample_rate);
             }
         } else {
-            LOG_ERR("ERR: Invalid input specified with --image/--audio\n");
-            show_additional_info(argc, argv);
-            return 1;
+            auto loaded = mtmd_helper_bitmap_init_from_file(ctx_mtmd.get(), input.c_str(), false);
+            if (!loaded.bitmap || loaded.video_ctx || mtmd_bitmap_is_audio(loaded.bitmap)) {
+                if (loaded.bitmap) {
+                    mtmd_bitmap_free(loaded.bitmap);
+                }
+                if (loaded.video_ctx) {
+                    mtmd_helper_video_free(loaded.video_ctx);
+                }
+                LOG_ERR("ERR: Invalid input specified with --image/--audio\n");
+                show_additional_info(argc, argv);
+                return 1;
+            }
+
+            const unsigned char * data = mtmd_bitmap_get_data(loaded.bitmap);
+            const size_t n_bytes = mtmd_bitmap_get_n_bytes(loaded.bitmap);
+            rgb_values.assign(data, data + n_bytes);
+            inp_size = (int) mtmd_bitmap_get_nx(loaded.bitmap);
+            const int inp_height = (int) mtmd_bitmap_get_ny(loaded.bitmap);
+            mtmd_bitmap_free(loaded.bitmap);
+            if (loaded.video_ctx) {
+                mtmd_helper_video_free(loaded.video_ctx);
+            }
+
+            LOG_INF("Running preprocessing pass for input file: %s\n", input.c_str());
+            LOG_INF("Input image with dimensions %d x %d\n", inp_size, inp_height);
+            mtmd_debug_preprocess_image(ctx_mtmd.get(), rgb_values, inp_size, inp_height);
+            return 0;
         }
 
         // run preprocessing pass
@@ -290,4 +479,3 @@ int main(int argc, char ** argv) {
 
     return 0;
 }
-

@@ -38,6 +38,7 @@ add_library(mtmd
             models/llava.cpp
             models/minicpmv.cpp
             models/paddleocr.cpp
+            models/phi4mm.cpp
             models/pixtral.cpp
             models/qwen2vl.cpp
             models/qwen3vl.cpp

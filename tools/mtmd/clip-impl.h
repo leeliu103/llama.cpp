@@ -516,6 +516,16 @@ struct clip_image_f32 {
     // whether a learned newline (or EOI) token should be appended after the image (eg Granite4 Vision)
     bool add_newline = false;
 
+    // Phi-4-MM Dynamic-HD metadata. Set on the first crop only.
+    int phi4mm_grid_x = 0;
+    int phi4mm_grid_y = 0;
+    int phi4mm_useful_width = 0;
+    int phi4mm_useful_height = 0;
+    int phi4mm_num_img_tokens = 0;
+    int phi4mm_mask_width = 0;
+    int phi4mm_mask_height = 0;
+    std::vector<uint8_t> phi4mm_image_attention_mask;
+
     clip_image_size get_size() const {
         return { nx_, ny_ };
     }

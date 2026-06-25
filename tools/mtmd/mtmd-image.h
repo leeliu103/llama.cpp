@@ -16,6 +16,20 @@ struct mtmd_image_preproc_out {
     int grid_x = 0;
     int grid_y = 0;
 
+    // Phi-4-MM Dynamic-HD layout metadata. Kept separate from grid_x/grid_y so
+    // mtmd does not split the crops into LLaVA-UHD-style image chunks.
+    int phi4mm_grid_x = 0;
+    int phi4mm_grid_y = 0;
+    int phi4mm_useful_width = 0;
+    int phi4mm_useful_height = 0;
+    int phi4mm_num_img_tokens = 0;
+    int phi4mm_image_width = 0;
+    int phi4mm_image_height = 0;
+    int phi4mm_mask_width = 0;
+    int phi4mm_mask_height = 0;
+    // Flattened [global + HD crops, mask_height, mask_width], uint8 0/1.
+    std::vector<uint8_t> phi4mm_image_attention_mask;
+
     void append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized = true);
     void append(const clip_hparams & hparams, const std::vector<clip_image_u8> & imgs, bool normalized = true);
     void append(const clip_hparams & hparams, clip_image_f32 & img, bool normalized = true);
@@ -121,6 +135,22 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
 struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
     mtmd_image_preprocessor_dyn_size(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+};
+
+// Phi-4-MM Dynamic-HD preprocessing. Produces one global 448x448 image followed
+// by row-major 448x448 HD crops in a single image chunk.
+struct mtmd_image_preprocessor_phi4mm : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_phi4mm(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+
+private:
+    static clip_image_size find_closest_aspect_ratio(
+            float aspect_ratio,
+            const std::vector<clip_image_size> & target_ratios,
+            int width,
+            int height,
+            int image_size);
+    static std::vector<clip_image_size> get_target_ratios(int min_num, int max_num);
 };
 
 // similar to mtmd_image_preprocessor_dyn_size, but resize the image to have longest edge equal to hparams.image_longest_edge, while preserving aspect ratio

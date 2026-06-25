@@ -22,6 +22,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <fstream>
+#include <string>
 #include <vector>
 
 // for still image data, layout is RGBRGBRGB...
@@ -91,7 +93,11 @@ struct mtmd_image_tokens {
     mtmd_pos_type pos = MTMD_POS_TYPE_NORMAL;
     uint32_t image_idx = 0; // 0-based position of this image among image chunks in the prompt(used by pos == MTMD_POS_TYPE_HUNYUANVL)
     uint32_t n_temporal_merge = 1; // for qwen-vl style temporal merge
+    uint32_t n_tokens_override = 0; // for one logical image backed by multiple preprocessed entries
     uint32_t n_tokens() const {
+        if (n_tokens_override > 0) {
+            return n_tokens_override;
+        }
         if (pos == MTMD_POS_TYPE_HUNYUANVL) {
             // [BOI] [row0 tokens + newline] ... [row(ny-1) tokens + newline] [EOI]
             return (nx + 1) * ny + 2;
@@ -132,6 +138,7 @@ struct mtmd_image_tokens {
             pos,
             image_idx,
             n_temporal_merge,
+            n_tokens_override,
             batch_f32.clone(),
             id
         };
@@ -511,6 +518,12 @@ struct mtmd_context {
                 {
                     // Phi-4 uses media marker insertion only. Keep image boundary text empty.
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_PHI4MM:
+                {
+                    // Phi-4-MM uses media marker insertion only. The Dynamic-HD
+                    // crops are one logical image sequence, not separate chunks.
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_phi4mm>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_LLAMA4:
                 {
@@ -1086,6 +1099,17 @@ struct mtmd_tokenizer {
                     preproc_out.entries.emplace_back(std::move(entry));
                 }
 
+                if (ctx->proj_type_v() == PROJECTOR_TYPE_PHI4MM) {
+                    if (bitmaps.size() != 1) {
+                        throw std::runtime_error(string_format("%s: Phi-4-MM expects one image per media marker\n", __func__));
+                    }
+                    preproc_out.phi4mm_grid_x         = tmp_preproc_out.phi4mm_grid_x;
+                    preproc_out.phi4mm_grid_y         = tmp_preproc_out.phi4mm_grid_y;
+                    preproc_out.phi4mm_useful_width   = tmp_preproc_out.phi4mm_useful_width;
+                    preproc_out.phi4mm_useful_height  = tmp_preproc_out.phi4mm_useful_height;
+                    preproc_out.phi4mm_num_img_tokens = tmp_preproc_out.phi4mm_num_img_tokens;
+                }
+
                 // for llava-uhd style, we need to handle grid too
                 // we don't care about overwriting these values for now because the case where bitmaps.size() > 1 is only for frame merging (qwen-vl), not supported by llava-uhd
                 if ((tmp_preproc_out.grid_x > 0 && tmp_preproc_out.grid_y > 0)
@@ -1183,11 +1207,18 @@ struct mtmd_tokenizer {
                 }
 
                 size_t n_tokens = 0;
-                for (auto & e : preproc_out.entries) {
-                    n_tokens += clip_n_output_tokens(ctx->ctx_v, &e);
-                    if (clip_model_n_temporal_merge(ctx->ctx_v) == 2) {
-                        // [QWEN_VIDEO] pair input is merged to the same embd, so only count as one image
-                        break;
+                if (ctx->proj_type_v() == PROJECTOR_TYPE_PHI4MM) {
+                    if (preproc_out.phi4mm_num_img_tokens <= 0) {
+                        throw std::runtime_error(string_format("%s: Phi-4-MM preprocessor did not return num_img_tokens\n", __func__));
+                    }
+                    n_tokens = preproc_out.phi4mm_num_img_tokens;
+                } else {
+                    for (auto & e : preproc_out.entries) {
+                        n_tokens += clip_n_output_tokens(ctx->ctx_v, &e);
+                        if (clip_model_n_temporal_merge(ctx->ctx_v) == 2) {
+                            // [QWEN_VIDEO] pair input is merged to the same embd, so only count as one image
+                            break;
+                        }
                     }
                 }
 
@@ -1204,6 +1235,9 @@ struct mtmd_tokenizer {
                     // other models, we only need the total number of tokens
                     image_tokens->nx = n_tokens;
                     image_tokens->ny = 1;
+                }
+                if (ctx->proj_type_v() == PROJECTOR_TYPE_PHI4MM) {
+                    image_tokens->n_tokens_override = n_tokens;
                 }
                 image_tokens->pos = ctx->pos_type;
                 // HunyuanVL wraps the image grid with BOI/EOI and adds one newline per row,
@@ -2079,6 +2113,146 @@ void mtmd_debug_encode_audio(mtmd_context * ctx, const std::vector<float> & inpu
     mtmd_debug_encode_impl(ctx, ctx->ctx_a, inp_audio);
 }
 
+static std::string mtmd_debug_join_path(const std::string & dir, const char * name) {
+    if (dir.empty() || dir.back() == '/' || dir.back() == '\\') {
+        return dir + name;
+    }
+    return dir + "/" + name;
+}
+
+template <typename T>
+static bool mtmd_debug_write_raw(const std::string & path, const std::vector<T> & data) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        LOG_ERR("%s: failed to open %s for writing\n", __func__, path.c_str());
+        return false;
+    }
+    if (!data.empty()) {
+        out.write(reinterpret_cast<const char *>(data.data()), data.size() * sizeof(T));
+    }
+    return bool(out);
+}
+
+static void mtmd_debug_dump_preprocess(const mtmd_image_preproc_out & preproc_out, const char * dump_dir_cstr) {
+    if (!dump_dir_cstr || dump_dir_cstr[0] == '\0') {
+        return;
+    }
+
+    const std::string dump_dir(dump_dir_cstr);
+    const size_t n_entries = preproc_out.entries.size();
+    if (n_entries == 0) {
+        LOG_ERR("%s: no preprocessed entries to dump\n", __func__);
+        return;
+    }
+
+    const int image_width = preproc_out.entries[0].nx();
+    const int image_height = preproc_out.entries[0].ny();
+    std::vector<float> input_image_embeds;
+    input_image_embeds.reserve(n_entries * 3 * (size_t) image_width * image_height);
+
+    for (const auto & entry : preproc_out.entries) {
+        if (entry.nx() != image_width || entry.ny() != image_height) {
+            LOG_ERR("%s: cannot dump entries with mixed sizes\n", __func__);
+            return;
+        }
+        const auto & buf = entry.get_ro_buf();
+        for (int c = 0; c < 3; ++c) {
+            for (int y = 0; y < image_height; ++y) {
+                for (int x = 0; x < image_width; ++x) {
+                    input_image_embeds.push_back(buf[((size_t) y * image_width + x) * 3 + c]);
+                }
+            }
+        }
+    }
+
+    const std::vector<int64_t> image_sizes = {
+        static_cast<int64_t>(preproc_out.phi4mm_image_height),
+        static_cast<int64_t>(preproc_out.phi4mm_image_width),
+    };
+    const std::vector<int64_t> num_img_tokens = {
+        static_cast<int64_t>(preproc_out.phi4mm_num_img_tokens),
+    };
+
+    if (!mtmd_debug_write_raw(mtmd_debug_join_path(dump_dir, "input_image_embeds.f32"), input_image_embeds)) {
+        return;
+    }
+    if (!preproc_out.phi4mm_image_attention_mask.empty()) {
+        if (!mtmd_debug_write_raw(mtmd_debug_join_path(dump_dir, "image_attention_mask.u8"),
+                    preproc_out.phi4mm_image_attention_mask)) {
+            return;
+        }
+    }
+    if (preproc_out.phi4mm_image_width > 0 && preproc_out.phi4mm_image_height > 0) {
+        if (!mtmd_debug_write_raw(mtmd_debug_join_path(dump_dir, "image_sizes.i64"), image_sizes)) {
+            return;
+        }
+    }
+    if (preproc_out.phi4mm_num_img_tokens > 0) {
+        if (!mtmd_debug_write_raw(mtmd_debug_join_path(dump_dir, "num_img_tokens.i64"), num_img_tokens)) {
+            return;
+        }
+    }
+
+    std::ofstream manifest(mtmd_debug_join_path(dump_dir, "manifest.json"));
+    if (!manifest) {
+        LOG_ERR("%s: failed to open manifest for writing\n", __func__);
+        return;
+    }
+    manifest
+        << "{\n"
+        << "  \"input_image_embeds\": {\"file\": \"input_image_embeds.f32\", \"dtype\": \"float32\", \"shape\": [1, "
+        << n_entries << ", 3, " << image_height << ", " << image_width << "]},\n";
+    if (!preproc_out.phi4mm_image_attention_mask.empty()) {
+        manifest
+            << "  \"image_attention_mask\": {\"file\": \"image_attention_mask.u8\", \"dtype\": \"uint8\", \"shape\": [1, "
+            << n_entries << ", " << preproc_out.phi4mm_mask_height << ", " << preproc_out.phi4mm_mask_width << "]},\n";
+    }
+    if (preproc_out.phi4mm_image_width > 0 && preproc_out.phi4mm_image_height > 0) {
+        manifest
+            << "  \"image_sizes\": {\"file\": \"image_sizes.i64\", \"dtype\": \"int64\", \"shape\": [1, 2]},\n";
+    }
+    if (preproc_out.phi4mm_num_img_tokens > 0) {
+        manifest
+            << "  \"num_img_tokens\": {\"file\": \"num_img_tokens.i64\", \"dtype\": \"int64\", \"shape\": [1]},\n";
+    }
+    manifest
+        << "  \"phi4mm\": {\"grid\": [" << preproc_out.phi4mm_grid_x << ", " << preproc_out.phi4mm_grid_y
+        << "], \"useful\": [" << preproc_out.phi4mm_useful_width << ", " << preproc_out.phi4mm_useful_height
+        << "], \"num_img_tokens\": " << preproc_out.phi4mm_num_img_tokens << "}\n"
+        << "}\n";
+
+    LOG_INF("%s: dumped preprocessing tensors to %s\n", __func__, dump_dir.c_str());
+}
+
+static void mtmd_debug_dump_phi4mm_projected_embeddings(
+        const std::vector<float> & embeddings,
+        int n_tokens,
+        int n_embd,
+        const char * dump_dir_cstr) {
+    if (!dump_dir_cstr || dump_dir_cstr[0] == '\0') {
+        return;
+    }
+
+    const std::string dump_dir(dump_dir_cstr);
+    if (!mtmd_debug_write_raw(mtmd_debug_join_path(dump_dir, "projected_embeddings.f32"), embeddings)) {
+        return;
+    }
+
+    const std::string manifest_path = mtmd_debug_join_path(dump_dir, "projected_embeddings.json");
+    std::ofstream manifest(manifest_path);
+    if (!manifest) {
+        LOG_ERR("%s: failed to open %s for writing\n", __func__, manifest_path.c_str());
+        return;
+    }
+    manifest
+        << "{\n"
+        << "  \"projected_embeddings\": {\"file\": \"projected_embeddings.f32\", \"dtype\": \"float32\", \"shape\": ["
+        << n_tokens << ", " << n_embd << "]}\n"
+        << "}\n";
+
+    LOG_INF("%s: dumped Phi-4-MM projected embeddings to %s\n", __func__, dump_dir.c_str());
+}
+
 void mtmd_debug_preprocess_image(mtmd_context * ctx, const std::vector<uint8_t> & rgb_values, int nx, int ny) {
     if (!ctx->ctx_v) {
         LOG_ERR("%s: model does not support vision input\n", __func__);
@@ -2089,6 +2263,12 @@ void mtmd_debug_preprocess_image(mtmd_context * ctx, const std::vector<uint8_t> 
     img_u8.cpy_buf(rgb_values);
     GGML_ASSERT(ctx->image_preproc != nullptr);
     mtmd_image_preproc_out preproc_out = ctx->image_preproc->preprocess(img_u8);
+    mtmd_debug_dump_preprocess(preproc_out, std::getenv("MTMD_DEBUG_PREPROC_DUMP"));
+    const int phi4mm_num_img_tokens = preproc_out.phi4mm_num_img_tokens;
+    const int phi4mm_grid_x = preproc_out.phi4mm_grid_x;
+    const int phi4mm_grid_y = preproc_out.phi4mm_grid_y;
+    const int phi4mm_useful_width = preproc_out.phi4mm_useful_width;
+    const int phi4mm_useful_height = preproc_out.phi4mm_useful_height;
 
     clip_image_f32_batch batch_f32;
     batch_f32.is_audio = false;
@@ -2097,6 +2277,30 @@ void mtmd_debug_preprocess_image(mtmd_context * ctx, const std::vector<uint8_t> 
     }
 
     LOG_INF("%s: preprocessed image to batch_f32 with %d entries\n", __func__, (int)batch_f32.entries.size());
+    if (ctx->proj_type_v() == PROJECTOR_TYPE_PHI4MM
+            && std::getenv("MTMD_DEBUG_PHI4MM_HIDDEN_STATES_DUMP") != nullptr) {
+        std::vector<float> empty_output;
+        if (!clip_image_batch_encode(ctx->ctx_v, ctx->n_threads, &batch_f32, empty_output)) {
+            LOG_ERR("%s: failed to dump Phi-4-MM hidden_states[-2]\n", __func__);
+        }
+    }
+    if (ctx->proj_type_v() == PROJECTOR_TYPE_PHI4MM
+            && std::getenv("MTMD_DEBUG_PHI4MM_PROJECTED_EMBEDDINGS_DUMP") != nullptr) {
+        const int n_mmproj_embd = clip_n_mmproj_embd(ctx->ctx_v);
+        const int n_tokens = clip_n_output_tokens(ctx->ctx_v, &batch_f32.entries[0]);
+        std::vector<float> projected_embeddings((size_t)n_tokens * n_mmproj_embd, 0.0f);
+        if (!clip_image_batch_encode(ctx->ctx_v, ctx->n_threads, &batch_f32, projected_embeddings)) {
+            LOG_ERR("%s: failed to dump Phi-4-MM projected embeddings\n", __func__);
+        } else {
+            mtmd_debug_dump_phi4mm_projected_embeddings(
+                projected_embeddings, n_tokens, n_mmproj_embd,
+                std::getenv("MTMD_DEBUG_PHI4MM_PROJECTED_EMBEDDINGS_DUMP"));
+        }
+    }
+    if (phi4mm_num_img_tokens > 0) {
+        LOG_INF("%s: phi4mm grid=%dx%d useful=%dx%d num_img_tokens=%d\n",
+                __func__, phi4mm_grid_x, phi4mm_grid_y, phi4mm_useful_width, phi4mm_useful_height, phi4mm_num_img_tokens);
+    }
     for (size_t i = 0; i < batch_f32.entries.size(); i++) {
         LOG_INF("%s: entry %zu has nx=%d, ny=%d\n", __func__, i, batch_f32.entries[i].nx(), batch_f32.entries[i].ny());
         // TODO: better way to dump entry content?

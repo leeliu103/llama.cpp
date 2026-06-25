@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 void mtmd_image_preproc_out::append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized) {
@@ -62,6 +64,9 @@ struct img_tool {
                 case RESIZE_ALGO_BILINEAR:
                     resize_bilinear(src, dst, target_resolution.width, target_resolution.height);
                     break;
+                case RESIZE_ALGO_BILINEAR_PILLOW:
+                    resize_bilinear_pillow(src, dst, target_resolution.width, target_resolution.height);
+                    break;
                 case RESIZE_ALGO_BICUBIC:
                     resize_bicubic(src, dst, target_resolution.width, target_resolution.height);
                     break;
@@ -91,6 +96,9 @@ struct img_tool {
                 case RESIZE_ALGO_BILINEAR:
                     resize_bilinear(src, resized_image, new_width, new_height);
                     break;
+                case RESIZE_ALGO_BILINEAR_PILLOW:
+                    resize_bilinear_pillow(src, resized_image, new_width, new_height);
+                    break;
                 case RESIZE_ALGO_BICUBIC:
                     resize_bicubic(src, resized_image, new_width, new_height);
                     break;
@@ -114,6 +122,82 @@ struct img_tool {
             }
             composite(dst, resized_image, offset_x, offset_y);
         }
+    }
+
+    static void resize_bicubic_pytorch(
+            const clip_image_f32 & src,
+            clip_image_f32 & dst,
+            const clip_image_size & target_resolution) {
+        const int src_w = src.nx();
+        const int src_h = src.ny();
+        const int dst_w = target_resolution.width;
+        const int dst_h = target_resolution.height;
+
+        GGML_ASSERT(src_w > 0 && src_h > 0 && dst_w > 0 && dst_h > 0);
+        dst.set_size(target_resolution, src.is_placeholder(), false);
+
+        if (src.is_placeholder()) {
+            return;
+        }
+
+        const auto & src_buf = src.get_ro_buf();
+        std::vector<float> dst_buf((size_t) dst_w * (size_t) dst_h * 3);
+
+        auto cubic_convolution1 = [](float x) {
+            constexpr float a = -0.75f;
+            return ((a + 2.0f) * x - (a + 3.0f)) * x * x + 1.0f;
+        };
+
+        auto cubic_convolution2 = [](float x) {
+            constexpr float a = -0.75f;
+            return ((a * x - 5.0f * a) * x + 8.0f * a) * x - 4.0f * a;
+        };
+
+        auto get_coeffs = [&](float t, float coeffs[4]) {
+            coeffs[0] = cubic_convolution2(t + 1.0f);
+            coeffs[1] = cubic_convolution1(t);
+            coeffs[2] = cubic_convolution1(1.0f - t);
+            coeffs[3] = cubic_convolution2(2.0f - t);
+        };
+
+        auto source_index = [](float scale, int dst_index) {
+            return scale * (dst_index + 0.5f) - 0.5f;
+        };
+
+        const float scale_x = static_cast<float>(src_w) / static_cast<float>(dst_w);
+        const float scale_y = static_cast<float>(src_h) / static_cast<float>(dst_h);
+
+        for (int y = 0; y < dst_h; ++y) {
+            const float in_y = source_index(scale_y, y);
+            const int y_int = static_cast<int>(std::floor(in_y));
+            const float y_t = in_y - y_int;
+            float y_coeffs[4];
+            get_coeffs(y_t, y_coeffs);
+
+            for (int x = 0; x < dst_w; ++x) {
+                const float in_x = source_index(scale_x, x);
+                const int x_int = static_cast<int>(std::floor(in_x));
+                const float x_t = in_x - x_int;
+                float x_coeffs[4];
+                get_coeffs(x_t, x_coeffs);
+
+                for (int c = 0; c < 3; ++c) {
+                    float value = 0.0f;
+                    for (int ky = 0; ky < 4; ++ky) {
+                        const int sy = clip(y_int - 1 + ky, 0, src_h - 1);
+                        float row = 0.0f;
+                        for (int kx = 0; kx < 4; ++kx) {
+                            const int sx = clip(x_int - 1 + kx, 0, src_w - 1);
+                            row += src_buf[((size_t) sy * src_w + sx) * 3 + c] * x_coeffs[kx];
+                        }
+                        value += row * y_coeffs[ky];
+                    }
+                    dst_buf[((size_t) y * dst_w + x) * 3 + c] = value;
+                }
+            }
+        }
+
+        dst.cpy_buf(dst_buf);
     }
 
     static void crop(const clip_image_u8 & image, clip_image_u8 & dst, int x, int y, int w, int h) {
@@ -335,6 +419,193 @@ private:
                 dst.set_pixel(j, i, pixel);
             }
         }
+    }
+
+    // Bilinear resize using Pillow's separable resampling rules.
+    static bool resize_bilinear_pillow(const clip_image_u8 & img, clip_image_u8 & dst, int target_width, int target_height) {
+        const int PRECISION_BITS = 32 - 8 - 2;
+
+        auto bilinear_filter = [](double x) -> double {
+            if (x < 0.0) {
+                x = -x;
+            }
+            return x < 1.0 ? 1.0 - x : 0.0;
+        };
+
+        constexpr double filter_support = 1.0;
+
+        auto clip8 = [](int val) -> uint8_t {
+            if (val < 0) return 0;
+            if (val > 255) return 255;
+            return static_cast<uint8_t>(val);
+        };
+
+        auto precompute_weights = [&](int inSize, int outSize,
+                                     std::vector<int> & bounds, std::vector<int32_t> & weights) -> int {
+            GGML_ASSERT(inSize > 0 && outSize > 0);
+            double support, scale, filterscale;
+            double center, ww, ss;
+            int xx, x, ksize, xmin, xmax;
+
+            filterscale = scale = static_cast<double>(inSize) / outSize;
+            if (filterscale < 1.0) {
+                filterscale = 1.0;
+            }
+
+            support = filter_support * filterscale;
+            ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
+
+            std::vector<double> pre_weights(outSize * ksize);
+            bounds.resize(outSize * 2);
+
+            for (xx = 0; xx < outSize; xx++) {
+                center = (xx + 0.5) * scale;
+                ww = 0.0;
+                ss = 1.0 / filterscale;
+
+                xmin = static_cast<int>(center - support + 0.5);
+                if (xmin < 0) {
+                    xmin = 0;
+                }
+
+                xmax = static_cast<int>(center + support + 0.5);
+                if (xmax > inSize) {
+                    xmax = inSize;
+                }
+
+                xmax -= xmin;
+
+                for (x = 0; x < xmax; x++) {
+                    double w = bilinear_filter((x + xmin - center + 0.5) * ss);
+                    pre_weights[xx * ksize + x] = w;
+                    ww += w;
+                }
+
+                for (x = 0; x < xmax; x++) {
+                    if (ww != 0.0) {
+                        pre_weights[xx * ksize + x] /= ww;
+                    }
+                }
+
+                for (; x < ksize; x++) {
+                    pre_weights[xx * ksize + x] = 0;
+                }
+
+                bounds[xx * 2 + 0] = xmin;
+                bounds[xx * 2 + 1] = xmax;
+            }
+
+            weights.resize(outSize * ksize);
+
+            const double fxp_scale = std::ldexp(1.0, PRECISION_BITS);
+            for (int i = 0; i < outSize * ksize; i++) {
+                double tmp_val = pre_weights[i] * fxp_scale;
+                if (pre_weights[i] < 0) {
+                    tmp_val -= 0.5;
+                } else {
+                    tmp_val += 0.5;
+                }
+                tmp_val = std::clamp(tmp_val,
+                                     static_cast<double>(std::numeric_limits<int32_t>::min()),
+                                     static_cast<double>(std::numeric_limits<int32_t>::max()));
+                weights[i] = static_cast<int32_t>(tmp_val);
+            }
+
+            return ksize;
+        };
+
+        auto resample_horizontal = [&](const clip_image_u8 & imIn, clip_image_u8 & imOut,
+                                       int out_nx,
+                                       int ksize, const std::vector<int> & bounds, const std::vector<int32_t> & weights) {
+            const int in_ny = imIn.get_size().height;
+            imOut.set_size({out_nx, in_ny}, false);
+
+            for (int yy = 0; yy < in_ny; yy++) {
+                for (int xx = 0; xx < out_nx; xx++) {
+                    int xmin = bounds[xx * 2 + 0];
+                    int xcnt = bounds[xx * 2 + 1];
+
+                    int32_t ss0 = 1 << (PRECISION_BITS - 1);
+                    int32_t ss1 = 1 << (PRECISION_BITS - 1);
+                    int32_t ss2 = 1 << (PRECISION_BITS - 1);
+
+                    for (int x = 0; x < xcnt; x++) {
+                        const auto src_px = imIn.get_pixel(x + xmin, yy);
+                        ss0 += src_px[0] * weights[xx * ksize + x];
+                        ss1 += src_px[1] * weights[xx * ksize + x];
+                        ss2 += src_px[2] * weights[xx * ksize + x];
+                    }
+
+                    imOut.set_pixel(xx, yy, {clip8(ss0 >> PRECISION_BITS),
+                                             clip8(ss1 >> PRECISION_BITS),
+                                             clip8(ss2 >> PRECISION_BITS)});
+                }
+            }
+        };
+
+        auto resample_vertical = [&](const clip_image_u8 & imIn, clip_image_u8 & imOut,
+                                     int out_ny,
+                                     int ksize, const std::vector<int> & bounds, const std::vector<int32_t> & weight) {
+            const int in_nx = imIn.get_size().width;
+            imOut.set_size({in_nx, out_ny}, false);
+
+            for (int yy = 0; yy < out_ny; yy++) {
+                int ymin = bounds[yy * 2 + 0];
+                int ycnt = bounds[yy * 2 + 1];
+
+                for (int xx = 0; xx < in_nx; xx++) {
+                    int32_t ss0 = 1 << (PRECISION_BITS - 1);
+                    int32_t ss1 = 1 << (PRECISION_BITS - 1);
+                    int32_t ss2 = 1 << (PRECISION_BITS - 1);
+
+                    for (int y = 0; y < ycnt; y++) {
+                        const auto src_px = imIn.get_pixel(xx, y + ymin);
+                        ss0 += src_px[0] * weight[yy * ksize + y];
+                        ss1 += src_px[1] * weight[yy * ksize + y];
+                        ss2 += src_px[2] * weight[yy * ksize + y];
+                    }
+
+                    imOut.set_pixel(xx, yy, {clip8(ss0 >> PRECISION_BITS),
+                                             clip8(ss1 >> PRECISION_BITS),
+                                             clip8(ss2 >> PRECISION_BITS)});
+                }
+            }
+        };
+
+        const int src_width  = img.get_size().width;
+        const int src_height = img.get_size().height;
+
+        bool need_horizontal = (target_width != src_width);
+        bool need_vertical = (target_height != src_height);
+
+        std::vector<int> bounds_horiz, bounds_vert;
+        std::vector<int32_t> weights_horiz, weights_vert;
+        int ksize_horiz = 0, ksize_vert = 0;
+
+        if (need_horizontal) {
+            ksize_horiz = precompute_weights(src_width, target_width, bounds_horiz, weights_horiz);
+        }
+
+        if (need_vertical) {
+            ksize_vert = precompute_weights(src_height, target_height, bounds_vert, weights_vert);
+        }
+
+        if (need_horizontal && need_vertical) {
+            clip_image_u8 temp;
+            resample_horizontal(img, temp, target_width, ksize_horiz, bounds_horiz, weights_horiz);
+            resample_vertical(temp, dst, target_height, ksize_vert, bounds_vert, weights_vert);
+        } else if (need_horizontal) {
+            resample_horizontal(img, dst, target_width, ksize_horiz, bounds_horiz, weights_horiz);
+        } else if (need_vertical) {
+            resample_vertical(img, dst, target_height, ksize_vert, bounds_vert, weights_vert);
+        } else {
+            dst.set_size(img.get_size(), img.is_placeholder());
+            if (!img.is_placeholder()) {
+                dst.cpy_buf(img.get_ro_buf());
+            }
+        }
+
+        return true;
     }
 
     // Bicubic resize function using Pillow's ImagingResample algorithm
@@ -906,6 +1177,228 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
                         hparams.image_pad_color);
     mtmd_image_preproc_out output;
     output.append(hparams, resized_image, true);
+    return output;
+}
+
+//
+// mtmd_image_preprocessor_phi4mm
+//
+
+std::vector<clip_image_size> mtmd_image_preprocessor_phi4mm::get_target_ratios(int min_num, int max_num) {
+    std::vector<clip_image_size> ratios;
+    for (int n = min_num; n <= max_num; ++n) {
+        for (int i = 1; i <= n; ++i) {
+            for (int j = 1; j <= n; ++j) {
+                const int n_tiles = i * j;
+                if (n_tiles >= min_num && n_tiles <= max_num) {
+                    ratios.push_back({i, j});
+                }
+            }
+        }
+    }
+    std::sort(ratios.begin(), ratios.end(), [](const clip_image_size & a, const clip_image_size & b) {
+        return a.width * a.height < b.width * b.height;
+    });
+    ratios.erase(std::unique(ratios.begin(), ratios.end(), [](const clip_image_size & a, const clip_image_size & b) {
+        return a.width == b.width && a.height == b.height;
+    }), ratios.end());
+    return ratios;
+}
+
+clip_image_size mtmd_image_preprocessor_phi4mm::find_closest_aspect_ratio(
+        float aspect_ratio,
+        const std::vector<clip_image_size> & target_ratios,
+        int width,
+        int height,
+        int image_size) {
+    clip_image_size best_ratio = {1, 1};
+    float best_ratio_diff = std::numeric_limits<float>::infinity();
+    const int area = width * height;
+
+    for (const auto & ratio : target_ratios) {
+        const float target_aspect_ratio = static_cast<float>(ratio.width) / static_cast<float>(ratio.height);
+        const float ratio_diff = std::abs(aspect_ratio - target_aspect_ratio);
+        if (ratio_diff < best_ratio_diff) {
+            best_ratio_diff = ratio_diff;
+            best_ratio = ratio;
+        } else if (ratio_diff == best_ratio_diff) {
+            if (area > 0.5f * image_size * image_size * ratio.width * ratio.height) {
+                best_ratio = ratio;
+            }
+        }
+    }
+
+    return best_ratio;
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_phi4mm::preprocess(const clip_image_u8 & img) {
+    const int image_size = hparams.image_size;
+    const int patch_size = hparams.patch_size;
+    const int max_num = hparams.preproc_max_tiles > 0 ? hparams.preproc_max_tiles : 36;
+    const int mask_size = image_size / patch_size;
+
+    GGML_ASSERT(image_size > 0);
+    GGML_ASSERT(patch_size > 0);
+    GGML_ASSERT(image_size % patch_size == 0);
+    GGML_ASSERT(mask_size % 2 == 0);
+
+    const clip_image_size original_size = img.get_size();
+    const int orig_width = original_size.width;
+    const int orig_height = original_size.height;
+
+    int grid_x = (orig_width  + image_size - 1) / image_size;
+    int grid_y = (orig_height + image_size - 1) / image_size;
+
+    if (grid_x * grid_y > max_num) {
+        const float aspect_ratio = static_cast<float>(orig_width) / static_cast<float>(orig_height);
+        const auto target_ratios = get_target_ratios(1, max_num);
+        const auto target_ratio = find_closest_aspect_ratio(aspect_ratio, target_ratios, orig_width, orig_height, image_size);
+        grid_x = target_ratio.width;
+        grid_y = target_ratio.height;
+    }
+
+    const int target_width = image_size * grid_x;
+    const int target_height = image_size * grid_y;
+
+    const float ratio_width = static_cast<float>(target_width) / static_cast<float>(orig_width);
+    const float ratio_height = static_cast<float>(target_height) / static_cast<float>(orig_height);
+
+    int new_width;
+    int new_height;
+    int padding_width;
+    int padding_height;
+    if (ratio_width < ratio_height) {
+        new_width = target_width;
+        new_height = static_cast<int>(orig_height * ratio_width);
+        padding_width = 0;
+        padding_height = target_height - new_height;
+    } else {
+        new_width = static_cast<int>(orig_width * ratio_height);
+        new_height = target_height;
+        padding_width = target_width - new_width;
+        padding_height = 0;
+    }
+
+    if (std::min(new_width, target_width) < 10 || std::min(new_height, target_height) < 10) {
+        throw std::runtime_error(string_format("%s: the aspect ratio is very extreme (%d x %d)\n", __func__, new_width, new_height));
+    }
+
+    const int mask_width = mask_size * grid_x;
+    const int mask_height = mask_size * grid_y;
+    std::vector<uint8_t> attention_mask(mask_width * mask_height, 1);
+    const int pad_cols = padding_width >= patch_size ? padding_width / patch_size : 0;
+    const int pad_rows = padding_height >= patch_size ? padding_height / patch_size : 0;
+
+    if (pad_cols > 0) {
+        for (int y = 0; y < mask_height; ++y) {
+            for (int x = mask_width - pad_cols; x < mask_width; ++x) {
+                attention_mask[y * mask_width + x] = 0;
+            }
+        }
+    }
+    if (pad_rows > 0) {
+        for (int y = mask_height - pad_rows; y < mask_height; ++y) {
+            for (int x = 0; x < mask_width; ++x) {
+                attention_mask[y * mask_width + x] = 0;
+            }
+        }
+    }
+
+    int mask_sum = 0;
+    for (uint8_t v : attention_mask) {
+        mask_sum += v ? 1 : 0;
+    }
+    if (mask_sum == 0) {
+        throw std::runtime_error(string_format("%s: Phi-4-MM image attention mask is empty\n", __func__));
+    }
+
+    std::vector<uint8_t> image_attention_mask((1 + grid_x * grid_y) * mask_size * mask_size, 1);
+    for (int gy = 0; gy < grid_y; ++gy) {
+        for (int gx = 0; gx < grid_x; ++gx) {
+            const int crop_idx = gy * grid_x + gx;
+            for (int y = 0; y < mask_size; ++y) {
+                for (int x = 0; x < mask_size; ++x) {
+                    image_attention_mask[((1 + crop_idx) * mask_size + y) * mask_size + x] =
+                        attention_mask[(gy * mask_size + y) * mask_width + (gx * mask_size + x)];
+                }
+            }
+        }
+    }
+
+    const int pooled_side = mask_size / 2;
+    const int pooled_width = pooled_side * grid_x;
+    const int pooled_height = pooled_side * grid_y;
+    std::vector<uint8_t> pooled_mask(pooled_width * pooled_height, 0);
+    int pooled_sum = 0;
+    for (int y = 0; y < pooled_height; ++y) {
+        for (int x = 0; x < pooled_width; ++x) {
+            const uint8_t v = attention_mask[(2 * y) * mask_width + (2 * x)];
+            pooled_mask[y * pooled_width + x] = v;
+            pooled_sum += v ? 1 : 0;
+        }
+    }
+
+    int useful_height = 0;
+    for (int y = 0; y < pooled_height; ++y) {
+        useful_height += pooled_mask[y * pooled_width] ? 1 : 0;
+    }
+    int useful_width = 0;
+    for (int x = 0; x < pooled_width; ++x) {
+        useful_width += pooled_mask[x] ? 1 : 0;
+    }
+
+    const int num_img_tokens = pooled_side * pooled_side + 1 + pooled_sum + useful_height + pooled_side;
+
+    clip_image_u8 resized_image;
+    img_tool::resize(img, resized_image, {new_width, new_height}, RESIZE_ALGO_BILINEAR_PILLOW, PAD_NONE);
+
+    clip_image_u8 hd_image;
+    hd_image.set_size({target_width, target_height}, img.is_placeholder());
+    img_tool::fill(hd_image, {255, 255, 255});
+    img_tool::composite(hd_image, resized_image, 0, 0);
+
+    clip_image_f32 hd_image_f32;
+    hd_image_f32.from_u8(hd_image);
+    hd_image_f32.normalize(hparams.image_mean, hparams.image_std);
+
+    clip_image_f32 global_image;
+    img_tool::resize_bicubic_pytorch(hd_image_f32, global_image, {image_size, image_size});
+
+    mtmd_image_preproc_out output;
+    output.append(hparams, global_image, false);
+    for (int y = 0; y < grid_y; ++y) {
+        for (int x = 0; x < grid_x; ++x) {
+            clip_image_u8 crop;
+            img_tool::crop(hd_image, crop, x * image_size, y * image_size, image_size, image_size);
+            output.append(hparams, crop, true);
+        }
+    }
+
+    output.phi4mm_grid_x = grid_x;
+    output.phi4mm_grid_y = grid_y;
+    output.phi4mm_useful_width = useful_width;
+    output.phi4mm_useful_height = useful_height;
+    output.phi4mm_num_img_tokens = num_img_tokens;
+    output.phi4mm_image_width = target_width;
+    output.phi4mm_image_height = target_height;
+    output.phi4mm_mask_width = mask_size;
+    output.phi4mm_mask_height = mask_size;
+    output.phi4mm_image_attention_mask = std::move(image_attention_mask);
+
+    if (!output.entries.empty()) {
+        output.entries[0].phi4mm_grid_x = grid_x;
+        output.entries[0].phi4mm_grid_y = grid_y;
+        output.entries[0].phi4mm_useful_width = useful_width;
+        output.entries[0].phi4mm_useful_height = useful_height;
+        output.entries[0].phi4mm_num_img_tokens = num_img_tokens;
+        output.entries[0].phi4mm_mask_width = mask_size;
+        output.entries[0].phi4mm_mask_height = mask_size;
+        output.entries[0].phi4mm_image_attention_mask = output.phi4mm_image_attention_mask;
+    }
+
+    LOG_DBG("%s: grid=%dx%d, crops=%zu, useful=%dx%d, num_img_tokens=%d\n",
+            __func__, grid_x, grid_y, output.entries.size(), useful_width, useful_height, num_img_tokens);
+
     return output;
 }
 
