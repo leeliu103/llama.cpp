@@ -125,6 +125,10 @@ void llama_backend_init(void) {
     if (!ggml_backend_reg_count()) {
         ggml_backend_load_all();
     }
+
+    if (!llama_execution_extensions_register()) {
+        GGML_ABORT("failed to register execution extensions");
+    }
 }
 
 void llama_numa_init(enum ggml_numa_strategy numa) {

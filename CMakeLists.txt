@@ -198,6 +198,13 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
 
+if (NOT GGML_HIP)
+    message(FATAL_ERROR "GPT-OSS execution extension requires GGML_HIP=ON")
+endif()
+
+enable_language(HIP)
+find_package(hip REQUIRED)
+
 #
 # build the library
 #

@@ -8,6 +8,11 @@ llama_add_compile_flags()
 
 file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
+set_source_files_properties(
+    extensions/gptoss/gptoss-repack-hip.cpp
+    PROPERTIES LANGUAGE HIP
+)
+
 add_library(llama
             ../include/llama.h
             llama.cpp
@@ -18,6 +23,8 @@ add_library(llama
             llama-context.cpp
             llama-cparams.cpp
             extensions/llama-execution-extension.cpp
+            extensions/gptoss/gptoss-extension.cpp
+            extensions/gptoss/gptoss-repack-hip.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp
@@ -56,6 +63,7 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+target_link_libraries(llama PRIVATE hip::host)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
