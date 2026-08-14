@@ -3,17 +3,29 @@
 #include "extensions/llama-execution-extension.h"
 #include "ggml.h"
 #include "gptoss-repack-hip.h"
+#include "llama-context.h"
 #include "llama-model.h"
 
 #include <hip/hip_runtime_api.h>
 
 #include <cstring>
 
+#define GPTOSS_AOT_DIR "/app/llama.cpp/src/extensions/gptoss/build/gfx1201"
+
 static constexpr uint32_t gptoss_layer_count       = 24;
 static constexpr uint32_t gptoss_hidden_size       = 2880;
 static constexpr uint32_t gptoss_intermediate_size = 2880;
 static constexpr uint32_t gptoss_expert_count      = 32;
 static constexpr uint32_t gptoss_expert_used_count = 4;
+
+struct gptoss_context_state {
+    hipModule_t q8_qkv_module      = nullptr;
+    hipModule_t q8_attn_out_module = nullptr;
+    hipModule_t fa_full_module     = nullptr;
+    hipModule_t fa_sw128_module    = nullptr;
+    hipModule_t ogs_w13_module     = nullptr;
+    hipModule_t ogs_w2_module      = nullptr;
+};
 
 static bool gptoss_model_init(llama_model * model) {
     const llama_hparams & hparams = model->hparams;
@@ -55,11 +67,52 @@ static bool gptoss_model_init(llama_model * model) {
     return success && synchronized && freed;
 }
 
-static bool gptoss_context_init(llama_context *) {
-    return false;
+static void gptoss_context_free(llama_context * ctx) {
+    auto * state = static_cast<gptoss_context_state *>(ctx->execution_extension_state);
+
+    if (state == nullptr) {
+        return;
+    }
+
+    if (state->q8_qkv_module != nullptr) {
+        (void) hipModuleUnload(state->q8_qkv_module);
+    }
+    if (state->q8_attn_out_module != nullptr) {
+        (void) hipModuleUnload(state->q8_attn_out_module);
+    }
+    if (state->fa_full_module != nullptr) {
+        (void) hipModuleUnload(state->fa_full_module);
+    }
+    if (state->fa_sw128_module != nullptr) {
+        (void) hipModuleUnload(state->fa_sw128_module);
+    }
+    if (state->ogs_w13_module != nullptr) {
+        (void) hipModuleUnload(state->ogs_w13_module);
+    }
+    if (state->ogs_w2_module != nullptr) {
+        (void) hipModuleUnload(state->ogs_w2_module);
+    }
+
+    delete state;
+    ctx->execution_extension_state = nullptr;
 }
 
-static void gptoss_context_free(llama_context *) {}
+static bool gptoss_context_init(llama_context * ctx) {
+    auto * state                   = new gptoss_context_state;
+    ctx->execution_extension_state = state;
+
+    if (hipModuleLoad(&state->q8_qkv_module, GPTOSS_AOT_DIR "/q8_qkv.hsaco") != hipSuccess ||
+        hipModuleLoad(&state->q8_attn_out_module, GPTOSS_AOT_DIR "/q8_attn_out.hsaco") != hipSuccess ||
+        hipModuleLoad(&state->fa_full_module, GPTOSS_AOT_DIR "/fa_full.hsaco") != hipSuccess ||
+        hipModuleLoad(&state->fa_sw128_module, GPTOSS_AOT_DIR "/fa_sw128.hsaco") != hipSuccess ||
+        hipModuleLoad(&state->ogs_w13_module, GPTOSS_AOT_DIR "/ogs_w13.hsaco") != hipSuccess ||
+        hipModuleLoad(&state->ogs_w2_module, GPTOSS_AOT_DIR "/ogs_w2.hsaco") != hipSuccess) {
+        gptoss_context_free(ctx);
+        return false;
+    }
+
+    return true;
+}
 
 static int gptoss_prefill(llama_context *, const llama_ubatch &, float *) {
     return -1;
