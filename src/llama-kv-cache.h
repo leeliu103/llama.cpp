@@ -370,6 +370,9 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    const llama_kv_cache * get_cache() const;
+    const llama_kv_cache::slot_info & get_slot_info() const;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;

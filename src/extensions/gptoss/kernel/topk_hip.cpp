@@ -62,8 +62,8 @@ __launch_bounds__(4 * warp_size) __global__ void gptoss_biased_topk_softmax_kern
         }
 
         if (lane == selected) {
-            selected_ids[token * expert_count + selected] = best_expert;
-            selected_logit                                = best_logit;
+            selected_ids[token * expert_used_count + selected] = best_expert;
+            selected_logit                                     = best_logit;
         }
         if (lane == best_expert) {
             biased_logit = -INFINITY;

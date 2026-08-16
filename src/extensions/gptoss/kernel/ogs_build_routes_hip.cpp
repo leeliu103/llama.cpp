@@ -35,9 +35,7 @@ __launch_bounds__(gptoss_routing_threads, 1) __global__ void gptoss_ogs_build_ro
     __syncthreads();
 
     for (uint32_t route = thread; route < route_count; route += blockDim.x) {
-        const uint32_t token  = route / gptoss_experts_used;
-        const uint32_t slot   = route % gptoss_experts_used;
-        const int32_t  expert = expert_ids[(uint64_t) token * gptoss_expert_count + slot];
+        const int32_t expert = expert_ids[route];
         if ((uint32_t) expert < gptoss_expert_count) {
             atomicAdd(&histogram[expert], 1);
         }
@@ -65,15 +63,13 @@ __launch_bounds__(gptoss_routing_threads, 1) __global__ void gptoss_ogs_build_ro
 
     for (uint32_t route = thread; route < route_count; route += blockDim.x) {
         const uint32_t token  = route / gptoss_experts_used;
-        const uint32_t slot   = route % gptoss_experts_used;
-        const int32_t  expert = expert_ids[(uint64_t) token * gptoss_expert_count + slot];
+        const int32_t  expert = expert_ids[route];
         if ((uint32_t) expert < gptoss_expert_count) {
             const int32_t destination          = atomicAdd(&cursors[expert], 1);
             gather_token_indices[destination]  = (int32_t) token;
             scatter_route_indices[destination] = (int32_t) route;
         }
     }
-    __syncthreads();
 
     for (uint32_t expert = thread; expert < gptoss_expert_count; expert += blockDim.x) {
         const uint32_t tile_count  = ((uint32_t) histogram[expert] + gptoss_ogs_block_m - 1) / gptoss_ogs_block_m;

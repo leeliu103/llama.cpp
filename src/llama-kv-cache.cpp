@@ -2596,6 +2596,14 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
+const llama_kv_cache * llama_kv_cache_context::get_cache() const {
+    return kv;
+}
+
+const llama_kv_cache::slot_info & llama_kv_cache_context::get_slot_info() const {
+    return sinfos[i_cur];
+}
+
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }

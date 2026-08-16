@@ -1854,18 +1854,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             float * logits_out = n_outputs > 0 ? logits.data + n_outputs_prev * n_vocab : nullptr;
 
-            const int ret = ubatch.n_tokens > 1 ? extension->prefill(this, ubatch, logits_out) :
-                                                  extension->decode(this, ubatch, logits_out);
-
-            if (ret != 0) {
-                n_outputs = 0;
-                return -3;
+            if (!mctx->apply()) {
+                GGML_ABORT("%s: failed to apply execution extension memory context\n", __func__);
             }
 
-            if (!mctx->apply()) {
-                LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-                n_outputs = 0;
-                return -3;
+            const int ret = ubatch.n_tokens > 1 ? extension->prefill(this, ubatch, mctx.get(), logits_out) :
+                                                  extension->decode(this, ubatch, mctx.get(), logits_out);
+
+            if (ret != 0) {
+                GGML_ABORT("%s: execution extension failed with status %d\n", __func__, ret);
             }
 
             n_outputs_prev += n_outputs;

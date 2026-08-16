@@ -1,11 +1,9 @@
+#include "../gptoss-kernel.h"
+
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
-
-struct gptoss_rope_corr_dims {
-    float values[2];
-};
 
 namespace {
 
@@ -30,7 +28,7 @@ __device__ void rope_yarn(float                 theta_extrap,
     float       theta        = theta_interp;
 
     if (ext_factor != 0.0f) {
-        const float ramp_mix = rope_yarn_ramp(corr_dims.values[0], corr_dims.values[1], dimension) * ext_factor;
+        const float ramp_mix = rope_yarn_ramp(corr_dims.low, corr_dims.high, dimension) * ext_factor;
         theta                = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
         mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }

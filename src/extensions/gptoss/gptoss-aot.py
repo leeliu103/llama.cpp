@@ -9,7 +9,9 @@ from pathlib import Path
 os.environ["AITER_AOT_IMPORT"] = "1"
 
 import triton
-from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd
+from aiter.ops.triton._triton_kernels.attention.unified_attention import (
+    kernel_unified_attention_2d,
+)
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource, make_backend
 from triton_kernels.matmul_details._matmul import _matmul as _ogs_matmul
@@ -92,76 +94,79 @@ def _fa_compiler_options(num_warps, num_stages, waves_per_eu):
 
 def _fa_kernel_constants(
     *,
-    query_heads,
-    key_value_heads,
-    head_size,
     block_m,
-    block_n,
     sliding_window,
 ):
-    query_size = query_heads * head_size
-    key_value_size = key_value_heads * head_size
-
     return {
-        "descale_q_ptr": None,
-        "descale_k_ptr": None,
-        "descale_v_ptr": None,
         "alibi_slopes_ptr": None,
-        "s_dmask_ptr": None,
-        "dropout_mask_ptr": None,
-        "softmax_lse_ptr": None,
-        "stride_qz_in": 0,
-        "stride_qh_in": head_size,
-        "stride_qm_in": query_size,
-        "stride_qk_in": 1,
-        "stride_kz_in": 0,
-        "stride_kh_in": head_size,
-        "stride_kn_in": key_value_size,
-        "stride_kk_in": 1,
-        "stride_vz_in": 0,
-        "stride_vh_in": head_size,
-        "stride_vn_in": key_value_size,
-        "stride_vk_in": 1,
-        "stride_descale_q_z_in": 0,
-        "stride_descale_k_z_in": 0,
-        "stride_descale_v_z_in": 0,
-        "stride_oz_in": 0,
-        "stride_oh_in": head_size,
-        "stride_om_in": query_size,
-        "stride_on_in": 1,
-        "stride_alibi_z_in": 0,
-        "stride_alibi_h_in": 0,
-        "stride_sd_z_in": 0,
-        "stride_sd_h_in": 0,
-        "stride_sd_m_in": 0,
-        "stride_sd_n_in": 0,
-        "stride_lse_z_in": 0,
-        "stride_lse_h_in": 0,
-        "stride_lse_m_in": 1,
-        "dropout_p": 0.0,
-        "philox_seed": 0,
-        "philox_offset_base_in": 0,
-        "IS_CAUSAL": True,
-        "NUM_Q_HEADS": query_heads,
-        "NUM_K_HEADS": key_value_heads,
-        "PRELOAD_V": False,
-        "BLOCK_M": block_m,
-        "BLOCK_N": block_n,
-        "BLOCK_DMODEL": head_size,
-        "BLOCK_DMODEL_POW2": head_size,
-        "BLOCK_DMODEL_PE": 0,
-        "RETURN_SCORES": False,
-        "ENABLE_DROPOUT": False,
-        "IS_FP8": False,
-        "FP8_MAX": 65504.0,
-        "VARLEN": True,
-        "NUM_XCD": 1,
-        "SWIZZLE": "default",
-        "USE_INT64_STRIDES": False,
-        "ENABLE_SINK": True,
+        "qq_bias_ptr": None,
+        "scale": 0.125,
+        "q_descale_ptr": None,
+        "k_descale_ptr": None,
+        "v_descale_ptr": None,
+        "out_scale_ptr": None,
+        "softcap": 0.0,
+        "num_query_heads": 64,
+        "num_queries_per_kv": 8,
+        "query_stride_0": 4096,
+        "query_stride_1": 64,
+        "output_stride_0": 4096,
+        "output_stride_1": 64,
+        "qq_bias_stride_0": 0,
+        "BLOCK_SIZE": 1,
+        "TILE_SIZE": 32,
+        "HEAD_SIZE": 64,
+        "HEAD_SIZE_PADDED": 64,
+        "USE_ALIBI_SLOPES": False,
+        "USE_QQ_BIAS": False,
+        "USE_SOFTCAP": False,
+        "USE_SINKS": True,
         "SLIDING_WINDOW": sliding_window,
-        "HEAD_STRIDE_ALIGNED_8": True,
+        "stride_k_cache_0": 512,
+        "stride_k_cache_1": 512,
+        "stride_k_cache_2": 64,
+        "stride_k_cache_3": 1,
+        "stride_v_cache_0": 512,
+        "stride_v_cache_1": 512,
+        "stride_v_cache_2": 64,
+        "stride_v_cache_3": 1,
+        "BLOCK_Q": block_m // 8,
+        "BLOCK_M": block_m,
+        "FP8_MIN": -448.0,
+        "FP8_MAX": 448.0,
+        "ALL_DECODE": False,
+        "SHUFFLED_KV_CACHE": False,
+        "K_WIDTH": 0,
     }
+
+
+def _fa_kernel_spec(output_name, block_m, sliding_window):
+    return KernelSpec(
+        output_name=output_name,
+        kernel=kernel_unified_attention_2d,
+        runtime_types={
+            "output_ptr": "*fp16",
+            "query_ptr": "*fp16",
+            "key_cache_ptr": "*fp16",
+            "value_cache_ptr": "*fp16",
+            "sink_ptr": "*fp32",
+            "block_tables_ptr": "*i32",
+            "seq_lens_ptr": "*i32",
+            "block_table_stride": "i64",
+            "query_start_len_ptr": "*i32",
+            "num_seqs": "i32",
+        },
+        kernel_constants=_fa_kernel_constants(
+            block_m=block_m,
+            sliding_window=sliding_window,
+        ),
+        compiler_options=_fa_compiler_options(
+            num_warps=4 if block_m == 64 else 2,
+            num_stages=1,
+            waves_per_eu=6,
+        ),
+        assume_32_bit_pointer_range=False,
+    )
 
 
 def _ogs_kernel_constants(
@@ -331,68 +336,10 @@ def _build_kernel_specs():
             ),
             assume_32_bit_pointer_range=True,
         ),
-        KernelSpec(
-            output_name="fa_full.hsaco",
-            kernel=_attn_fwd,
-            runtime_types={
-                "q_ptr": "*fp16",
-                "k_ptr": "*fp16",
-                "v_ptr": "*fp16",
-                "out_ptr": "*fp16",
-                "sink_ptr": "*fp32",
-                "sm_scale": "fp32",
-                "cu_seqlens_q": "*i32",
-                "cu_seqlens_k": "*i32",
-                "SEQLEN_Q": "i32",
-                "SEQLEN_K": "i32",
-                "BATCH": "i32",
-            },
-            kernel_constants=_fa_kernel_constants(
-                query_heads=64,
-                key_value_heads=8,
-                head_size=64,
-                block_m=64,
-                block_n=32,
-                sliding_window=0,
-            ),
-            compiler_options=_fa_compiler_options(
-                num_warps=2,
-                num_stages=1,
-                waves_per_eu=1,
-            ),
-            assume_32_bit_pointer_range=False,
-        ),
-        KernelSpec(
-            output_name="fa_sw128.hsaco",
-            kernel=_attn_fwd,
-            runtime_types={
-                "q_ptr": "*fp16",
-                "k_ptr": "*fp16",
-                "v_ptr": "*fp16",
-                "out_ptr": "*fp16",
-                "sink_ptr": "*fp32",
-                "sm_scale": "fp32",
-                "cu_seqlens_q": "*i32",
-                "cu_seqlens_k": "*i32",
-                "SEQLEN_Q": "i32",
-                "SEQLEN_K": "i32",
-                "BATCH": "i32",
-            },
-            kernel_constants=_fa_kernel_constants(
-                query_heads=64,
-                key_value_heads=8,
-                head_size=64,
-                block_m=32,
-                block_n=32,
-                sliding_window=128 - 1,
-            ),
-            compiler_options=_fa_compiler_options(
-                num_warps=2,
-                num_stages=1,
-                waves_per_eu=0,
-            ),
-            assume_32_bit_pointer_range=False,
-        ),
+        _fa_kernel_spec("fa_full_small.hsaco", 16, 0),
+        _fa_kernel_spec("fa_full.hsaco", 64, 0),
+        _fa_kernel_spec("fa_sw128_small.hsaco", 16, 128),
+        _fa_kernel_spec("fa_sw128.hsaco", 64, 128),
         KernelSpec(
             output_name="ogs_w13.hsaco",
             kernel=ogs_w13,
@@ -486,7 +433,7 @@ def _build_kernel_specs():
     )
 
 
-def _compile_kernel(output_dir, backend, target, spec):
+def _compile_kernel(backend, target, spec):
     runtime_names = set(spec.runtime_types)
     constant_names = set(spec.kernel_constants)
     overlap = runtime_names & constant_names
@@ -538,9 +485,7 @@ def _compile_kernel(output_dir, backend, target, spec):
     ):
         raise RuntimeError(f"{spec.output_name}: unexpected Triton scratch")
 
-    (output_dir / spec.output_name).write_bytes(
-        compiled.asm[backend.binary_ext]
-    )
+    return compiled.asm[backend.binary_ext]
 
 
 def _compile_arch(arch, specs):
@@ -549,23 +494,25 @@ def _compile_arch(arch, specs):
 
     target = GPUTarget("hip", arch, 32)
     backend = make_backend(target)
-    for spec in specs:
-        _compile_kernel(output_dir, backend, target, spec)
+    binaries = [
+        (spec.output_name, _compile_kernel(backend, target, spec))
+        for spec in specs
+    ]
+    for name, binary in binaries:
+        (output_dir / name).write_bytes(binary)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--arch",
-        action="append",
-        choices=("gfx1100", "gfx1201"),
+        choices=("gfx1201",),
         required=True,
     )
     args = parser.parse_args()
 
     specs = _build_kernel_specs()
-    for arch in dict.fromkeys(args.arch):
-        _compile_arch(arch, specs)
+    _compile_arch(args.arch, specs)
 
 
 if __name__ == "__main__":

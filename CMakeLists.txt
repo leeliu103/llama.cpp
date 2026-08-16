@@ -204,6 +204,7 @@ endif()
 
 enable_language(HIP)
 find_package(hip REQUIRED)
+find_package(hipblas REQUIRED)
 
 #
 # build the library
