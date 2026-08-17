@@ -15,7 +15,7 @@ struct gptoss_rope_corr_dims {
 struct gptoss_decode_layer_params {
     float *       next;
     const float * cur;
-    float *       tmp;
+    float *       rms_partials;
 
     __half * activation_scratch;
     __half * query;

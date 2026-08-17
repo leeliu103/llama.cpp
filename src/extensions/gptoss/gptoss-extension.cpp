@@ -40,7 +40,6 @@ constexpr uint32_t gptoss_expert_count          = 32;
 constexpr uint32_t gptoss_expert_used_count     = 4;
 constexpr uint32_t gptoss_vocabulary_size       = 201088;
 constexpr uint32_t gptoss_swa_size              = 128;
-constexpr uint32_t gptoss_decode_tmp_size       = 320;
 constexpr uint32_t gptoss_max_attention_parts   = 12;
 constexpr uint32_t gptoss_quant_block_size      = 32;
 constexpr uint32_t gptoss_ogs_block_m           = 64;
@@ -611,7 +610,7 @@ struct gptoss_decode_buffers {
 
     float *   cur;
     float *   next;
-    float *   tmp;
+    float *   rms_partials;
     __half *  activation_scratch;
     __half *  query;
     float *   router_scores;
@@ -644,7 +643,7 @@ gptoss_decode_buffers gptoss_make_decode_buffers(void *   workspace,
     result.swa_rows         = result.base_rows == nullptr ? nullptr : result.base_rows + n_base_rows;
     result.cur              = arena.take<float>(gptoss_hidden_size);
     result.next             = arena.take<float>(gptoss_hidden_size);
-    result.tmp              = arena.take<float>(gptoss_decode_tmp_size);
+    result.rms_partials     = arena.take<float>(gptoss_decode_grid_blocks);
     result.activation_scratch =
         arena.take<__half>(gptoss_hidden_size * (1 + gptoss_expert_used_count));
     result.query            = arena.take<__half>(gptoss_query_size);
@@ -1327,7 +1326,7 @@ int gptoss_decode(llama_context *                ctx,
         gptoss_decode_layer_params params = {};
         params.next                      = next;
         params.cur                       = current;
-        params.tmp                       = buffers.tmp;
+        params.rms_partials              = buffers.rms_partials;
         params.activation_scratch        = buffers.activation_scratch;
         params.query                     = buffers.query;
         params.attn_parts                = buffers.attention_parts;
