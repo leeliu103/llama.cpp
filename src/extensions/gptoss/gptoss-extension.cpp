@@ -514,7 +514,6 @@ bool gptoss_get_kv(const llama_kv_cache * cache, uint32_t layer, __half *& k, __
 struct gptoss_prefill_buffers {
     int32_t * tokens;
     int32_t * positions;
-    int32_t * output_rows;
 
     int64_t * base_write_rows;
     int64_t * swa_write_rows;
@@ -552,7 +551,7 @@ struct gptoss_prefill_buffers {
 
 gptoss_prefill_buffers gptoss_make_prefill_buffers(void *   workspace,
                                                    uint32_t n_tokens,
-                                                   uint32_t n_outputs,
+                                                   bool     output,
                                                    uint32_t n_sequences,
                                                    uint32_t n_base_blocks,
                                                    uint32_t n_swa_blocks) {
@@ -564,7 +563,6 @@ gptoss_prefill_buffers gptoss_make_prefill_buffers(void *   workspace,
 
     result.tokens             = arena.take<int32_t>(n_tokens);
     result.positions          = arena.take<int32_t>(n_tokens);
-    result.output_rows        = arena.take<int32_t>(n_outputs);
     result.base_write_rows    = arena.take<int64_t>(n_tokens);
     result.swa_write_rows     = arena.take<int64_t>(n_tokens);
     result.base_block_table   = arena.take<int32_t>(n_base_blocks);
@@ -590,8 +588,8 @@ gptoss_prefill_buffers gptoss_make_prefill_buffers(void *   workspace,
     result.block_schedule     = arena.take<int32_t>(schedule_capacity);
     result.expert_activations = arena.take<__half>(static_cast<size_t>(route_count) * gptoss_intermediate_size);
     result.expert_outputs     = arena.take<float>(static_cast<size_t>(route_count) * gptoss_hidden_size);
-    result.final_q8           = arena.take<uint8_t>(n_outputs > 0 ? gptoss_q8_1_row_size : 0);
-    result.logits             = arena.take<float>(n_outputs > 0 ? gptoss_vocabulary_size : 0);
+    result.final_q8           = arena.take<uint8_t>(output ? gptoss_q8_1_row_size : 0);
+    result.logits             = arena.take<float>(output ? gptoss_vocabulary_size : 0);
     result.size               = arena.offset;
 
     return result;
@@ -599,7 +597,6 @@ gptoss_prefill_buffers gptoss_make_prefill_buffers(void *   workspace,
 
 struct gptoss_decode_buffers {
     int32_t * token;
-    int32_t * output_row;
     int32_t * base_rows;
     int32_t * swa_rows;
 
@@ -633,7 +630,6 @@ gptoss_decode_buffers gptoss_make_decode_buffers(void *   workspace,
     gptoss_decode_buffers result = {};
 
     result.token            = arena.take<int32_t>(1);
-    result.output_row       = arena.take<int32_t>(output ? 1 : 0);
     result.base_rows        = arena.take<int32_t>(n_base_rows + n_swa_rows);
     result.swa_rows         = result.base_rows == nullptr ? nullptr : result.base_rows + n_base_rows;
     result.cur              = arena.take<float>(gptoss_hidden_size);
@@ -947,13 +943,13 @@ int gptoss_prefill(llama_context *                ctx,
     }
 
     auto buffers = gptoss_make_prefill_buffers(
-        nullptr, ubatch.n_tokens, static_cast<uint32_t>(output_rows.size()), static_cast<uint32_t>(spans.size()),
+        nullptr, ubatch.n_tokens, !output_rows.empty(), static_cast<uint32_t>(spans.size()),
         static_cast<uint32_t>(base_fa.block_table.size()), static_cast<uint32_t>(swa_fa.block_table.size()));
     if (!gptoss_workspace_reserve(state, buffers.size)) {
         return -1;
     }
     buffers =
-        gptoss_make_prefill_buffers(state->workspace, ubatch.n_tokens, static_cast<uint32_t>(output_rows.size()),
+        gptoss_make_prefill_buffers(state->workspace, ubatch.n_tokens, !output_rows.empty(),
                                     static_cast<uint32_t>(spans.size()),
                                     static_cast<uint32_t>(base_fa.block_table.size()),
                                     static_cast<uint32_t>(swa_fa.block_table.size()));
@@ -987,11 +983,7 @@ int gptoss_prefill(llama_context *                ctx,
                        "base lengths upload") ||
         !gptoss_hip_ok(hipMemcpyAsync(buffers.swa_seq_lens, swa.seq_lens.data(),
                                       swa.seq_lens.size() * sizeof(int32_t), hipMemcpyHostToDevice, state->stream),
-                       "SWA lengths upload") ||
-        (!output_rows.empty() &&
-         !gptoss_hip_ok(hipMemcpyAsync(buffers.output_rows, output_rows.data(), output_rows.size() * sizeof(int32_t),
-                                       hipMemcpyHostToDevice, state->stream),
-                        "output-row upload"))) {
+                       "SWA lengths upload")) {
         return -1;
     }
 
@@ -1193,10 +1185,10 @@ int gptoss_prefill(llama_context *                ctx,
     for (size_t i = 0; i < output_rows.size(); ++i) {
         if (!gptoss_hip_ok(gptoss_output_rms_norm_quantize_launch(
                                buffers.cur, static_cast<const float *>(model.output_norm->data),
-                               buffers.output_rows + i, buffers.final_q8, hparams.f_norm_rms_eps, 1, state->stream),
+                               output_rows[i], buffers.final_q8, hparams.f_norm_rms_eps, state->stream),
                            "output RMS norm") ||
             !gptoss_hip_ok(gptoss_lm_head_mmvq_launch(static_cast<const uint8_t *>(model.output->data),
-                                                      buffers.final_q8, buffers.logits, 1, state->stream),
+                                                      buffers.final_q8, buffers.logits, state->stream),
                            "LM head") ||
             !gptoss_hip_ok(hipMemcpyAsync(logits_out + i * gptoss_vocabulary_size, buffers.logits,
                                           static_cast<size_t>(gptoss_vocabulary_size) * sizeof(float),
@@ -1249,7 +1241,6 @@ int gptoss_decode(llama_context *                ctx,
     }
     buffers = gptoss_make_decode_buffers(state->workspace, base.read_rows.size(), swa.read_rows.size(), output);
 
-    const int32_t       output_row = 0;
     gptoss_stream_guard stream_guard(state->stream);
     if (!gptoss_hip_ok(
             hipMemcpyAsync(buffers.token, ubatch.token, sizeof(int32_t), hipMemcpyHostToDevice, state->stream),
@@ -1259,10 +1250,7 @@ int gptoss_decode(llama_context *                ctx,
                        "base read-row upload") ||
         !gptoss_hip_ok(hipMemcpyAsync(buffers.swa_rows, swa.read_rows.data(),
                                       swa.read_rows.size() * sizeof(int32_t), hipMemcpyHostToDevice, state->stream),
-                       "SWA read-row upload") ||
-        (output && !gptoss_hip_ok(hipMemcpyAsync(buffers.output_row, &output_row, sizeof(output_row),
-                                                 hipMemcpyHostToDevice, state->stream),
-                                  "output-row upload"))) {
+                       "SWA read-row upload")) {
         return -1;
     }
 
@@ -1351,11 +1339,11 @@ int gptoss_decode(llama_context *                ctx,
 
     if (output) {
         if (!gptoss_hip_ok(gptoss_output_rms_norm_quantize_launch(
-                               current, static_cast<const float *>(model.output_norm->data), buffers.output_row,
-                               buffers.final_q8, hparams.f_norm_rms_eps, 1, state->stream),
+                               current, static_cast<const float *>(model.output_norm->data), 0, buffers.final_q8,
+                               hparams.f_norm_rms_eps, state->stream),
                            "output RMS norm") ||
             !gptoss_hip_ok(gptoss_lm_head_mmvq_launch(static_cast<const uint8_t *>(model.output->data),
-                                                      buffers.final_q8, buffers.logits, 1, state->stream),
+                                                      buffers.final_q8, buffers.logits, state->stream),
                            "LM head") ||
             !gptoss_hip_ok(
                                hipMemcpyAsync(logits_out, buffers.logits, static_cast<size_t>(gptoss_vocabulary_size) * sizeof(float),

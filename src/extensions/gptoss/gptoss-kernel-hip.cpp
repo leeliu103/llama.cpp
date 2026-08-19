@@ -33,7 +33,7 @@ __global__ void gptoss_ogs_build_routes(const int32_t *,
 __global__ void gptoss_moe_combine_residual_f32(float *, const float *, const float *, const float *, uint32_t);
 __global__ void gptoss_output_rms_norm_quantize_q8_1_kernel(const float *,
                                                             const float *,
-                                                            const int32_t *,
+                                                            int32_t,
                                                             uint8_t *,
                                                             float);
 __global__ void gptoss_lm_head_mmvq_q8_0_kernel(const uint8_t *, const uint8_t *, float *);
@@ -144,23 +144,20 @@ hipError_t gptoss_moe_combine_launch(float *       output,
 
 hipError_t gptoss_output_rms_norm_quantize_launch(const float *   hidden,
                                                   const float *   weight,
-                                                  const int32_t * output_rows,
+                                                  int32_t         input_row,
                                                   uint8_t *       output,
                                                   float           eps,
-                                                  uint32_t        n_outputs,
                                                   hipStream_t     stream) {
-    hipLaunchKernelGGL(gptoss_output_rms_norm_quantize_q8_1_kernel, dim3(n_outputs), dim3(1024), 0, stream, hidden,
-                       weight, output_rows, output, eps);
+    hipLaunchKernelGGL(gptoss_output_rms_norm_quantize_q8_1_kernel, dim3(1), dim3(1024), 0, stream, hidden, weight,
+                       input_row, output, eps);
     return hipGetLastError();
 }
 
 hipError_t gptoss_lm_head_mmvq_launch(const uint8_t * weight,
                                       const uint8_t * activation,
                                       float *         logits,
-                                      uint32_t        n_outputs,
                                       hipStream_t     stream) {
-    hipLaunchKernelGGL(gptoss_lm_head_mmvq_q8_0_kernel, dim3(201088, n_outputs), dim3(256), 0, stream, weight,
-                       activation, logits);
+    hipLaunchKernelGGL(gptoss_lm_head_mmvq_q8_0_kernel, dim3(201088), dim3(256), 0, stream, weight, activation, logits);
     return hipGetLastError();
 }
 

@@ -6,7 +6,6 @@
 namespace {
 
 constexpr int hidden_size      = 2880;
-constexpr int vocabulary_size  = 201088;
 constexpr int block_size       = 256;
 constexpr int warp_size        = 32;
 constexpr int warp_count       = block_size / warp_size;
@@ -61,15 +60,13 @@ __launch_bounds__(block_size) __global__ void gptoss_lm_head_mmvq_q8_0_kernel(co
     __shared__ float warp_sums[warp_count - 1][warp_size];
 
     const int vocabulary_row = blockIdx.x;
-    const int output_row     = blockIdx.y;
     const int thread         = threadIdx.x;
     const int lane           = thread % warp_size;
     const int warp           = thread / warp_size;
 
     const block_q8_0 * weight_row =
         reinterpret_cast<const block_q8_0 *>(weight) + static_cast<uint64_t>(vocabulary_row) * blocks_per_row;
-    const block_q8_1 * activation_row =
-        reinterpret_cast<const block_q8_1 *>(activation) + static_cast<uint64_t>(output_row) * blocks_per_row;
+    const block_q8_1 * activation_row = reinterpret_cast<const block_q8_1 *>(activation);
 
     float sum = 0.0f;
 
@@ -107,6 +104,6 @@ __launch_bounds__(block_size) __global__ void gptoss_lm_head_mmvq_q8_0_kernel(co
     sum = warp_sum(sum);
 
     if (lane == 0) {
-        logits[static_cast<uint64_t>(output_row) * vocabulary_size + vocabulary_row] = sum;
+        logits[vocabulary_row] = sum;
     }
 }

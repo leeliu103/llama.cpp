@@ -127,16 +127,14 @@ hipError_t gptoss_moe_combine_launch(float *       output,
 
 hipError_t gptoss_output_rms_norm_quantize_launch(const float *   hidden,
                                                   const float *   weight,
-                                                  const int32_t * output_rows,
+                                                  int32_t         input_row,
                                                   uint8_t *       output,
                                                   float           eps,
-                                                  uint32_t        n_outputs,
                                                   hipStream_t     stream);
 
 hipError_t gptoss_lm_head_mmvq_launch(const uint8_t * weight,
                                       const uint8_t * activation,
                                       float *         logits,
-                                      uint32_t        n_outputs,
                                       hipStream_t     stream);
 
 hipError_t gptoss_decode_layer_launch(bool swa, const gptoss_decode_layer_params & params, hipStream_t stream);
