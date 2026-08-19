@@ -362,7 +362,7 @@ bool gptoss_build_kv_layout(const llama_ubatch &                      ubatch,
     const auto * cache = context->get_cache();
     const auto & slot  = context->get_slot_info();
 
-    if (cache == nullptr || slot.empty() || slot.n_stream() * slot.size() != ubatch.n_tokens) {
+    if (cache == nullptr || cache->get_has_shift() || slot.empty() || slot.n_stream() * slot.size() != ubatch.n_tokens) {
         return false;
     }
 
@@ -396,7 +396,8 @@ bool gptoss_build_kv_layout(const llama_ubatch &                      ubatch,
 
         const llama_pos first_position = ubatch.pos[span.begin];
         const llama_pos last_position  = ubatch.pos[span.begin + span.size - 1];
-        const llama_pos first_visible  = sliding_window ? first_position - (gptoss_swa_size - 1) : 0;
+        const llama_pos first_visible =
+            sliding_window ? first_position - static_cast<llama_pos>(gptoss_swa_size - 1) : 0;
         const auto &    cells          = cache->get_cells(span.sequence);
 
         std::vector<cell_row> rows;
@@ -553,8 +554,8 @@ gptoss_prefill_buffers gptoss_make_prefill_buffers(void *   workspace,
                                                    uint32_t n_tokens,
                                                    bool     output,
                                                    uint32_t n_sequences,
-                                                   uint32_t n_base_blocks,
-                                                   uint32_t n_swa_blocks) {
+                                                   uint32_t n_base_table_elements,
+                                                   uint32_t n_swa_table_elements) {
     const uint32_t route_count = n_tokens * gptoss_expert_used_count;
     const uint32_t schedule_capacity =
         (route_count + gptoss_ogs_block_m - 1) / gptoss_ogs_block_m + gptoss_expert_count - 1;
@@ -565,8 +566,8 @@ gptoss_prefill_buffers gptoss_make_prefill_buffers(void *   workspace,
     result.positions          = arena.take<int32_t>(n_tokens);
     result.base_write_rows    = arena.take<int64_t>(n_tokens);
     result.swa_write_rows     = arena.take<int64_t>(n_tokens);
-    result.base_block_table   = arena.take<int32_t>(n_base_blocks);
-    result.swa_block_table    = arena.take<int32_t>(n_swa_blocks);
+    result.base_block_table   = arena.take<int32_t>(n_base_table_elements);
+    result.swa_block_table    = arena.take<int32_t>(n_swa_table_elements);
     result.cu_seqlens_q       = arena.take<int32_t>(n_sequences + 1);
     result.base_seq_lens      = arena.take<int32_t>(n_sequences);
     result.swa_seq_lens       = arena.take<int32_t>(n_sequences);
