@@ -53,9 +53,18 @@ constexpr uint32_t gptoss_ogs_shared_memory     = 16384;
 constexpr size_t gptoss_qkv_values_size              = static_cast<size_t>(gptoss_qkv_size) * gptoss_hidden_size;
 constexpr size_t gptoss_attention_output_values_size = static_cast<size_t>(gptoss_hidden_size) * gptoss_query_size;
 
-constexpr size_t gptoss_moe_down_scales_offset    = 150994944;
-constexpr size_t gptoss_moe_gate_up_values_offset = 160432128;
-constexpr size_t gptoss_moe_gate_up_scales_offset = 462422016;
+constexpr size_t gptoss_ogs_alignment     = 256;
+constexpr size_t gptoss_mxfp4_block_size  = 32;
+constexpr size_t gptoss_mxfp4_padded_size = GGML_PAD(gptoss_intermediate_size, gptoss_ogs_alignment);
+constexpr size_t gptoss_moe_down_values_size =
+    gptoss_expert_count * gptoss_mxfp4_padded_size * gptoss_mxfp4_padded_size / 2;
+constexpr size_t gptoss_moe_down_scales_size =
+    gptoss_expert_count * gptoss_mxfp4_padded_size * gptoss_mxfp4_padded_size / gptoss_mxfp4_block_size;
+constexpr size_t gptoss_moe_down_scales_offset = gptoss_moe_down_values_size;
+constexpr size_t gptoss_moe_gate_up_values_offset =
+    gptoss_moe_down_values_size + gptoss_moe_down_scales_size;
+constexpr size_t gptoss_moe_gate_up_scales_offset =
+    gptoss_moe_gate_up_values_offset + 2 * gptoss_moe_down_values_size;
 
 constexpr size_t gptoss_q8_1_row_size = static_cast<size_t>(gptoss_hidden_size / gptoss_quant_block_size) * 36;
 
@@ -1362,14 +1371,12 @@ size_t gptoss_tensor_alloc_size(const ggml_tensor * tensor) {
         return 0;
     }
 
-    constexpr size_t ogs_alignment = 256;
-
     const size_t hidden       = static_cast<size_t>(tensor->ne[0]);
     const size_t intermediate = static_cast<size_t>(tensor->ne[1]);
     const size_t n_experts    = static_cast<size_t>(tensor->ne[2]);
 
-    const size_t padded_hidden       = GGML_PAD(hidden, ogs_alignment);
-    const size_t padded_intermediate = GGML_PAD(intermediate, ogs_alignment);
+    const size_t padded_hidden       = GGML_PAD(hidden, gptoss_ogs_alignment);
+    const size_t padded_intermediate = GGML_PAD(intermediate, gptoss_ogs_alignment);
 
     const size_t packed_gate_size = n_experts * padded_intermediate * ggml_row_size(tensor->type, padded_hidden);
     const size_t packed_up_size   = packed_gate_size;
