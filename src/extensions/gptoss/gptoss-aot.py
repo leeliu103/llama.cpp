@@ -81,22 +81,7 @@ def _matmul_compiler_options(num_warps, num_stages, waves_per_eu):
     }
 
 
-def _fa_compiler_options(num_warps, num_stages, waves_per_eu):
-    return {
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "waves_per_eu": waves_per_eu,
-        "num_ctas": 1,
-        "matrix_instr_nonkdim": 0,
-        "kpack": 1,
-    }
-
-
-def _fa_kernel_constants(
-    *,
-    block_m,
-    sliding_window,
-):
+def _fa_kernel_constants(*, sliding_window):
     return {
         "alibi_slopes_ptr": None,
         "qq_bias_ptr": None,
@@ -130,8 +115,8 @@ def _fa_kernel_constants(
         "stride_v_cache_1": 512,
         "stride_v_cache_2": 64,
         "stride_v_cache_3": 1,
-        "BLOCK_Q": block_m // 8,
-        "BLOCK_M": block_m,
+        "BLOCK_Q": 8,
+        "BLOCK_M": 64,
         "FP8_MIN": -448.0,
         "FP8_MAX": 448.0,
         "ALL_DECODE": False,
@@ -140,7 +125,7 @@ def _fa_kernel_constants(
     }
 
 
-def _fa_kernel_spec(output_name, block_m, sliding_window):
+def _fa_kernel_spec(output_name, sliding_window):
     return KernelSpec(
         output_name=output_name,
         kernel=kernel_unified_attention_2d,
@@ -156,15 +141,15 @@ def _fa_kernel_spec(output_name, block_m, sliding_window):
             "query_start_len_ptr": "*i32",
             "num_seqs": "i32",
         },
-        kernel_constants=_fa_kernel_constants(
-            block_m=block_m,
-            sliding_window=sliding_window,
-        ),
-        compiler_options=_fa_compiler_options(
-            num_warps=4 if block_m == 64 else 2,
-            num_stages=1,
-            waves_per_eu=6,
-        ),
+        kernel_constants=_fa_kernel_constants(sliding_window=sliding_window),
+        compiler_options={
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 6,
+            "num_ctas": 1,
+            "matrix_instr_nonkdim": 0,
+            "kpack": 1,
+        },
         assume_32_bit_pointer_range=False,
     )
 
@@ -336,10 +321,8 @@ def _build_kernel_specs():
             ),
             assume_32_bit_pointer_range=True,
         ),
-        _fa_kernel_spec("fa_full_small.hsaco", 16, 0),
-        _fa_kernel_spec("fa_full.hsaco", 64, 0),
-        _fa_kernel_spec("fa_sw128_small.hsaco", 16, 128),
-        _fa_kernel_spec("fa_sw128.hsaco", 64, 128),
+        _fa_kernel_spec("fa_full.hsaco", 0),
+        _fa_kernel_spec("fa_sw128.hsaco", 128),
         KernelSpec(
             output_name="ogs_w13.hsaco",
             kernel=ogs_w13,

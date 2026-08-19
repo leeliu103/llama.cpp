@@ -45,9 +45,9 @@ constexpr uint32_t gptoss_quant_block_size      = 32;
 constexpr uint32_t gptoss_ogs_block_m           = 64;
 constexpr uint32_t gptoss_q8_shared_memory      = 16384;
 constexpr uint32_t gptoss_fa_tile_size          = 32;
-constexpr uint32_t gptoss_fa_large_query        = 256;
-constexpr uint32_t gptoss_fa_small_shared_memory = 4096;
-constexpr uint32_t gptoss_fa_large_shared_memory = 8192;
+constexpr uint32_t gptoss_fa_block_q            = 8;
+constexpr uint32_t gptoss_fa_threads            = 128;
+constexpr uint32_t gptoss_fa_shared_memory      = 8192;
 constexpr uint32_t gptoss_ogs_shared_memory     = 16384;
 
 constexpr size_t gptoss_qkv_values_size              = static_cast<size_t>(gptoss_qkv_size) * gptoss_hidden_size;
@@ -67,18 +67,14 @@ struct gptoss_context_state {
 
     hipModule_t q8_qkv_module      = nullptr;
     hipModule_t q8_attn_out_module = nullptr;
-    hipModule_t fa_full_small_module = nullptr;
     hipModule_t fa_full_module     = nullptr;
-    hipModule_t fa_swa_small_module = nullptr;
     hipModule_t fa_swa_module      = nullptr;
     hipModule_t ogs_w13_module     = nullptr;
     hipModule_t ogs_w2_module      = nullptr;
 
     hipFunction_t q8_qkv      = nullptr;
     hipFunction_t q8_attn_out = nullptr;
-    hipFunction_t fa_full_small = nullptr;
     hipFunction_t fa_full     = nullptr;
-    hipFunction_t fa_swa_small = nullptr;
     hipFunction_t fa_swa      = nullptr;
     hipFunction_t ogs_w13     = nullptr;
     hipFunction_t ogs_w2      = nullptr;
@@ -194,8 +190,6 @@ hipError_t gptoss_aot_launch(hipFunction_t function,
 
 hipError_t gptoss_fa_launch(hipFunction_t function,
                             uint32_t      query_blocks,
-                            uint32_t      threads,
-                            uint32_t      shared_memory,
                             gptoss_fa_args & args,
                             hipStream_t   stream) {
     size_t args_size = sizeof(args);
@@ -204,7 +198,8 @@ hipError_t gptoss_fa_launch(hipFunction_t function,
     };
 
     return hipModuleLaunchKernel(
-        function, gptoss_kv_head_count, query_blocks, 1, threads, 1, 1, shared_memory, stream, nullptr, config);
+        function, gptoss_kv_head_count, query_blocks, 1, gptoss_fa_threads, 1, 1, gptoss_fa_shared_memory, stream,
+        nullptr, config);
 }
 
 hipError_t gptoss_q8_qkv_launch(
@@ -689,14 +684,8 @@ void gptoss_context_free(llama_context * ctx) {
     if (state->q8_attn_out_module != nullptr) {
         (void) hipModuleUnload(state->q8_attn_out_module);
     }
-    if (state->fa_full_small_module != nullptr) {
-        (void) hipModuleUnload(state->fa_full_small_module);
-    }
     if (state->fa_full_module != nullptr) {
         (void) hipModuleUnload(state->fa_full_module);
-    }
-    if (state->fa_swa_small_module != nullptr) {
-        (void) hipModuleUnload(state->fa_swa_small_module);
     }
     if (state->fa_swa_module != nullptr) {
         (void) hipModuleUnload(state->fa_swa_module);
@@ -888,12 +877,8 @@ bool gptoss_context_init(llama_context * ctx) {
         hipModuleLoad(&state->q8_attn_out_module, GPTOSS_AOT_DIR "/q8_attn_out.hsaco") != hipSuccess ||
         hipModuleGetFunction(&state->q8_attn_out, state->q8_attn_out_module,
                              "gptoss_q8_0_w8a16_attn_output_bias_residual") != hipSuccess ||
-        hipModuleLoad(&state->fa_full_small_module, GPTOSS_AOT_DIR "/fa_full_small.hsaco") != hipSuccess ||
-        hipModuleGetFunction(&state->fa_full_small, state->fa_full_small_module, gptoss_fa_name) != hipSuccess ||
         hipModuleLoad(&state->fa_full_module, GPTOSS_AOT_DIR "/fa_full.hsaco") != hipSuccess ||
         hipModuleGetFunction(&state->fa_full, state->fa_full_module, gptoss_fa_name) != hipSuccess ||
-        hipModuleLoad(&state->fa_swa_small_module, GPTOSS_AOT_DIR "/fa_sw128_small.hsaco") != hipSuccess ||
-        hipModuleGetFunction(&state->fa_swa_small, state->fa_swa_small_module, gptoss_fa_name) != hipSuccess ||
         hipModuleLoad(&state->fa_swa_module, GPTOSS_AOT_DIR "/fa_sw128.hsaco") != hipSuccess ||
         hipModuleGetFunction(&state->fa_swa, state->fa_swa_module, gptoss_fa_name) != hipSuccess ||
         hipModuleLoad(&state->ogs_w13_module, GPTOSS_AOT_DIR "/ogs_w13.hsaco") != hipSuccess ||
@@ -947,10 +932,8 @@ int gptoss_prefill(llama_context *                ctx,
     }
 
     std::vector<int32_t> cu_seqlens_q(1, 0);
-    uint32_t             max_seqlen_q = 0;
     for (const auto & span : spans) {
         cu_seqlens_q.push_back(cu_seqlens_q.back() + static_cast<int32_t>(span.size));
-        max_seqlen_q = std::max(max_seqlen_q, span.size);
     }
 
     std::vector<int32_t> output_rows;
@@ -1042,6 +1025,8 @@ int gptoss_prefill(llama_context *                ctx,
     const uint32_t route_count = ubatch.n_tokens * gptoss_expert_used_count;
     const uint32_t schedule_capacity =
         (route_count + gptoss_ogs_block_m - 1) / gptoss_ogs_block_m + gptoss_expert_count - 1;
+    const uint32_t fa_query_blocks =
+        ubatch.n_tokens / gptoss_fa_block_q + static_cast<uint32_t>(spans.size());
     const float alpha = 1.0f;
     const float beta  = 0.0f;
 
@@ -1100,16 +1085,8 @@ int gptoss_prefill(llama_context *                ctx,
             nullptr,
             nullptr,
         };
-        const bool        fa_small         = max_seqlen_q < gptoss_fa_large_query;
-        const uint32_t    fa_block_q       = fa_small ? 2 : 8;
-        const uint32_t    fa_query_blocks  = ubatch.n_tokens / fa_block_q + static_cast<uint32_t>(spans.size());
-        const uint32_t    fa_threads       = fa_small ? 64 : 128;
-        const uint32_t    fa_shared_memory = fa_small ? gptoss_fa_small_shared_memory : gptoss_fa_large_shared_memory;
-        const hipFunction_t fa_function    = is_swa ? (fa_small ? state->fa_swa_small : state->fa_swa) :
-                                                     (fa_small ? state->fa_full_small : state->fa_full);
         if (!gptoss_hip_ok(
-                gptoss_fa_launch(
-                    fa_function, fa_query_blocks, fa_threads, fa_shared_memory, fa_args, state->stream),
+                gptoss_fa_launch(is_swa ? state->fa_swa : state->fa_full, fa_query_blocks, fa_args, state->stream),
                 "flash attention")) {
             return -1;
         }
