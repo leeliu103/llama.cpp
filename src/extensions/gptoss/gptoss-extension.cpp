@@ -942,24 +942,25 @@ int gptoss_prefill(llama_context *                ctx,
         cu_seqlens_q.push_back(cu_seqlens_q.back() + static_cast<int32_t>(span.size));
     }
 
-    std::vector<int32_t> output_rows;
+    bool output = false;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         if (ubatch.output[i] != 0) {
-            output_rows.push_back(static_cast<int32_t>(i));
+            output = true;
+            break;
         }
     }
-    if ((logits_out != nullptr) != !output_rows.empty()) {
+    if ((logits_out != nullptr) != output) {
         return -1;
     }
 
     auto buffers = gptoss_make_prefill_buffers(
-        nullptr, ubatch.n_tokens, !output_rows.empty(), static_cast<uint32_t>(spans.size()),
+        nullptr, ubatch.n_tokens, output, static_cast<uint32_t>(spans.size()),
         static_cast<uint32_t>(base_fa.block_table.size()), static_cast<uint32_t>(swa_fa.block_table.size()));
     if (!gptoss_workspace_reserve(state, buffers.size)) {
         return -1;
     }
     buffers =
-        gptoss_make_prefill_buffers(state->workspace, ubatch.n_tokens, !output_rows.empty(),
+        gptoss_make_prefill_buffers(state->workspace, ubatch.n_tokens, output,
                                     static_cast<uint32_t>(spans.size()),
                                     static_cast<uint32_t>(base_fa.block_table.size()),
                                     static_cast<uint32_t>(swa_fa.block_table.size()));
@@ -1192,20 +1193,25 @@ int gptoss_prefill(llama_context *                ctx,
         }
     }
 
-    for (size_t i = 0; i < output_rows.size(); ++i) {
+    size_t output_idx = 0;
+    for (uint32_t row = 0; row < ubatch.n_tokens; ++row) {
+        if (ubatch.output[row] == 0) {
+            continue;
+        }
         if (!gptoss_hip_ok(gptoss_output_rms_norm_quantize_launch(
                                buffers.cur, static_cast<const float *>(model.output_norm->data),
-                               output_rows[i], buffers.final_q8, hparams.f_norm_rms_eps, state->stream),
+                               static_cast<int32_t>(row), buffers.final_q8, hparams.f_norm_rms_eps, state->stream),
                            "output RMS norm") ||
             !gptoss_hip_ok(gptoss_lm_head_mmvq_launch(static_cast<const uint8_t *>(model.output->data),
                                                       buffers.final_q8, buffers.logits, state->stream),
                            "LM head") ||
-            !gptoss_hip_ok(hipMemcpyAsync(logits_out + i * gptoss_vocabulary_size, buffers.logits,
+            !gptoss_hip_ok(hipMemcpyAsync(logits_out + output_idx * gptoss_vocabulary_size, buffers.logits,
                                           static_cast<size_t>(gptoss_vocabulary_size) * sizeof(float),
                                           hipMemcpyDeviceToHost, state->stream),
                            "logits download")) {
             return -1;
         }
+        ++output_idx;
     }
 
     if (!gptoss_hip_ok(stream_guard.synchronize(), "prefill synchronize")) {
