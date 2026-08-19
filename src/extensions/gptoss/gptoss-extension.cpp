@@ -18,7 +18,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -71,7 +70,6 @@ constexpr size_t gptoss_q8_1_row_size = static_cast<size_t>(gptoss_hidden_size /
 constexpr const char * gptoss_fa_name = "kernel_unified_attention_2d";
 
 struct gptoss_context_state {
-    int device = 0;
     hipStream_t stream = nullptr;
 
     hipModule_t q8_qkv_module      = nullptr;
@@ -238,19 +236,6 @@ bool gptoss_hip_ok(hipError_t error, const char * operation) {
 
     LLAMA_LOG_ERROR("gptoss: %s failed: %s\n", operation, hipGetErrorString(error));
     return false;
-}
-
-int gptoss_device(const llama_model & model) {
-    const auto * device = model.dev_layer(0);
-    auto *       reg    = ggml_backend_cuda_reg();
-
-    for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
-        if (ggml_backend_reg_dev_get(reg, i) == device) {
-            return i;
-        }
-    }
-
-    return -1;
 }
 
 struct gptoss_stream_guard {
@@ -669,7 +654,6 @@ void gptoss_context_free(llama_context * ctx) {
         return;
     }
 
-    (void) hipSetDevice(state->device);
     if (state->stream != nullptr) {
         (void) hipStreamSynchronize(state->stream);
     }
@@ -722,11 +706,11 @@ bool gptoss_model_init(llama_model * model) {
         return false;
     }
 
-    const int       device = gptoss_device(*model);
+    int             hip_device_count = 0;
     hipDeviceProp_t properties{};
-    if (device < 0 || hipSetDevice(device) != hipSuccess || hipGetDeviceProperties(&properties, device) != hipSuccess ||
-        std::strncmp(properties.gcnArchName, "gfx1201", 7) != 0 || properties.warpSize != 32 ||
-        !properties.cooperativeLaunch) {
+    if (hipGetDeviceCount(&hip_device_count) != hipSuccess || hip_device_count != 1 ||
+        ggml_backend_cuda_get_device_count() != 1 || hipGetDeviceProperties(&properties, 0) != hipSuccess ||
+        properties.warpSize != 32 || !properties.cooperativeLaunch) {
         LLAMA_LOG_ERROR("%s: unsupported device\n", __func__);
         return false;
     }
@@ -851,14 +835,8 @@ bool gptoss_context_init(llama_context * ctx) {
         return false;
     }
 
-    const int device = gptoss_device(model);
-    if (device < 0 || hipSetDevice(device) != hipSuccess) {
-        return false;
-    }
-
     auto * state                   = new gptoss_context_state;
     ctx->execution_extension_state = state;
-    state->device                  = device;
 
     if (hipStreamCreateWithFlags(&state->stream, hipStreamNonBlocking) != hipSuccess) {
         gptoss_context_free(ctx);
@@ -911,10 +889,6 @@ int gptoss_prefill(llama_context *                ctx,
         ubatch.n_tokens > std::numeric_limits<int32_t>::max() / gptoss_expert_used_count) {
         return -1;
     }
-    if (hipSetDevice(state->device) != hipSuccess) {
-        return -1;
-    }
-
     std::vector<gptoss_sequence_span> spans;
     if (!gptoss_sequence_spans(ubatch, spans)) {
         LLAMA_LOG_ERROR("%s: unsupported sequence layout\n", __func__);
@@ -1228,10 +1202,6 @@ int gptoss_decode(llama_context *                ctx,
     if (state == nullptr || ubatch.n_tokens != 1 || ubatch.token == nullptr || mctx == nullptr) {
         return -1;
     }
-    if (hipSetDevice(state->device) != hipSuccess) {
-        return -1;
-    }
-
     std::vector<gptoss_sequence_span> spans;
     if (!gptoss_sequence_spans(ubatch, spans)) {
         return -1;
