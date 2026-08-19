@@ -1,5 +1,3 @@
-#include "../gptoss-kernel.h"
-
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -18,7 +16,8 @@ __device__ float rope_yarn_ramp(float low, float high, int dimension) {
 
 __device__ void rope_yarn(float                 theta_extrap,
                           float                 freq_scale,
-                          gptoss_rope_corr_dims corr_dims,
+                          float                 corr_low,
+                          float                 corr_high,
                           int64_t               dimension,
                           float                 ext_factor,
                           float                 mscale,
@@ -28,7 +27,7 @@ __device__ void rope_yarn(float                 theta_extrap,
     float       theta        = theta_interp;
 
     if (ext_factor != 0.0f) {
-        const float ramp_mix = rope_yarn_ramp(corr_dims.low, corr_dims.high, dimension) * ext_factor;
+        const float ramp_mix = rope_yarn_ramp(corr_low, corr_high, dimension) * ext_factor;
         theta                = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
         mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
@@ -42,13 +41,13 @@ __device__ void rope_yarn(float                 theta_extrap,
 __global__ void gptoss_build_rope_cache_f32(float *               cache,
                                             const int32_t *       positions,
                                             uint32_t              n_tokens,
-                                            int                   n_dims,
                                             float                 freq_scale,
                                             float                 ext_factor,
                                             float                 attn_factor,
-                                            gptoss_rope_corr_dims corr_dims,
+                                            float                 corr_low,
+                                            float                 corr_high,
                                             float                 theta_scale) {
-    const uint32_t pairs = static_cast<uint32_t>(n_dims) / 2;
+    constexpr uint32_t pairs = attention_head_size / 2;
     const uint32_t pair  = threadIdx.x;
     const uint32_t token = blockIdx.x * blockDim.y + threadIdx.y;
 
@@ -63,7 +62,7 @@ __global__ void gptoss_build_rope_cache_f32(float *               cache,
 
     float cos_theta;
     float sin_theta;
-    rope_yarn(theta, freq_scale, corr_dims, dimension, ext_factor, attn_factor, cos_theta, sin_theta);
+    rope_yarn(theta, freq_scale, corr_low, corr_high, dimension, ext_factor, attn_factor, cos_theta, sin_theta);
 
     cache[2 * cache_idx]     = cos_theta;
     cache[2 * cache_idx + 1] = sin_theta;

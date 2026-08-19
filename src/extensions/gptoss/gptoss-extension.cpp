@@ -1012,8 +1012,8 @@ int gptoss_prefill(llama_context *                ctx,
         float       corr[2];
         ggml_rope_yarn_corr_dims(gptoss_head_size, cparams.n_ctx_orig_yarn, freq_base, cparams.yarn_beta_fast,
                                  cparams.yarn_beta_slow, corr);
-        return gptoss_build_rope_cache_launch(cache, buffers.positions, ubatch.n_tokens, gptoss_head_size, freq_scale,
-                                              cparams.yarn_ext_factor, cparams.yarn_attn_factor, { corr[0], corr[1] },
+        return gptoss_build_rope_cache_launch(cache, buffers.positions, ubatch.n_tokens, freq_scale,
+                                              cparams.yarn_ext_factor, cparams.yarn_attn_factor, corr[0], corr[1],
                                               std::pow(freq_base, -2.0f / gptoss_head_size), state->stream);
     };
 

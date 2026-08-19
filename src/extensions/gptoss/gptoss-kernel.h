@@ -7,11 +7,6 @@
 
 constexpr uint32_t gptoss_decode_grid_blocks = 120;
 
-struct gptoss_rope_corr_dims {
-    float low;
-    float high;
-};
-
 struct gptoss_decode_layer_params {
     float *       next;
     const float * cur;
@@ -88,11 +83,11 @@ hipError_t gptoss_post_attention_rms_norm_launch(const float * input,
 hipError_t gptoss_build_rope_cache_launch(float *               cache,
                                           const int32_t *       positions,
                                           uint32_t              n_tokens,
-                                          int                   n_dims,
                                           float                 freq_scale,
                                           float                 ext_factor,
                                           float                 attn_factor,
-                                          gptoss_rope_corr_dims corr_dims,
+                                          float                 corr_low,
+                                          float                 corr_high,
                                           float                 theta_scale,
                                           hipStream_t           stream);
 

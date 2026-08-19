@@ -5,8 +5,15 @@
 __global__ void gptoss_embedding_q8_0_kernel(float *, const uint8_t *, const int32_t *);
 __global__ void gptoss_attention_rms_norm_f16_kernel(const float *, const float *, __half *, float);
 __global__ void gptoss_post_attention_rms_norm_f32_f16_kernel(const float *, const float *, float *, __half *, float);
-__global__ void
-gptoss_build_rope_cache_f32(float *, const int32_t *, uint32_t, int, float, float, float, gptoss_rope_corr_dims, float);
+__global__ void gptoss_build_rope_cache_f32(float *         cache,
+                                            const int32_t * positions,
+                                            uint32_t        n_tokens,
+                                            float           freq_scale,
+                                            float           ext_factor,
+                                            float           attn_factor,
+                                            float           corr_low,
+                                            float           corr_high,
+                                            float           theta_scale);
 __global__ void gptoss_qkv_rope_cache_f16(__half *,
                                           __half *,
                                           uint16_t *,
@@ -68,18 +75,18 @@ hipError_t gptoss_post_attention_rms_norm_launch(const float * input,
 hipError_t gptoss_build_rope_cache_launch(float *               cache,
                                           const int32_t *       positions,
                                           uint32_t              n_tokens,
-                                          int                   n_dims,
                                           float                 freq_scale,
                                           float                 ext_factor,
                                           float                 attn_factor,
-                                          gptoss_rope_corr_dims corr_dims,
+                                          float                 corr_low,
+                                          float                 corr_high,
                                           float                 theta_scale,
                                           hipStream_t           stream) {
     constexpr uint32_t tokens_per_block = 8;
     const dim3         block(32, tokens_per_block);
     const dim3         grid((n_tokens + tokens_per_block - 1) / tokens_per_block);
-    hipLaunchKernelGGL(gptoss_build_rope_cache_f32, grid, block, 0, stream, cache, positions, n_tokens, n_dims,
-                       freq_scale, ext_factor, attn_factor, corr_dims, theta_scale);
+    hipLaunchKernelGGL(gptoss_build_rope_cache_f32, grid, block, 0, stream, cache, positions, n_tokens, freq_scale,
+                       ext_factor, attn_factor, corr_low, corr_high, theta_scale);
     return hipGetLastError();
 }
 
