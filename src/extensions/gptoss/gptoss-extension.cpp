@@ -5,6 +5,8 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
+#include "gptoss-aot.h"
+#include "gptoss-config.h"
 #include "gptoss-kernel.h"
 #include "gptoss-repack-hip.h"
 #include "llama-batch.h"
@@ -19,6 +21,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -27,43 +30,7 @@
 
 namespace {
 
-constexpr uint32_t gptoss_layer_count           = 24;
-constexpr uint32_t gptoss_hidden_size           = 2880;
-constexpr uint32_t gptoss_intermediate_size     = 2880;
-constexpr uint32_t gptoss_query_size            = 4096;
-constexpr uint32_t gptoss_key_value_size        = 512;
-constexpr uint32_t gptoss_qkv_size              = gptoss_query_size + 2 * gptoss_key_value_size;
-constexpr uint32_t gptoss_head_size             = 64;
-constexpr uint32_t gptoss_query_head_count      = 64;
-constexpr uint32_t gptoss_kv_head_count         = 8;
-constexpr uint32_t gptoss_expert_count          = 32;
-constexpr uint32_t gptoss_expert_used_count     = 4;
-constexpr uint32_t gptoss_vocabulary_size       = 201088;
-constexpr uint32_t gptoss_swa_size              = 128;
-constexpr uint32_t gptoss_max_attention_parts   = 12;
-constexpr uint32_t gptoss_ogs_block_m           = 64;
-constexpr uint32_t gptoss_q8_shared_memory      = 16384;
-constexpr uint32_t gptoss_fa_tile_size          = 32;
-constexpr uint32_t gptoss_fa_block_q            = 8;
-constexpr uint32_t gptoss_fa_threads            = 128;
-constexpr uint32_t gptoss_fa_shared_memory      = 8192;
-constexpr uint32_t gptoss_ogs_shared_memory     = 16384;
-
-constexpr size_t gptoss_qkv_values_size              = static_cast<size_t>(gptoss_qkv_size) * gptoss_hidden_size;
-constexpr size_t gptoss_attention_output_values_size = static_cast<size_t>(gptoss_hidden_size) * gptoss_query_size;
-
-constexpr size_t gptoss_ogs_alignment     = 256;
-constexpr size_t gptoss_mxfp4_block_size  = 32;
-constexpr size_t gptoss_mxfp4_padded_size = GGML_PAD(gptoss_intermediate_size, gptoss_ogs_alignment);
-constexpr size_t gptoss_moe_down_values_size =
-    gptoss_expert_count * gptoss_mxfp4_padded_size * gptoss_mxfp4_padded_size / 2;
-constexpr size_t gptoss_moe_down_scales_size =
-    gptoss_expert_count * gptoss_mxfp4_padded_size * gptoss_mxfp4_padded_size / gptoss_mxfp4_block_size;
-constexpr size_t gptoss_moe_down_scales_offset = gptoss_moe_down_values_size;
-constexpr size_t gptoss_moe_gate_up_values_offset =
-    gptoss_moe_down_values_size + gptoss_moe_down_scales_size;
-constexpr size_t gptoss_moe_gate_up_scales_offset =
-    gptoss_moe_gate_up_values_offset + 2 * gptoss_moe_down_values_size;
+constexpr uint32_t gptoss_max_attention_parts = 12;
 
 constexpr const char * gptoss_fa_name = "kernel_unified_attention_2d";
 
@@ -91,140 +58,6 @@ struct gptoss_context_state {
 
     llama_hip_workspace workspace;
 };
-
-struct gptoss_q8_qkv_args {
-    void *       output;
-    const void * activation;
-    const void * values;
-    const void * scales;
-    const void * bias;
-    int32_t      n_tokens;
-    void *       global_scratch;
-    void *       profile_scratch;
-};
-
-struct gptoss_q8_attention_output_args {
-    void *       output;
-    const void * activation;
-    const void * values;
-    const void * scales;
-    const void * bias;
-    const void * residual;
-    int32_t      n_tokens;
-    void *       global_scratch;
-    void *       profile_scratch;
-};
-
-struct gptoss_fa_args {
-    void *       output;
-    const void * query;
-    const void * key_cache;
-    const void * value_cache;
-    const void * sinks;
-    const void * block_table;
-    const void * seq_lens;
-    int64_t      block_table_stride;
-    const void * cu_seqlens_q;
-    int32_t      n_sequences;
-    uint32_t     padding;
-    void *       global_scratch;
-    void *       profile_scratch;
-};
-
-struct gptoss_ogs_w13_args {
-    void *       output;
-    void *       output_ptr;
-    const void * activation;
-    const void * activation_ptr;
-    const void * values;
-    const void * values_ptr;
-    const void * scales;
-    const void * bias;
-    const void * gather_indices;
-    const void * expert_counts;
-    const void * route_offsets;
-    const void * block_offsets;
-    const void * block_schedule;
-    int32_t      grid_m;
-    uint32_t     padding;
-    void *       global_scratch;
-    void *       profile_scratch;
-};
-
-struct gptoss_ogs_w2_args {
-    void *       output;
-    void *       output_ptr;
-    const void * activation;
-    const void * activation_ptr;
-    const void * values;
-    const void * values_ptr;
-    const void * scales;
-    const void * bias;
-    const void * scatter_indices;
-    int32_t      route_count;
-    uint32_t     padding_0;
-    const void * expert_counts;
-    const void * route_offsets;
-    const void * block_offsets;
-    const void * block_schedule;
-    int32_t      grid_m;
-    uint32_t     padding_1;
-    void *       global_scratch;
-    void *       profile_scratch;
-};
-
-static_assert(sizeof(gptoss_fa_args) == 96);
-static_assert(sizeof(gptoss_ogs_w13_args) == 128);
-static_assert(sizeof(gptoss_ogs_w2_args) == 136);
-
-template <typename T>
-hipError_t gptoss_aot_launch(hipFunction_t function,
-                             uint32_t      blocks,
-                             uint32_t      threads,
-                             uint32_t      shared_memory,
-                             T &           args,
-                             hipStream_t   stream) {
-    size_t args_size = sizeof(args);
-    void * config[]  = {
-        HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &args_size, HIP_LAUNCH_PARAM_END,
-    };
-
-    return hipModuleLaunchKernel(function, blocks, 1, 1, threads, 1, 1, shared_memory, stream, nullptr, config);
-}
-
-hipError_t gptoss_fa_launch(hipFunction_t function,
-                            uint32_t      query_blocks,
-                            gptoss_fa_args & args,
-                            hipStream_t   stream) {
-    size_t args_size = sizeof(args);
-    void * config[]  = {
-        HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &args_size, HIP_LAUNCH_PARAM_END,
-    };
-
-    return hipModuleLaunchKernel(
-        function, gptoss_kv_head_count, query_blocks, 1, gptoss_fa_threads, 1, 1, gptoss_fa_shared_memory, stream,
-        nullptr, config);
-}
-
-hipError_t gptoss_q8_qkv_launch(
-    hipFunction_t function, uint32_t blocks, gptoss_q8_qkv_args & args, hipStream_t stream) {
-    void * params[] = {
-        &args.output, &args.activation, &args.values,         &args.scales,
-        &args.bias,   &args.n_tokens,   &args.global_scratch, &args.profile_scratch,
-    };
-    return hipModuleLaunchKernel(function, blocks, 1, 1, 128, 1, 1, gptoss_q8_shared_memory, stream, params, nullptr);
-}
-
-hipError_t gptoss_q8_attention_output_launch(hipFunction_t                     function,
-                                             uint32_t                          blocks,
-                                             gptoss_q8_attention_output_args & args,
-                                             hipStream_t                       stream) {
-    void * params[] = {
-        &args.output,   &args.activation, &args.values,         &args.scales,          &args.bias,
-        &args.residual, &args.n_tokens,   &args.global_scratch, &args.profile_scratch,
-    };
-    return hipModuleLaunchKernel(function, blocks, 1, 1, 128, 1, 1, gptoss_q8_shared_memory, stream, params, nullptr);
-}
 
 bool gptoss_hip_ok(hipError_t error, const char * operation) {
     if (error == hipSuccess) {
@@ -957,8 +790,6 @@ int gptoss_prefill(llama_context *                ctx,
     const uint32_t route_count = ubatch.n_tokens * gptoss_expert_used_count;
     const uint32_t schedule_capacity =
         (route_count + gptoss_ogs_block_m - 1) / gptoss_ogs_block_m + gptoss_expert_count - 1;
-    const uint32_t fa_query_blocks =
-        ubatch.n_tokens / gptoss_fa_block_q + static_cast<uint32_t>(spans.size());
     const float alpha = 1.0f;
     const float beta  = 0.0f;
 
@@ -984,14 +815,13 @@ int gptoss_prefill(llama_context *                ctx,
             return -1;
         }
 
-        gptoss_q8_qkv_args qkv_args = {
+        gptoss_q8_qkv_params qkv_params = {
             buffers.qkv,      buffers.norm,
             qkv_weight,       qkv_weight + gptoss_qkv_values_size,
             layer.wq_b->data, static_cast<int32_t>(ubatch.n_tokens),
             nullptr,          nullptr,
         };
-        const uint32_t qkv_grid = ((ubatch.n_tokens + 63) / 64) * 40;
-        if (!gptoss_hip_ok(gptoss_q8_qkv_launch(state->q8_qkv, qkv_grid, qkv_args, state->stream),
+        if (!gptoss_hip_ok(gptoss_q8_qkv_launch(state->q8_qkv, qkv_params, state->stream),
                            "QKV projection") ||
             !gptoss_hip_ok(gptoss_qkv_rope_cache_launch(
                                buffers.q, cache_k, cache_v, buffers.qkv, is_swa ? buffers.rope_swa : buffers.rope_base,
@@ -1002,7 +832,7 @@ int gptoss_prefill(llama_context *                ctx,
         }
 
         const auto & fa_layout = is_swa ? swa_fa : base_fa;
-        gptoss_fa_args fa_args = {
+        gptoss_fa_params fa_params = {
             buffers.qkv,
             buffers.q,
             cache_k,
@@ -1018,12 +848,13 @@ int gptoss_prefill(llama_context *                ctx,
             nullptr,
         };
         if (!gptoss_hip_ok(
-                gptoss_fa_launch(is_swa ? state->fa_swa : state->fa_full, fa_query_blocks, fa_args, state->stream),
+                gptoss_fa_launch(
+                    is_swa ? state->fa_swa : state->fa_full, ubatch.n_tokens, fa_params, state->stream),
                 "flash attention")) {
             return -1;
         }
 
-        gptoss_q8_attention_output_args output_args = {
+        gptoss_q8_attention_output_params output_params = {
             buffers.next,
             buffers.qkv,
             output_weight,
@@ -1034,10 +865,9 @@ int gptoss_prefill(llama_context *                ctx,
             nullptr,
             nullptr,
         };
-        const uint32_t output_grid = ((ubatch.n_tokens + 63) / 64) * 23;
         if (!gptoss_hip_ok(
-                gptoss_q8_attention_output_launch(state->q8_attn_out, output_grid, output_args, state->stream),
-                           "attention output projection") ||
+                gptoss_q8_attention_output_launch(state->q8_attn_out, output_params, state->stream),
+                "attention output projection") ||
             !gptoss_hip_ok(gptoss_post_attention_rms_norm_launch(
                                buffers.next, static_cast<const float *>(layer.attn_post_norm->data), buffers.cur,
                                buffers.norm, hparams.f_norm_rms_eps, ubatch.n_tokens, state->stream),
@@ -1064,7 +894,7 @@ int gptoss_prefill(llama_context *                ctx,
             return -1;
         }
 
-        gptoss_ogs_w13_args w13_args = {
+        gptoss_ogs_w13_params w13_params = {
             buffers.expert_activations,
             buffers.expert_activations,
             buffers.norm,
@@ -1083,14 +913,12 @@ int gptoss_prefill(llama_context *                ctx,
             nullptr,
             nullptr,
         };
-        if (!gptoss_hip_ok(
-                gptoss_aot_launch(state->ogs_w13, schedule_capacity * 45, 128, gptoss_ogs_shared_memory, w13_args,
-                                  state->stream),
-                "MoE gate/up projection")) {
+        if (!gptoss_hip_ok(gptoss_ogs_w13_launch(state->ogs_w13, w13_params, state->stream),
+                           "MoE gate/up projection")) {
             return -1;
         }
 
-        gptoss_ogs_w2_args w2_args = {
+        gptoss_ogs_w2_params w2_params = {
             buffers.expert_outputs,
             buffers.expert_outputs,
             buffers.expert_activations,
@@ -1111,10 +939,8 @@ int gptoss_prefill(llama_context *                ctx,
             nullptr,
             nullptr,
         };
-        if (!gptoss_hip_ok(
-                gptoss_aot_launch(state->ogs_w2, schedule_capacity * 23, 128, gptoss_ogs_shared_memory, w2_args,
-                                  state->stream),
-                "MoE down projection") ||
+        if (!gptoss_hip_ok(gptoss_ogs_w2_launch(state->ogs_w2, w2_params, state->stream),
+                           "MoE down projection") ||
             !gptoss_hip_ok(gptoss_moe_combine_launch(buffers.cur, buffers.next, buffers.expert_outputs,
                                                      buffers.selected_weights, ubatch.n_tokens, state->stream),
                            "MoE combine")) {

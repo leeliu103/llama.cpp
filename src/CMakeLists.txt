@@ -27,6 +27,7 @@ set_source_files_properties(
 )
 
 set(LLAMA_GPTOSS_SOURCES
+    extensions/gptoss/gptoss-aot.cpp
     extensions/gptoss/gptoss-extension.cpp
     ${LLAMA_EXTENSIONS_HIP_SOURCES}
 )

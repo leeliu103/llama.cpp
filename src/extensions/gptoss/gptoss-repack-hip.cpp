@@ -1,5 +1,7 @@
 #include "gptoss-repack-hip.h"
 
+#include "gptoss-config.h"
+
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -9,29 +11,28 @@ namespace {
 constexpr uint32_t repack_threads = 256;
 
 constexpr uint32_t q8_0_scale_bytes  = sizeof(uint16_t);
-constexpr uint32_t q8_0_block_values = 32;
+constexpr uint32_t q8_0_block_values = gptoss_quant_block_size;
 constexpr uint32_t q8_0_block_bytes  = q8_0_scale_bytes + q8_0_block_values;
 
-constexpr uint32_t hidden_size    = 2880;
-constexpr uint32_t query_size     = 4096;
-constexpr uint32_t key_value_size = 512;
+constexpr uint32_t hidden_size    = gptoss_hidden_size;
+constexpr uint32_t query_size     = gptoss_query_size;
+constexpr uint32_t key_value_size = gptoss_key_value_size;
 
 constexpr size_t q8_0_query_source_size =
     static_cast<size_t>(query_size) * hidden_size / q8_0_block_values * q8_0_block_bytes;
 constexpr size_t q8_0_key_value_source_size =
     static_cast<size_t>(key_value_size) * hidden_size / q8_0_block_values * q8_0_block_bytes;
-constexpr size_t q8_0_qkv_value_count              = static_cast<size_t>(query_size + 2 * key_value_size) * hidden_size;
-constexpr size_t q8_0_attention_output_value_count = static_cast<size_t>(hidden_size) * query_size;
+constexpr size_t q8_0_qkv_value_count              = gptoss_qkv_values_size;
+constexpr size_t q8_0_attention_output_value_count = gptoss_attention_output_values_size;
 constexpr size_t q8_0_attention_output_source_size =
     q8_0_attention_output_value_count / q8_0_block_values * q8_0_block_bytes;
 
 constexpr uint32_t mxfp4_scale_bytes       = sizeof(uint8_t);
-constexpr uint32_t mxfp4_block_values      = 32;
+constexpr uint32_t mxfp4_block_values      = gptoss_mxfp4_block_size;
 constexpr uint32_t mxfp4_block_bytes       = mxfp4_scale_bytes + mxfp4_block_values / 2;
-constexpr uint32_t ogs_alignment           = 256;
-constexpr uint32_t expert_dimension        = 2880;
-constexpr uint32_t padded_expert_dimension = (expert_dimension + ogs_alignment - 1) / ogs_alignment * ogs_alignment;
-constexpr uint32_t expert_count            = 32;
+constexpr uint32_t expert_dimension        = gptoss_intermediate_size;
+constexpr uint32_t padded_expert_dimension = gptoss_mxfp4_padded_size;
+constexpr uint32_t expert_count            = gptoss_expert_count;
 
 constexpr uint32_t mxfp4_source_row_size       = expert_dimension / mxfp4_block_values * mxfp4_block_bytes;
 constexpr uint32_t mxfp4_source_value_row_size = expert_dimension / 2;
@@ -41,13 +42,9 @@ constexpr uint32_t mxfp4_packed_scale_row_size = padded_expert_dimension / mxfp4
 
 constexpr size_t mxfp4_native_weight_size =
     static_cast<size_t>(expert_count) * expert_dimension * mxfp4_source_row_size;
-constexpr size_t mxfp4_down_values_size =
-    static_cast<size_t>(expert_count) * padded_expert_dimension * mxfp4_packed_value_row_size;
-constexpr size_t mxfp4_down_scales_size =
-    static_cast<size_t>(expert_count) * padded_expert_dimension * mxfp4_packed_scale_row_size;
-constexpr size_t mxfp4_gate_up_values_size   = 2 * mxfp4_down_values_size;
-constexpr size_t mxfp4_gate_up_values_offset = mxfp4_down_values_size + mxfp4_down_scales_size;
-constexpr size_t mxfp4_gate_up_scales_offset = mxfp4_gate_up_values_offset + mxfp4_gate_up_values_size;
+constexpr size_t mxfp4_down_values_size       = gptoss_moe_down_values_size;
+constexpr size_t mxfp4_gate_up_values_offset  = gptoss_moe_gate_up_values_offset;
+constexpr size_t mxfp4_gate_up_scales_offset  = gptoss_moe_gate_up_scales_offset;
 
 constexpr uint32_t expert_bias_elements = expert_count * expert_dimension;
 constexpr size_t   expert_bias_size     = static_cast<size_t>(expert_bias_elements) * sizeof(float);

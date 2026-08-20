@@ -1,12 +1,11 @@
+#include "../gptoss-config.h"
+
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
 
 namespace {
 
-constexpr uint32_t gptoss_expert_count    = 32;
-constexpr uint32_t gptoss_experts_used    = 4;
-constexpr uint32_t gptoss_ogs_block_m     = 64;
 constexpr uint32_t gptoss_routing_threads = 256;
 
 }  // namespace
@@ -62,7 +61,7 @@ __launch_bounds__(gptoss_routing_threads, 1) __global__ void gptoss_ogs_build_ro
     __syncthreads();
 
     for (uint32_t route = thread; route < route_count; route += blockDim.x) {
-        const uint32_t token  = route / gptoss_experts_used;
+        const uint32_t token  = route / gptoss_expert_used_count;
         const int32_t  expert = expert_ids[route];
         if ((uint32_t) expert < gptoss_expert_count) {
             const int32_t destination          = atomicAdd(&cursors[expert], 1);

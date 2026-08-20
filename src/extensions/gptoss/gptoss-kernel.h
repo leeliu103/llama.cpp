@@ -6,6 +6,8 @@
 #include <cstdint>
 
 constexpr uint32_t gptoss_decode_grid_blocks = 120;
+constexpr uint32_t gptoss_decode_block_x     = 32;
+constexpr uint32_t gptoss_decode_block_y     = 8;
 
 struct gptoss_decode_layer_params {
     float *       next;

@@ -1,6 +1,7 @@
 // GPT-OSS FP16 decode megakernel. Each cooperative launch executes one
 // transformer layer using llama.cpp's packed weights and physical KV rows.
 
+#include "../gptoss-config.h"
 #include "../gptoss-kernel.h"
 
 #include <float.h>
@@ -14,37 +15,33 @@ namespace cg = cooperative_groups;
 
 namespace {
 
-static constexpr uint32_t hidden_size         = 2880;
-static constexpr uint32_t query_head_count    = 64;
-static constexpr uint32_t kv_head_count       = 8;
-static constexpr uint32_t head_size           = 64;
-static constexpr uint32_t sliding_window_size = 128;
-static constexpr uint32_t expert_count        = 32;
-static constexpr uint32_t experts_used        = 4;
-static constexpr uint32_t intermediate_size   = 2880;
+static constexpr uint32_t hidden_size         = gptoss_hidden_size;
+static constexpr uint32_t query_head_count    = gptoss_query_head_count;
+static constexpr uint32_t kv_head_count       = gptoss_kv_head_count;
+static constexpr uint32_t head_size           = gptoss_head_size;
+static constexpr uint32_t sliding_window_size = gptoss_swa_size;
+static constexpr uint32_t expert_count        = gptoss_expert_count;
+static constexpr uint32_t experts_used        = gptoss_expert_used_count;
+static constexpr uint32_t intermediate_size   = gptoss_intermediate_size;
 
-enum {
-    warp_size       = 32,
-    warps_per_block = 8,
-    block_size      = warp_size * warps_per_block,
-
-    q8_block_size        = 32,
-    mxfp4_block_size     = 32,
-    moe_output_tile_size = 32,
-    query_size           = query_head_count * head_size,
-    kv_size              = kv_head_count * head_size,
-};
+static constexpr uint32_t warp_size            = gptoss_decode_block_x;
+static constexpr uint32_t warps_per_block      = gptoss_decode_block_y;
+static constexpr uint32_t block_size           = warp_size * warps_per_block;
+static constexpr uint32_t q8_block_size        = gptoss_quant_block_size;
+static constexpr uint32_t mxfp4_block_size     = gptoss_mxfp4_block_size;
+static constexpr uint32_t moe_output_tile_size = warp_size;
+static constexpr uint32_t query_size           = gptoss_query_size;
+static constexpr uint32_t kv_size              = gptoss_key_value_size;
 
 static constexpr float attention_max_offset = 3.0f * 0.6931f;
 
-static constexpr uint32_t qkv_rows                      = query_size + 2u * kv_size;
-static constexpr uint32_t mxfp4_padded_dim              = 3072;
+static constexpr uint32_t mxfp4_padded_dim              = gptoss_mxfp4_padded_size;
 static constexpr uint32_t mxfp4_value_row_bytes         = mxfp4_padded_dim / 2u;
 static constexpr uint32_t mxfp4_scale_row_bytes         = mxfp4_padded_dim / mxfp4_block_size;
-static constexpr uint64_t qkv_values_bytes              = (uint64_t) qkv_rows * hidden_size;
-static constexpr uint64_t attention_output_values_bytes = (uint64_t) hidden_size * query_size;
-static constexpr uint64_t moe_down_values_bytes    = (uint64_t) expert_count * mxfp4_padded_dim * mxfp4_value_row_bytes;
-static constexpr uint64_t moe_gate_up_values_bytes = 2u * moe_down_values_bytes;
+static constexpr uint64_t qkv_values_bytes              = gptoss_qkv_values_size;
+static constexpr uint64_t attention_output_values_bytes = gptoss_attention_output_values_size;
+static constexpr uint64_t moe_down_values_bytes          = gptoss_moe_down_values_size;
+static constexpr uint64_t moe_gate_up_values_bytes       = gptoss_moe_gate_up_values_size;
 
 struct q8_0_row {
     const int8_t * values;

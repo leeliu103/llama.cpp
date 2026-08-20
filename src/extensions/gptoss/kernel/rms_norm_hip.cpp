@@ -1,3 +1,5 @@
+#include "../gptoss-config.h"
+
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -5,7 +7,7 @@
 
 namespace {
 
-constexpr int hidden_size = 2880;
+constexpr int hidden_size = gptoss_hidden_size;
 constexpr int block_size  = 1024;
 constexpr int warp_size   = 32;
 

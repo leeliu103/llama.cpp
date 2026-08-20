@@ -1,5 +1,7 @@
 #include "gptoss-kernel.h"
 
+#include "gptoss-config.h"
+
 #include <hip/hip_runtime.h>
 
 __global__ void gptoss_embedding_q8_0_kernel(float *, const uint8_t *, const int32_t *);
@@ -77,7 +79,7 @@ hipError_t gptoss_build_rope_cache_launch(float *               cache,
                                           float                 theta_scale,
                                           hipStream_t           stream) {
     constexpr uint32_t tokens_per_block = 8;
-    const dim3         block(32, tokens_per_block);
+    const dim3         block(gptoss_head_size / 2, tokens_per_block);
     const dim3         grid((n_tokens + tokens_per_block - 1) / tokens_per_block);
     hipLaunchKernelGGL(gptoss_build_rope_cache_f32, grid, block, 0, stream, cache, positions, n_tokens, freq_scale,
                        ext_factor, attn_factor, corr_low, corr_high, theta_scale);
@@ -92,8 +94,9 @@ hipError_t gptoss_qkv_rope_cache_launch(__half *        q,
                                         const int64_t * kv_dst_rows,
                                         uint32_t        n_tokens,
                                         hipStream_t     stream) {
-    hipLaunchKernelGGL(gptoss_qkv_rope_cache_f16, dim3(n_tokens, 9), dim3(256), 0, stream, q, cache_k,
-                       reinterpret_cast<uint16_t *>(cache_v), qkv, rope_cache, kv_dst_rows);
+    hipLaunchKernelGGL(gptoss_qkv_rope_cache_f16,
+                       dim3(n_tokens, gptoss_query_head_count / gptoss_kv_head_count + 1), dim3(256), 0, stream, q,
+                       cache_k, reinterpret_cast<uint16_t *>(cache_v), qkv, rope_cache, kv_dst_rows);
     return hipGetLastError();
 }
 
@@ -130,7 +133,7 @@ hipError_t gptoss_moe_combine_launch(float *       output,
                                      const float * routing_weights,
                                      uint32_t      n_tokens,
                                      hipStream_t   stream) {
-    const uint32_t blocks = (n_tokens * 2880 + 255) / 256;
+    const uint32_t blocks = (n_tokens * gptoss_hidden_size + 255) / 256;
     hipLaunchKernelGGL(gptoss_moe_combine_residual_f32, dim3(blocks), dim3(256), 0, stream, output, residual,
                        expert_outputs, routing_weights, n_tokens);
     return hipGetLastError();
@@ -140,8 +143,8 @@ hipError_t gptoss_lm_head_mmvq_launch(const uint8_t * weight,
                                       const __half *  activation,
                                       float *         logits,
                                       hipStream_t     stream) {
-    hipLaunchKernelGGL(gptoss_lm_head_mmvq_q8_0_f16_kernel, dim3(201088 / 4), dim3(32, 4), 0, stream, weight,
-                       activation, logits);
+    hipLaunchKernelGGL(gptoss_lm_head_mmvq_q8_0_f16_kernel, dim3(gptoss_vocabulary_size / 4), dim3(32, 4), 0, stream,
+                       weight, activation, logits);
     return hipGetLastError();
 }
 
@@ -150,5 +153,6 @@ hipError_t gptoss_decode_layer_launch(bool swa, const gptoss_decode_layer_params
                                 reinterpret_cast<const void *>(gptoss_decode_layer_full_kernel);
 
     void * args[] = { const_cast<gptoss_decode_layer_params *>(&params) };
-    return hipLaunchCooperativeKernel(kernel, dim3(gptoss_decode_grid_blocks), dim3(32, 8), args, 0, stream);
+    return hipLaunchCooperativeKernel(kernel, dim3(gptoss_decode_grid_blocks),
+                                      dim3(gptoss_decode_block_x, gptoss_decode_block_y), args, 0, stream);
 }

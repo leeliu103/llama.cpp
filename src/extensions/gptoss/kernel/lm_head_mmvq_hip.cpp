@@ -1,3 +1,5 @@
+#include "../gptoss-config.h"
+
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -5,13 +7,13 @@
 
 namespace {
 
-constexpr int hidden_size           = 2880;
-constexpr int vocabulary_size       = 201088;
+constexpr int hidden_size           = gptoss_hidden_size;
+constexpr int vocabulary_size       = gptoss_vocabulary_size;
 constexpr int rows_per_block        = 4;
 constexpr int block_size            = 128;
 constexpr int warp_size             = 32;
 constexpr int warp_count            = block_size / warp_size;
-constexpr int quant_block_size      = 32;
+constexpr int quant_block_size      = gptoss_quant_block_size;
 constexpr int blocks_per_row        = hidden_size / quant_block_size;
 constexpr int segments_per_q8_block = 4;
 

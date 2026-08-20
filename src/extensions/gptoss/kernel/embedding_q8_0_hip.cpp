@@ -1,3 +1,5 @@
+#include "../gptoss-config.h"
+
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -5,8 +7,8 @@
 
 namespace {
 
-constexpr uint32_t hidden_size      = 2880;
-constexpr uint32_t quant_block_size = 32;
+constexpr uint32_t hidden_size      = gptoss_hidden_size;
+constexpr uint32_t quant_block_size = gptoss_quant_block_size;
 
 struct block_q8_0 {
     uint16_t d;

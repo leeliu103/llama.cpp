@@ -1,3 +1,5 @@
+#include "../gptoss-config.h"
+
 #include <float.h>
 #include <hip/hip_runtime.h>
 #include <math.h>
@@ -5,8 +7,8 @@
 
 namespace {
 
-constexpr int expert_count      = 32;
-constexpr int expert_used_count = 4;
+constexpr int expert_count      = gptoss_expert_count;
+constexpr int expert_used_count = gptoss_expert_used_count;
 constexpr int warp_size         = 32;
 
 __device__ __forceinline__ float warp_max(float value) {

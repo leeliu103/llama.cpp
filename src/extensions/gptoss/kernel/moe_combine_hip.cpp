@@ -1,3 +1,5 @@
+#include "../gptoss-config.h"
+
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
@@ -7,8 +9,8 @@ __global__ void gptoss_moe_combine_residual_f32(float *       out,
                                                 const float * __restrict__ expert_outputs,
                                                 const float * __restrict__ routing_weights,
                                                 uint32_t n_tokens) {
-    constexpr uint32_t hidden_size       = 2880;
-    constexpr uint32_t experts_per_token = 4;
+    constexpr uint32_t hidden_size       = gptoss_hidden_size;
+    constexpr uint32_t experts_per_token = gptoss_expert_used_count;
 
     const uint64_t element_count = (uint64_t) n_tokens * hidden_size;
     const uint64_t index         = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;

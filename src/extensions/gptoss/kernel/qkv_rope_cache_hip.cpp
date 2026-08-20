@@ -1,3 +1,5 @@
+#include "../gptoss-config.h"
+
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -5,9 +7,9 @@
 
 namespace {
 
-constexpr uint32_t attention_head_count    = 64;
-constexpr uint32_t attention_head_count_kv = 8;
-constexpr uint32_t attention_head_size     = 64;
+constexpr uint32_t attention_head_count    = gptoss_query_head_count;
+constexpr uint32_t attention_head_count_kv = gptoss_kv_head_count;
+constexpr uint32_t attention_head_size     = gptoss_head_size;
 
 __device__ float rope_yarn_ramp(float low, float high, int dimension) {
     const float y = (dimension / 2 - low) / fmaxf(0.001f, high - low);
