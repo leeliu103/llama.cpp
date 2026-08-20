@@ -3,7 +3,7 @@
 #include <hip/hip_runtime.h>
 
 __global__ void gptoss_embedding_q8_0_kernel(float *, const uint8_t *, const int32_t *);
-__global__ void gptoss_attention_rms_norm_f16_kernel(const float *, const float *, __half *, float);
+__global__ void gptoss_rms_norm_f16_kernel(const float *, const float *, __half *, float);
 __global__ void gptoss_post_attention_rms_norm_f32_f16_kernel(const float *, const float *, float *, __half *, float);
 __global__ void gptoss_build_rope_cache_f32(float *         cache,
                                             const int32_t * positions,
@@ -31,12 +31,7 @@ __global__ void gptoss_ogs_build_routes(const int32_t *,
                                         uint32_t,
                                         uint32_t);
 __global__ void gptoss_moe_combine_residual_f32(float *, const float *, const float *, const float *, uint32_t);
-__global__ void gptoss_output_rms_norm_quantize_q8_1_kernel(const float *,
-                                                            const float *,
-                                                            int32_t,
-                                                            uint8_t *,
-                                                            float);
-__global__ void gptoss_lm_head_mmvq_q8_0_kernel(const uint8_t *, const uint8_t *, float *);
+__global__ void gptoss_lm_head_mmvq_q8_0_f16_kernel(const uint8_t *, const __half *, float *);
 __global__ void gptoss_decode_layer_swa_kernel(gptoss_decode_layer_params);
 __global__ void gptoss_decode_layer_full_kernel(gptoss_decode_layer_params);
 
@@ -49,14 +44,13 @@ hipError_t gptoss_embedding_q8_0_launch(float *         output,
     return hipGetLastError();
 }
 
-hipError_t gptoss_attention_rms_norm_launch(const float * input,
-                                            const float * weight,
-                                            __half *      output,
-                                            float         eps,
-                                            uint32_t      n_tokens,
-                                            hipStream_t   stream) {
-    hipLaunchKernelGGL(gptoss_attention_rms_norm_f16_kernel, dim3(n_tokens), dim3(1024), 0, stream, input, weight,
-                       output, eps);
+hipError_t gptoss_rms_norm_launch(const float * input,
+                                  const float * weight,
+                                  __half *      output,
+                                  float         eps,
+                                  uint32_t      n_tokens,
+                                  hipStream_t   stream) {
+    hipLaunchKernelGGL(gptoss_rms_norm_f16_kernel, dim3(n_tokens), dim3(1024), 0, stream, input, weight, output, eps);
     return hipGetLastError();
 }
 
@@ -142,22 +136,12 @@ hipError_t gptoss_moe_combine_launch(float *       output,
     return hipGetLastError();
 }
 
-hipError_t gptoss_output_rms_norm_quantize_launch(const float *   hidden,
-                                                  const float *   weight,
-                                                  int32_t         input_row,
-                                                  uint8_t *       output,
-                                                  float           eps,
-                                                  hipStream_t     stream) {
-    hipLaunchKernelGGL(gptoss_output_rms_norm_quantize_q8_1_kernel, dim3(1), dim3(1024), 0, stream, hidden, weight,
-                       input_row, output, eps);
-    return hipGetLastError();
-}
-
 hipError_t gptoss_lm_head_mmvq_launch(const uint8_t * weight,
-                                      const uint8_t * activation,
+                                      const __half *  activation,
                                       float *         logits,
                                       hipStream_t     stream) {
-    hipLaunchKernelGGL(gptoss_lm_head_mmvq_q8_0_kernel, dim3(201088), dim3(256), 0, stream, weight, activation, logits);
+    hipLaunchKernelGGL(gptoss_lm_head_mmvq_q8_0_f16_kernel, dim3(201088 / 4), dim3(32, 4), 0, stream, weight,
+                       activation, logits);
     return hipGetLastError();
 }
 

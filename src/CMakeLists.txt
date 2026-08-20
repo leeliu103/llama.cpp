@@ -16,7 +16,6 @@ set(LLAMA_EXTENSIONS_HIP_SOURCES
     extensions/gptoss/kernel/lm_head_mmvq_hip.cpp
     extensions/gptoss/kernel/moe_combine_hip.cpp
     extensions/gptoss/kernel/ogs_build_routes_hip.cpp
-    extensions/gptoss/kernel/output_rms_norm_quantize_hip.cpp
     extensions/gptoss/kernel/qkv_rope_cache_hip.cpp
     extensions/gptoss/kernel/rms_norm_hip.cpp
     extensions/gptoss/kernel/topk_hip.cpp

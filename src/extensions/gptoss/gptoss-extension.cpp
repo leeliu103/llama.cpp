@@ -41,7 +41,6 @@ constexpr uint32_t gptoss_expert_used_count     = 4;
 constexpr uint32_t gptoss_vocabulary_size       = 201088;
 constexpr uint32_t gptoss_swa_size              = 128;
 constexpr uint32_t gptoss_max_attention_parts   = 12;
-constexpr uint32_t gptoss_quant_block_size      = 32;
 constexpr uint32_t gptoss_ogs_block_m           = 64;
 constexpr uint32_t gptoss_q8_shared_memory      = 16384;
 constexpr uint32_t gptoss_fa_tile_size          = 32;
@@ -65,8 +64,6 @@ constexpr size_t gptoss_moe_gate_up_values_offset =
     gptoss_moe_down_values_size + gptoss_moe_down_scales_size;
 constexpr size_t gptoss_moe_gate_up_scales_offset =
     gptoss_moe_gate_up_values_offset + 2 * gptoss_moe_down_values_size;
-
-constexpr size_t gptoss_q8_1_row_size = static_cast<size_t>(gptoss_hidden_size / gptoss_quant_block_size) * 36;
 
 constexpr const char * gptoss_fa_name = "kernel_unified_attention_2d";
 
@@ -502,8 +499,7 @@ struct gptoss_prefill_buffers {
     __half *  expert_activations;
     float *   expert_outputs;
 
-    uint8_t * final_q8;
-    float *   logits;
+    float * logits;
 };
 
 gptoss_prefill_buffers gptoss_make_prefill_buffers(llama_hip_workspace_cursor & cursor,
@@ -544,7 +540,6 @@ gptoss_prefill_buffers gptoss_make_prefill_buffers(llama_hip_workspace_cursor & 
     result.block_schedule     = cursor.take<int32_t>(schedule_capacity);
     result.expert_activations = cursor.take<__half>(static_cast<size_t>(route_count) * gptoss_intermediate_size);
     result.expert_outputs     = cursor.take<float>(static_cast<size_t>(route_count) * gptoss_hidden_size);
-    result.final_q8           = cursor.take<uint8_t>(output ? gptoss_q8_1_row_size : 0);
     result.logits             = cursor.take<float>(output ? gptoss_vocabulary_size : 0);
 
     return result;
@@ -567,8 +562,7 @@ struct gptoss_decode_buffers {
     float2 *  attention_meta;
     uint32_t  attention_partitions;
 
-    uint8_t * final_q8;
-    float *   logits;
+    float * logits;
 };
 
 gptoss_decode_buffers gptoss_make_decode_buffers(llama_hip_workspace_cursor & cursor,
@@ -597,7 +591,6 @@ gptoss_decode_buffers gptoss_make_decode_buffers(llama_hip_workspace_cursor & cu
         cursor.take<float>(static_cast<size_t>(gptoss_query_head_count) * partitions * gptoss_head_size);
     result.attention_meta       = cursor.take<float2>(static_cast<size_t>(gptoss_query_head_count) * partitions);
     result.attention_partitions = partitions;
-    result.final_q8             = cursor.take<uint8_t>(output ? gptoss_q8_1_row_size : 0);
     result.logits               = cursor.take<float>(output ? gptoss_vocabulary_size : 0);
 
     return result;
@@ -985,8 +978,8 @@ int gptoss_prefill(llama_context *                ctx,
         const uint8_t * moe           = static_cast<const uint8_t *>(layer.ffn_gate_exps->data);
 
         if (!gptoss_hip_ok(
-                gptoss_attention_rms_norm_launch(buffers.cur, static_cast<const float *>(layer.attn_norm->data),
-                                                 buffers.norm, hparams.f_norm_rms_eps, ubatch.n_tokens, state->stream),
+                gptoss_rms_norm_launch(buffers.cur, static_cast<const float *>(layer.attn_norm->data), buffers.norm,
+                                       hparams.f_norm_rms_eps, ubatch.n_tokens, state->stream),
                 "attention RMS norm")) {
             return -1;
         }
@@ -1134,12 +1127,13 @@ int gptoss_prefill(llama_context *                ctx,
         if (ubatch.output[row] == 0) {
             continue;
         }
-        if (!gptoss_hip_ok(gptoss_output_rms_norm_quantize_launch(
-                               buffers.cur, static_cast<const float *>(model.output_norm->data),
-                               static_cast<int32_t>(row), buffers.final_q8, hparams.f_norm_rms_eps, state->stream),
+        if (!gptoss_hip_ok(gptoss_rms_norm_launch(
+                               buffers.cur + static_cast<size_t>(row) * gptoss_hidden_size,
+                               static_cast<const float *>(model.output_norm->data), buffers.norm,
+                               hparams.f_norm_rms_eps, 1, state->stream),
                            "output RMS norm") ||
             !gptoss_hip_ok(gptoss_lm_head_mmvq_launch(static_cast<const uint8_t *>(model.output->data),
-                                                      buffers.final_q8, buffers.logits, state->stream),
+                                                      buffers.norm, buffers.logits, state->stream),
                            "LM head") ||
             !gptoss_hip_ok(hipMemcpyAsync(logits_out + output_idx * gptoss_vocabulary_size, buffers.logits,
                                           static_cast<size_t>(gptoss_vocabulary_size) * sizeof(float),
@@ -1296,12 +1290,12 @@ int gptoss_decode(llama_context *                ctx,
     }
 
     if (output) {
-        if (!gptoss_hip_ok(gptoss_output_rms_norm_quantize_launch(
-                               current, static_cast<const float *>(model.output_norm->data), 0, buffers.final_q8,
-                               hparams.f_norm_rms_eps, state->stream),
+        if (!gptoss_hip_ok(gptoss_rms_norm_launch(
+                               current, static_cast<const float *>(model.output_norm->data), buffers.activation_scratch,
+                               hparams.f_norm_rms_eps, 1, state->stream),
                            "output RMS norm") ||
             !gptoss_hip_ok(gptoss_lm_head_mmvq_launch(static_cast<const uint8_t *>(model.output->data),
-                                                      buffers.final_q8, buffers.logits, state->stream),
+                                                      buffers.activation_scratch, buffers.logits, state->stream),
                            "LM head") ||
             !gptoss_hip_ok(
                                hipMemcpyAsync(logits_out, buffers.logits, static_cast<size_t>(gptoss_vocabulary_size) * sizeof(float),

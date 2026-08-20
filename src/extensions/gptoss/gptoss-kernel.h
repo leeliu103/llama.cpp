@@ -65,12 +65,12 @@ hipError_t gptoss_embedding_q8_0_launch(float *         output,
                                         uint32_t        n_tokens,
                                         hipStream_t     stream);
 
-hipError_t gptoss_attention_rms_norm_launch(const float * input,
-                                            const float * weight,
-                                            __half *      output,
-                                            float         eps,
-                                            uint32_t      n_tokens,
-                                            hipStream_t   stream);
+hipError_t gptoss_rms_norm_launch(const float * input,
+                                  const float * weight,
+                                  __half *      output,
+                                  float         eps,
+                                  uint32_t      n_tokens,
+                                  hipStream_t   stream);
 
 hipError_t gptoss_post_attention_rms_norm_launch(const float * input,
                                                  const float * weight,
@@ -125,15 +125,8 @@ hipError_t gptoss_moe_combine_launch(float *       output,
                                      uint32_t      n_tokens,
                                      hipStream_t   stream);
 
-hipError_t gptoss_output_rms_norm_quantize_launch(const float *   hidden,
-                                                  const float *   weight,
-                                                  int32_t         input_row,
-                                                  uint8_t *       output,
-                                                  float           eps,
-                                                  hipStream_t     stream);
-
 hipError_t gptoss_lm_head_mmvq_launch(const uint8_t * weight,
-                                      const uint8_t * activation,
+                                      const __half *  activation,
                                       float *         logits,
                                       hipStream_t     stream);
 

@@ -32,10 +32,10 @@ __device__ float block_sum(float value, float * warp_sums) {
 
 }  // namespace
 
-__launch_bounds__(block_size) __global__ void gptoss_attention_rms_norm_f16_kernel(const float * __restrict__ input,
-                                                                                   const float * __restrict__ weight,
-                                                                                   __half * __restrict__ output,
-                                                                                   float eps) {
+__launch_bounds__(block_size) __global__ void gptoss_rms_norm_f16_kernel(const float * __restrict__ input,
+                                                                         const float * __restrict__ weight,
+                                                                         __half * __restrict__ output,
+                                                                         float eps) {
     __shared__ float warp_sums[block_size / warp_size];
 
     const std::uint64_t row_offset = static_cast<std::uint64_t>(blockIdx.x) * hidden_size;
