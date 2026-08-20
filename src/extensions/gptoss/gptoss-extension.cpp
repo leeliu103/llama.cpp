@@ -9,6 +9,7 @@
 #include "gptoss-buffers.h"
 #include "gptoss-config.h"
 #include "gptoss-kernel-hip.h"
+#include "gptoss-kv.h"
 #include "gptoss-repack-hip.h"
 #include "llama-batch.h"
 #include "llama-context.h"
@@ -18,14 +19,12 @@
 #include <hip/hip_runtime_api.h>
 #include <hipblas/hipblas.h>
 
-#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <utility>
-#include <vector>
 
 #define GPTOSS_AOT_DIR "/app/llama.cpp/src/extensions/gptoss/build/gfx1201"
 
@@ -64,237 +63,7 @@ bool gptoss_hip_ok(hipError_t error, const char * operation) {
     return false;
 }
 
-struct gptoss_stream_guard {
-    explicit gptoss_stream_guard(hipStream_t stream) : stream(stream) {}
-
-    ~gptoss_stream_guard() {
-        if (!synchronized) {
-            (void) hipStreamSynchronize(stream);
-        }
-    }
-
-    hipError_t synchronize() {
-        synchronized = true;
-        return hipStreamSynchronize(stream);
-    }
-
-    hipStream_t stream;
-    bool synchronized = false;
-};
-
 size_t gptoss_tensor_alloc_size(const ggml_tensor * tensor);
-
-struct gptoss_sequence_span {
-    llama_seq_id sequence;
-    uint32_t     begin;
-    uint32_t     size;
-};
-
-bool gptoss_sequence_spans(const llama_ubatch & ubatch, std::vector<gptoss_sequence_span> & spans) {
-    if (ubatch.n_tokens == 0 || ubatch.n_pos != 1) {
-        return false;
-    }
-
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        if (ubatch.n_seq_id[i] <= 0 || ubatch.pos[i] < 0) {
-            return false;
-        }
-
-        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
-            if (ubatch.seq_id[i][s] < 0) {
-                return false;
-            }
-        }
-
-        const llama_seq_id sequence = ubatch.seq_id[i][0];
-        if (spans.empty() || spans.back().sequence != sequence) {
-            for (const auto & span : spans) {
-                if (span.sequence == sequence) {
-                    return false;
-                }
-            }
-            spans.push_back({ sequence, i, 1 });
-        } else {
-            if (ubatch.pos[i] != ubatch.pos[i - 1] + 1 || ubatch.n_seq_id[i] != ubatch.n_seq_id[i - 1]) {
-                return false;
-            }
-            for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
-                if (ubatch.seq_id[i][s] != ubatch.seq_id[i - 1][s]) {
-                    return false;
-                }
-            }
-            spans.back().size++;
-        }
-    }
-
-    return true;
-}
-
-struct gptoss_kv_layout {
-    const llama_kv_cache * cache = nullptr;
-
-    std::vector<int64_t> write_rows;
-    std::vector<int32_t> read_rows;
-    std::vector<int32_t> seq_lens;
-};
-
-bool gptoss_build_kv_layout(const llama_ubatch &                      ubatch,
-                            const std::vector<gptoss_sequence_span> & spans,
-                            const llama_kv_cache_context *            context,
-                            bool                                      sliding_window,
-                            gptoss_kv_layout &                        layout) {
-    const auto * cache = context->get_cache();
-    const auto & slot  = context->get_slot_info();
-
-    if (cache == nullptr || cache->get_has_shift() || slot.empty() || slot.n_stream() * slot.size() != ubatch.n_tokens) {
-        return false;
-    }
-
-    const uint32_t cache_size = cache->get_size();
-    const uint32_t n_streams  = cache->get_n_stream();
-    layout.cache              = cache;
-    layout.write_rows.resize(ubatch.n_tokens);
-
-    for (uint32_t stream = 0; stream < slot.n_stream(); ++stream) {
-        for (uint32_t token = 0; token < slot.size(); ++token) {
-            const uint32_t i = stream * slot.size() + token;
-            if (static_cast<uint32_t>(slot.strm[stream]) >= n_streams || slot.idxs[stream][token] >= cache_size) {
-                return false;
-            }
-            layout.write_rows[i] = static_cast<int64_t>(slot.strm[stream]) * cache_size + slot.idxs[stream][token];
-        }
-    }
-
-    struct cell_row {
-        llama_pos position;
-        int32_t   row;
-    };
-
-    for (const auto & span : spans) {
-        const uint32_t stream = static_cast<uint32_t>(layout.write_rows[span.begin] / cache_size);
-        for (uint32_t i = 1; i < span.size; ++i) {
-            if (static_cast<uint32_t>(layout.write_rows[span.begin + i] / cache_size) != stream) {
-                return false;
-            }
-        }
-
-        const llama_pos first_position = ubatch.pos[span.begin];
-        const llama_pos last_position  = ubatch.pos[span.begin + span.size - 1];
-        const llama_pos first_visible =
-            sliding_window ? first_position - static_cast<llama_pos>(gptoss_swa_size - 1) : 0;
-        const auto &    cells          = cache->get_cells(span.sequence);
-
-        std::vector<cell_row> rows;
-        rows.reserve(cells.get_used());
-        for (uint32_t row = 0; row < cells.size(); ++row) {
-            if (cells.is_empty(row) || !cells.seq_has(row, span.sequence)) {
-                continue;
-            }
-
-            const llama_pos position = cells.pos_get(row);
-            if (position <= last_position && position >= first_visible) {
-                const uint64_t global_row = static_cast<uint64_t>(stream) * cache_size + row;
-                if (global_row > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
-                    return false;
-                }
-                rows.push_back({ position, static_cast<int32_t>(global_row) });
-            }
-        }
-
-        std::sort(rows.begin(), rows.end(),
-                  [](const cell_row & a, const cell_row & b) { return a.position < b.position; });
-
-        if (rows.size() < span.size || rows.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-            return false;
-        }
-        for (size_t i = 1; i < rows.size(); ++i) {
-            if (rows[i].position != rows[i - 1].position + 1) {
-                return false;
-            }
-        }
-        for (uint32_t i = 0; i < span.size; ++i) {
-            const auto & row = rows[rows.size() - span.size + i];
-            if (row.position != ubatch.pos[span.begin + i] || row.row != layout.write_rows[span.begin + i]) {
-                return false;
-            }
-        }
-
-        for (const auto & row : rows) {
-            layout.read_rows.push_back(row.row);
-        }
-        layout.seq_lens.push_back(static_cast<int32_t>(rows.size()));
-    }
-
-    return !layout.read_rows.empty();
-}
-
-struct gptoss_fa_layout {
-    std::vector<int32_t> block_table;
-    int64_t              block_table_stride = 0;
-};
-
-bool gptoss_build_fa_layout(const gptoss_kv_layout & kv, gptoss_fa_layout & layout) {
-    if (kv.seq_lens.empty()) {
-        return false;
-    }
-
-    const size_t n_sequences = kv.seq_lens.size();
-    size_t       n_rows      = 0;
-    int32_t      max_seq_len = 0;
-
-    for (const int32_t seq_len : kv.seq_lens) {
-        if (seq_len <= 0 || static_cast<size_t>(seq_len) > kv.read_rows.size() - n_rows) {
-            return false;
-        }
-        n_rows += static_cast<size_t>(seq_len);
-        max_seq_len = std::max(max_seq_len, seq_len);
-    }
-    if (n_rows != kv.read_rows.size()) {
-        return false;
-    }
-
-    if (max_seq_len > std::numeric_limits<int32_t>::max() - static_cast<int32_t>(gptoss_fa_tile_size - 1)) {
-        return false;
-    }
-
-    layout.block_table_stride = (max_seq_len + gptoss_fa_tile_size - 1) / gptoss_fa_tile_size * gptoss_fa_tile_size;
-    const size_t block_table_stride = static_cast<size_t>(layout.block_table_stride);
-    if (block_table_stride > std::numeric_limits<uint32_t>::max() / n_sequences) {
-        return false;
-    }
-    layout.block_table.resize(block_table_stride * n_sequences);
-
-    size_t begin = 0;
-    for (size_t i = 0; i < n_sequences; ++i) {
-        const size_t end = begin + static_cast<size_t>(kv.seq_lens[i]);
-        int32_t *    dst   = layout.block_table.data() + i * block_table_stride;
-        std::copy(kv.read_rows.begin() + begin, kv.read_rows.begin() + end, dst);
-        std::fill(dst + end - begin, dst + block_table_stride, kv.read_rows[end - 1]);
-        begin = end;
-    }
-
-    return true;
-}
-
-bool gptoss_get_kv(const llama_kv_cache * cache, uint32_t layer, __half *& k, __half *& v) {
-    const ggml_tensor * tensor_k = cache->get_k_storage(layer);
-    const ggml_tensor * tensor_v = cache->get_v_storage(layer);
-
-    if (tensor_k->type != GGML_TYPE_F16 || tensor_v->type != GGML_TYPE_F16 ||
-        tensor_k->ne[0] != gptoss_key_value_size || tensor_v->ne[0] != gptoss_key_value_size ||
-        tensor_k->ne[1] != cache->get_size() || tensor_v->ne[1] != cache->get_size() ||
-        tensor_k->ne[2] != cache->get_n_stream() || tensor_v->ne[2] != cache->get_n_stream() ||
-        tensor_k->nb[1] != gptoss_key_value_size * sizeof(uint16_t) ||
-        tensor_v->nb[1] != gptoss_key_value_size * sizeof(uint16_t) ||
-        tensor_k->nb[2] != cache->get_size() * tensor_k->nb[1] ||
-        tensor_v->nb[2] != cache->get_size() * tensor_v->nb[1]) {
-        return false;
-    }
-
-    k = static_cast<__half *>(tensor_k->data);
-    v = static_cast<__half *>(tensor_v->data);
-    return k != nullptr && v != nullptr;
-}
 
 void gptoss_context_free(llama_context * ctx) {
     auto * state = static_cast<gptoss_context_state *>(ctx->execution_extension_state);
@@ -517,32 +286,22 @@ int gptoss_prefill(llama_context *                ctx,
         ubatch.n_tokens > std::numeric_limits<int32_t>::max() / gptoss_expert_used_count) {
         return -1;
     }
-    std::vector<gptoss_sequence_span> spans;
-    if (!gptoss_sequence_spans(ubatch, spans)) {
-        LLAMA_LOG_ERROR("%s: unsupported sequence layout\n", __func__);
+    const auto *   iswa = static_cast<const llama_kv_cache_iswa_context *>(mctx);
+    gptoss_kv_batch kv_batch;
+    if (!gptoss_build_kv_batch(ubatch, *iswa, kv_batch)) {
+        LLAMA_LOG_ERROR("%s: unsupported KV batch\n", __func__);
         return -1;
     }
 
-    const auto *     iswa = static_cast<const llama_kv_cache_iswa_context *>(mctx);
-    gptoss_kv_layout base;
-    gptoss_kv_layout swa;
-    if (!gptoss_build_kv_layout(ubatch, spans, iswa->get_base(), false, base) ||
-        !gptoss_build_kv_layout(ubatch, spans, iswa->get_swa(), true, swa)) {
-        LLAMA_LOG_ERROR("%s: unsupported KV-cache layout\n", __func__);
+    gptoss_fa_block_table base_fa;
+    gptoss_fa_block_table swa_fa;
+    if (!gptoss_build_fa_block_table(kv_batch.base, base_fa) ||
+        !gptoss_build_fa_block_table(kv_batch.swa, swa_fa)) {
+        LLAMA_LOG_ERROR("%s: unsupported flash-attention block table\n", __func__);
         return -1;
     }
 
-    gptoss_fa_layout base_fa;
-    gptoss_fa_layout swa_fa;
-    if (!gptoss_build_fa_layout(base, base_fa) || !gptoss_build_fa_layout(swa, swa_fa)) {
-        LLAMA_LOG_ERROR("%s: unsupported flash-attention layout\n", __func__);
-        return -1;
-    }
-
-    std::vector<int32_t> cu_seqlens_q(1, 0);
-    for (const auto & span : spans) {
-        cu_seqlens_q.push_back(cu_seqlens_q.back() + static_cast<int32_t>(span.size));
-    }
+    const uint32_t n_sequences = static_cast<uint32_t>(kv_batch.query_offsets.size() - 1);
 
     bool output = false;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -556,9 +315,9 @@ int gptoss_prefill(llama_context *                ctx,
     }
 
     llama_hip_workspace_cursor measure;
-    (void) gptoss_make_prefill_buffers(
-        measure, ubatch.n_tokens, output, static_cast<uint32_t>(spans.size()),
-        static_cast<uint32_t>(base_fa.block_table.size()), static_cast<uint32_t>(swa_fa.block_table.size()));
+    (void) gptoss_make_prefill_buffers(measure, ubatch.n_tokens, output, n_sequences,
+                                       static_cast<uint32_t>(base_fa.row_indices.size()),
+                                       static_cast<uint32_t>(swa_fa.row_indices.size()));
     if (!measure.valid()) {
         LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
         return -1;
@@ -567,43 +326,47 @@ int gptoss_prefill(llama_context *                ctx,
         return -1;
     }
     llama_hip_workspace_cursor bind(state->workspace.data(), measure.size());
-    auto buffers = gptoss_make_prefill_buffers(bind, ubatch.n_tokens, output, static_cast<uint32_t>(spans.size()),
-                                               static_cast<uint32_t>(base_fa.block_table.size()),
-                                               static_cast<uint32_t>(swa_fa.block_table.size()));
+    auto buffers = gptoss_make_prefill_buffers(bind, ubatch.n_tokens, output, n_sequences,
+                                               static_cast<uint32_t>(base_fa.row_indices.size()),
+                                               static_cast<uint32_t>(swa_fa.row_indices.size()));
     if (!bind.valid() || bind.size() != measure.size()) {
         LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
         return -1;
     }
 
-    gptoss_stream_guard stream_guard(state->stream);
     if (!gptoss_hip_ok(hipMemcpyAsync(buffers.tokens, ubatch.token, ubatch.n_tokens * sizeof(int32_t),
                                       hipMemcpyHostToDevice, state->stream),
                        "token upload") ||
         !gptoss_hip_ok(hipMemcpyAsync(buffers.positions, ubatch.pos, ubatch.n_tokens * sizeof(int32_t),
                                       hipMemcpyHostToDevice, state->stream),
                        "position upload") ||
-        !gptoss_hip_ok(hipMemcpyAsync(buffers.base_write_rows, base.write_rows.data(),
-                                      base.write_rows.size() * sizeof(int64_t), hipMemcpyHostToDevice, state->stream),
+        !gptoss_hip_ok(hipMemcpyAsync(buffers.base_write_rows, kv_batch.base.write_rows.data(),
+                                      kv_batch.base.write_rows.size() * sizeof(int64_t), hipMemcpyHostToDevice,
+                                      state->stream),
                        "base write-row upload") ||
-        !gptoss_hip_ok(hipMemcpyAsync(buffers.swa_write_rows, swa.write_rows.data(),
-                                      swa.write_rows.size() * sizeof(int64_t), hipMemcpyHostToDevice, state->stream),
+        !gptoss_hip_ok(hipMemcpyAsync(buffers.swa_write_rows, kv_batch.swa.write_rows.data(),
+                                      kv_batch.swa.write_rows.size() * sizeof(int64_t), hipMemcpyHostToDevice,
+                                      state->stream),
                        "SWA write-row upload") ||
-        !gptoss_hip_ok(hipMemcpyAsync(buffers.base_block_table, base_fa.block_table.data(),
-                                      base_fa.block_table.size() * sizeof(int32_t), hipMemcpyHostToDevice,
+        !gptoss_hip_ok(hipMemcpyAsync(buffers.base_block_table, base_fa.row_indices.data(),
+                                      base_fa.row_indices.size() * sizeof(int32_t), hipMemcpyHostToDevice,
                                       state->stream),
                        "base block-table upload") ||
-        !gptoss_hip_ok(hipMemcpyAsync(buffers.swa_block_table, swa_fa.block_table.data(),
-                                      swa_fa.block_table.size() * sizeof(int32_t), hipMemcpyHostToDevice,
+        !gptoss_hip_ok(hipMemcpyAsync(buffers.swa_block_table, swa_fa.row_indices.data(),
+                                      swa_fa.row_indices.size() * sizeof(int32_t), hipMemcpyHostToDevice,
                                       state->stream),
                        "SWA block-table upload") ||
-        !gptoss_hip_ok(hipMemcpyAsync(buffers.cu_seqlens_q, cu_seqlens_q.data(), cu_seqlens_q.size() * sizeof(int32_t),
-                                      hipMemcpyHostToDevice, state->stream),
+        !gptoss_hip_ok(hipMemcpyAsync(buffers.cu_seqlens_q, kv_batch.query_offsets.data(),
+                                      kv_batch.query_offsets.size() * sizeof(int32_t), hipMemcpyHostToDevice,
+                                      state->stream),
                        "query lengths upload") ||
-        !gptoss_hip_ok(hipMemcpyAsync(buffers.base_seq_lens, base.seq_lens.data(),
-                                      base.seq_lens.size() * sizeof(int32_t), hipMemcpyHostToDevice, state->stream),
+        !gptoss_hip_ok(hipMemcpyAsync(buffers.base_seq_lens, kv_batch.base.sequence_lengths.data(),
+                                      kv_batch.base.sequence_lengths.size() * sizeof(int32_t), hipMemcpyHostToDevice,
+                                      state->stream),
                        "base lengths upload") ||
-        !gptoss_hip_ok(hipMemcpyAsync(buffers.swa_seq_lens, swa.seq_lens.data(),
-                                      swa.seq_lens.size() * sizeof(int32_t), hipMemcpyHostToDevice, state->stream),
+        !gptoss_hip_ok(hipMemcpyAsync(buffers.swa_seq_lens, kv_batch.swa.sequence_lengths.data(),
+                                      kv_batch.swa.sequence_lengths.size() * sizeof(int32_t), hipMemcpyHostToDevice,
+                                      state->stream),
                        "SWA lengths upload")) {
         return -1;
     }
@@ -642,11 +405,11 @@ int gptoss_prefill(llama_context *                ctx,
     for (uint32_t il = 0; il < gptoss_layer_count; ++il) {
         const llama_layer & layer  = model.layers[il];
         const bool          is_swa = hparams.is_swa(il);
-        const auto &        kv     = is_swa ? swa : base;
+        const auto &        kv     = is_swa ? kv_batch.swa : kv_batch.base;
 
         __half * cache_k = nullptr;
         __half * cache_v = nullptr;
-        if (!gptoss_get_kv(kv.cache, il, cache_k, cache_v)) {
+        if (!gptoss_get_kv_storage(kv.cache, il, cache_k, cache_v)) {
             return -1;
         }
 
@@ -675,14 +438,13 @@ int gptoss_prefill(llama_context *                ctx,
             return -1;
         }
 
-        const auto & fa_layout = is_swa ? swa_fa : base_fa;
+        const auto & fa_table = is_swa ? swa_fa : base_fa;
         if (!gptoss_hip_ok(
                 gptoss_fa_launch(is_swa ? state->fa_swa : state->fa_full, buffers.qkv, buffers.q, cache_k, cache_v,
                                  static_cast<const float *>(layer.attn_sinks->data),
                                  is_swa ? buffers.swa_block_table : buffers.base_block_table,
-                                 is_swa ? buffers.swa_seq_lens : buffers.base_seq_lens, fa_layout.block_table_stride,
-                                 buffers.cu_seqlens_q, static_cast<uint32_t>(spans.size()), ubatch.n_tokens,
-                                 state->stream),
+                                 is_swa ? buffers.swa_seq_lens : buffers.base_seq_lens, fa_table.stride,
+                                 buffers.cu_seqlens_q, n_sequences, ubatch.n_tokens, state->stream),
                 "flash attention")) {
             return -1;
         }
@@ -767,7 +529,7 @@ int gptoss_prefill(llama_context *                ctx,
         ++output_idx;
     }
 
-    if (!gptoss_hip_ok(stream_guard.synchronize(), "prefill synchronize")) {
+    if (!gptoss_hip_ok(hipStreamSynchronize(state->stream), "prefill synchronize")) {
         return -1;
     }
     return 0;
@@ -781,17 +543,10 @@ int gptoss_decode(llama_context *                ctx,
     if (state == nullptr || ubatch.n_tokens != 1 || ubatch.token == nullptr || mctx == nullptr) {
         return -1;
     }
-    std::vector<gptoss_sequence_span> spans;
-    if (!gptoss_sequence_spans(ubatch, spans)) {
-        return -1;
-    }
-
-    const auto *     iswa = static_cast<const llama_kv_cache_iswa_context *>(mctx);
-    gptoss_kv_layout base;
-    gptoss_kv_layout swa;
-    if (!gptoss_build_kv_layout(ubatch, spans, iswa->get_base(), false, base) ||
-        !gptoss_build_kv_layout(ubatch, spans, iswa->get_swa(), true, swa)) {
-        LLAMA_LOG_ERROR("%s: unsupported KV-cache layout\n", __func__);
+    const auto *   iswa = static_cast<const llama_kv_cache_iswa_context *>(mctx);
+    gptoss_kv_batch kv_batch;
+    if (!gptoss_build_kv_batch(ubatch, *iswa, kv_batch)) {
+        LLAMA_LOG_ERROR("%s: unsupported KV batch\n", __func__);
         return -1;
     }
 
@@ -801,7 +556,7 @@ int gptoss_decode(llama_context *                ctx,
     }
 
     llama_hip_workspace_cursor measure;
-    (void) gptoss_make_decode_buffers(measure, base.read_rows.size(), swa.read_rows.size(), output);
+    (void) gptoss_make_decode_buffers(measure, kv_batch.base.read_rows.size(), kv_batch.swa.read_rows.size(), output);
     if (!measure.valid()) {
         LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
         return -1;
@@ -810,21 +565,23 @@ int gptoss_decode(llama_context *                ctx,
         return -1;
     }
     llama_hip_workspace_cursor bind(state->workspace.data(), measure.size());
-    auto buffers = gptoss_make_decode_buffers(bind, base.read_rows.size(), swa.read_rows.size(), output);
+    auto buffers =
+        gptoss_make_decode_buffers(bind, kv_batch.base.read_rows.size(), kv_batch.swa.read_rows.size(), output);
     if (!bind.valid() || bind.size() != measure.size()) {
         LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
         return -1;
     }
 
-    gptoss_stream_guard stream_guard(state->stream);
     if (!gptoss_hip_ok(
             hipMemcpyAsync(buffers.token, ubatch.token, sizeof(int32_t), hipMemcpyHostToDevice, state->stream),
                        "token upload") ||
-        !gptoss_hip_ok(hipMemcpyAsync(buffers.base_rows, base.read_rows.data(),
-                                      base.read_rows.size() * sizeof(int32_t), hipMemcpyHostToDevice, state->stream),
+        !gptoss_hip_ok(hipMemcpyAsync(buffers.base_rows, kv_batch.base.read_rows.data(),
+                                      kv_batch.base.read_rows.size() * sizeof(int32_t), hipMemcpyHostToDevice,
+                                      state->stream),
                        "base read-row upload") ||
-        !gptoss_hip_ok(hipMemcpyAsync(buffers.swa_rows, swa.read_rows.data(),
-                                      swa.read_rows.size() * sizeof(int32_t), hipMemcpyHostToDevice, state->stream),
+        !gptoss_hip_ok(hipMemcpyAsync(buffers.swa_rows, kv_batch.swa.read_rows.data(),
+                                      kv_batch.swa.read_rows.size() * sizeof(int32_t), hipMemcpyHostToDevice,
+                                      state->stream),
                        "SWA read-row upload")) {
         return -1;
     }
@@ -846,11 +603,11 @@ int gptoss_decode(llama_context *                ctx,
     for (uint32_t il = 0; il < gptoss_layer_count; ++il) {
         const llama_layer & layer  = model.layers[il];
         const bool          is_swa = hparams.is_swa(il);
-        const auto &        kv     = is_swa ? swa : base;
+        const auto &        kv     = is_swa ? kv_batch.swa : kv_batch.base;
 
         __half * cache_k = nullptr;
         __half * cache_v = nullptr;
-        if (!gptoss_get_kv(kv.cache, il, cache_k, cache_v)) {
+        if (!gptoss_get_kv_storage(kv.cache, il, cache_k, cache_v)) {
             return -1;
         }
 
@@ -929,7 +686,7 @@ int gptoss_decode(llama_context *                ctx,
         }
     }
 
-    return gptoss_hip_ok(stream_guard.synchronize(), "decode synchronize") ? 0 : -1;
+    return gptoss_hip_ok(hipStreamSynchronize(state->stream), "decode synchronize") ? 0 : -1;
 }
 
 size_t gptoss_tensor_alloc_size(const ggml_tensor * tensor) {

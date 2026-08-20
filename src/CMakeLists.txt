@@ -30,6 +30,7 @@ set(LLAMA_GPTOSS_SOURCES
     extensions/gptoss/gptoss-kernel-aot.cpp
     extensions/gptoss/gptoss-buffers.cpp
     extensions/gptoss/gptoss-extension.cpp
+    extensions/gptoss/gptoss-kv.cpp
     ${LLAMA_EXTENSIONS_HIP_SOURCES}
 )
 
