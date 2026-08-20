@@ -815,14 +815,12 @@ int gptoss_prefill(llama_context *                ctx,
             return -1;
         }
 
-        gptoss_q8_qkv_params qkv_params = {
-            buffers.qkv,      buffers.norm,
-            qkv_weight,       qkv_weight + gptoss_qkv_values_size,
-            layer.wq_b->data, static_cast<int32_t>(ubatch.n_tokens),
-            nullptr,          nullptr,
-        };
-        if (!gptoss_hip_ok(gptoss_q8_qkv_launch(state->q8_qkv, qkv_params, state->stream),
-                           "QKV projection") ||
+        if (!gptoss_hip_ok(
+                gptoss_q8_qkv_launch(state->q8_qkv, buffers.qkv, buffers.norm,
+                                     reinterpret_cast<const int8_t *>(qkv_weight),
+                                     reinterpret_cast<const __half *>(qkv_weight + gptoss_qkv_values_size),
+                                     static_cast<const float *>(layer.wq_b->data), ubatch.n_tokens, state->stream),
+                "QKV projection") ||
             !gptoss_hip_ok(gptoss_qkv_rope_cache_launch(
                                buffers.q, cache_k, cache_v, buffers.qkv, is_swa ? buffers.rope_swa : buffers.rope_base,
                                is_swa ? buffers.swa_write_rows : buffers.base_write_rows, ubatch.n_tokens,
@@ -832,41 +830,22 @@ int gptoss_prefill(llama_context *                ctx,
         }
 
         const auto & fa_layout = is_swa ? swa_fa : base_fa;
-        gptoss_fa_params fa_params = {
-            buffers.qkv,
-            buffers.q,
-            cache_k,
-            cache_v,
-            layer.attn_sinks->data,
-            is_swa ? buffers.swa_block_table : buffers.base_block_table,
-            is_swa ? buffers.swa_seq_lens : buffers.base_seq_lens,
-            fa_layout.block_table_stride,
-            buffers.cu_seqlens_q,
-            static_cast<int32_t>(spans.size()),
-            0,
-            nullptr,
-            nullptr,
-        };
         if (!gptoss_hip_ok(
-                gptoss_fa_launch(
-                    is_swa ? state->fa_swa : state->fa_full, ubatch.n_tokens, fa_params, state->stream),
+                gptoss_fa_launch(is_swa ? state->fa_swa : state->fa_full, buffers.qkv, buffers.q, cache_k, cache_v,
+                                 static_cast<const float *>(layer.attn_sinks->data),
+                                 is_swa ? buffers.swa_block_table : buffers.base_block_table,
+                                 is_swa ? buffers.swa_seq_lens : buffers.base_seq_lens, fa_layout.block_table_stride,
+                                 buffers.cu_seqlens_q, static_cast<uint32_t>(spans.size()), ubatch.n_tokens,
+                                 state->stream),
                 "flash attention")) {
             return -1;
         }
 
-        gptoss_q8_attention_output_params output_params = {
-            buffers.next,
-            buffers.qkv,
-            output_weight,
-            output_weight + gptoss_attention_output_values_size,
-            layer.wo_b->data,
-            buffers.cur,
-            static_cast<int32_t>(ubatch.n_tokens),
-            nullptr,
-            nullptr,
-        };
         if (!gptoss_hip_ok(
-                gptoss_q8_attention_output_launch(state->q8_attn_out, output_params, state->stream),
+                gptoss_q8_attention_output_launch(
+                    state->q8_attn_out, buffers.next, buffers.qkv, reinterpret_cast<const int8_t *>(output_weight),
+                    reinterpret_cast<const __half *>(output_weight + gptoss_attention_output_values_size),
+                    static_cast<const float *>(layer.wo_b->data), buffers.cur, ubatch.n_tokens, state->stream),
                 "attention output projection") ||
             !gptoss_hip_ok(gptoss_post_attention_rms_norm_launch(
                                buffers.next, static_cast<const float *>(layer.attn_post_norm->data), buffers.cur,
@@ -894,53 +873,24 @@ int gptoss_prefill(llama_context *                ctx,
             return -1;
         }
 
-        gptoss_ogs_w13_params w13_params = {
-            buffers.expert_activations,
-            buffers.expert_activations,
-            buffers.norm,
-            buffers.norm,
-            moe + gptoss_moe_gate_up_values_offset,
-            moe + gptoss_moe_gate_up_values_offset,
-            moe + gptoss_moe_gate_up_scales_offset,
-            layer.ffn_down_exps_b->data,
-            buffers.gather_indices,
-            buffers.expert_counts,
-            buffers.route_offsets,
-            buffers.block_offsets,
-            buffers.block_schedule,
-            static_cast<int32_t>(schedule_capacity),
-            0,
-            nullptr,
-            nullptr,
-        };
-        if (!gptoss_hip_ok(gptoss_ogs_w13_launch(state->ogs_w13, w13_params, state->stream),
-                           "MoE gate/up projection")) {
+        if (!gptoss_hip_ok(
+                gptoss_ogs_w13_launch(
+                    state->ogs_w13, buffers.expert_activations, buffers.norm,
+                    moe + gptoss_moe_gate_up_values_offset, moe + gptoss_moe_gate_up_scales_offset,
+                    static_cast<const float *>(layer.ffn_down_exps_b->data), buffers.gather_indices,
+                    buffers.expert_counts, buffers.route_offsets, buffers.block_offsets, buffers.block_schedule,
+                    schedule_capacity, state->stream),
+                "MoE gate/up projection")) {
             return -1;
         }
 
-        gptoss_ogs_w2_params w2_params = {
-            buffers.expert_outputs,
-            buffers.expert_outputs,
-            buffers.expert_activations,
-            buffers.expert_activations,
-            moe,
-            moe,
-            moe + gptoss_moe_down_scales_offset,
-            layer.ffn_gate_exps_b->data,
-            buffers.scatter_indices,
-            static_cast<int32_t>(route_count),
-            0,
-            buffers.expert_counts,
-            buffers.route_offsets,
-            buffers.block_offsets,
-            buffers.block_schedule,
-            static_cast<int32_t>(schedule_capacity),
-            0,
-            nullptr,
-            nullptr,
-        };
-        if (!gptoss_hip_ok(gptoss_ogs_w2_launch(state->ogs_w2, w2_params, state->stream),
-                           "MoE down projection") ||
+        if (!gptoss_hip_ok(
+                gptoss_ogs_w2_launch(
+                    state->ogs_w2, buffers.expert_outputs, buffers.expert_activations, moe,
+                    moe + gptoss_moe_down_scales_offset, static_cast<const float *>(layer.ffn_gate_exps_b->data),
+                    buffers.scatter_indices, route_count, buffers.expert_counts, buffers.route_offsets,
+                    buffers.block_offsets, buffers.block_schedule, schedule_capacity, state->stream),
+                "MoE down projection") ||
             !gptoss_hip_ok(gptoss_moe_combine_launch(buffers.cur, buffers.next, buffers.expert_outputs,
                                                      buffers.selected_weights, ubatch.n_tokens, state->stream),
                            "MoE combine")) {

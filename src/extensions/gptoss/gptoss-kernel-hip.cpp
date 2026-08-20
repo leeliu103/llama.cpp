@@ -152,7 +152,7 @@ hipError_t gptoss_decode_layer_launch(bool swa, const gptoss_decode_layer_params
     const void * kernel = swa ? reinterpret_cast<const void *>(gptoss_decode_layer_swa_kernel) :
                                 reinterpret_cast<const void *>(gptoss_decode_layer_full_kernel);
 
-    void * args[] = { const_cast<gptoss_decode_layer_params *>(&params) };
+    void * kernel_params[] = { const_cast<gptoss_decode_layer_params *>(&params) };
     return hipLaunchCooperativeKernel(kernel, dim3(gptoss_decode_grid_blocks),
-                                      dim3(gptoss_decode_block_x, gptoss_decode_block_y), args, 0, stream);
+                                      dim3(gptoss_decode_block_x, gptoss_decode_block_y), kernel_params, 0, stream);
 }
