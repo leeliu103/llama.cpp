@@ -2,7 +2,7 @@
 
 #include "extensions/hip-workspace.h"
 #include "gptoss-config.h"
-#include "gptoss-kernel.h"
+#include "gptoss-kernel-hip.h"
 
 #include <algorithm>
 

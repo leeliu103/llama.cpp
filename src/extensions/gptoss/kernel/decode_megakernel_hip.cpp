@@ -2,7 +2,7 @@
 // transformer layer using llama.cpp's packed weights and physical KV rows.
 
 #include "../gptoss-config.h"
-#include "../gptoss-kernel.h"
+#include "../gptoss-kernel-hip.h"
 
 #include <float.h>
 #include <hip/hip_cooperative_groups.h>

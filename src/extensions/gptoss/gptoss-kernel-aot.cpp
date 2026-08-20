@@ -1,4 +1,4 @@
-#include "gptoss-aot.h"
+#include "gptoss-kernel-aot.h"
 
 #include "gptoss-config.h"
 
