@@ -53,9 +53,6 @@ struct gptoss_context_state {
 
     hipblasHandle_t hipblas = nullptr;
 
-    const uint8_t * token_embedding      = nullptr;
-    void *          token_embedding_copy = nullptr;
-
     llama_hip_workspace workspace;
 };
 
@@ -443,9 +440,6 @@ void gptoss_context_free(llama_context * ctx) {
     if (state->hipblas != nullptr) {
         (void) hipblasDestroy(state->hipblas);
     }
-    if (state->token_embedding_copy != nullptr) {
-        (void) hipFree(state->token_embedding_copy);
-    }
     (void) gptoss_hip_ok(state->workspace.free(), "workspace free");
 
     if (state->q8_qkv_module != nullptr) {
@@ -495,12 +489,10 @@ bool gptoss_model_init(llama_model * model) {
         return false;
     }
 
-    const auto tensor_is = [](const ggml_tensor * tensor, ggml_type type) {
-        return tensor != nullptr && tensor->type == type && tensor->data != nullptr && tensor->buffer != nullptr;
-    };
-    const auto device_tensor_is = [model, &tensor_is](const ggml_tensor * tensor, ggml_type type) {
-        return tensor_is(tensor, type) &&
-               ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer)) == model->dev_layer(0);
+    const auto hip_buft = ggml_backend_cuda_buffer_type(0);
+    const auto device_tensor_is = [hip_buft](const ggml_tensor * tensor, ggml_type type) {
+        return tensor != nullptr && tensor->type == type && tensor->data != nullptr && tensor->buffer != nullptr &&
+               ggml_backend_buffer_get_type(tensor->buffer) == hip_buft;
     };
     const auto follows = [](const ggml_tensor * first, const ggml_tensor * second) {
         if (first->buffer != second->buffer) {
@@ -513,7 +505,7 @@ bool gptoss_model_init(llama_model * model) {
         return reinterpret_cast<uintptr_t>(second->data) == reinterpret_cast<uintptr_t>(first->data) + size;
     };
 
-    if (!tensor_is(model->tok_embd, GGML_TYPE_Q8_0) || !device_tensor_is(model->output, GGML_TYPE_Q8_0) ||
+    if (!device_tensor_is(model->tok_embd, GGML_TYPE_Q8_0) || !device_tensor_is(model->output, GGML_TYPE_Q8_0) ||
         !device_tensor_is(model->output_norm, GGML_TYPE_F32)) {
         LLAMA_LOG_ERROR("%s: unsupported model tensors\n", __func__);
         return false;
@@ -601,7 +593,6 @@ bool gptoss_model_init(llama_model * model) {
 }
 
 bool gptoss_context_init(llama_context * ctx) {
-    const auto & model   = ctx->get_model();
     const auto & cparams = ctx->get_cparams();
 
     if (!cparams.causal_attn || !cparams.flash_attn || !cparams.offload_kqv) {
@@ -621,19 +612,6 @@ bool gptoss_context_init(llama_context * ctx) {
     if (hipStreamCreateWithFlags(&state->stream, hipStreamNonBlocking) != hipSuccess) {
         gptoss_context_free(ctx);
         return false;
-    }
-
-    state->token_embedding      = static_cast<const uint8_t *>(model.tok_embd->data);
-    auto * token_embedding_buft = ggml_backend_buffer_get_type(model.tok_embd->buffer);
-    auto * token_embedding_dev  = ggml_backend_buft_get_device(token_embedding_buft);
-    if (token_embedding_dev == nullptr || ggml_backend_dev_type(token_embedding_dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-        const size_t size = ggml_nbytes(model.tok_embd);
-        if (hipMalloc(&state->token_embedding_copy, size) != hipSuccess ||
-            hipMemcpy(state->token_embedding_copy, model.tok_embd->data, size, hipMemcpyHostToDevice) != hipSuccess) {
-            gptoss_context_free(ctx);
-            return false;
-        }
-        state->token_embedding = static_cast<const uint8_t *>(state->token_embedding_copy);
     }
 
     if (hipModuleLoad(&state->q8_qkv_module, GPTOSS_AOT_DIR "/q8_qkv.hsaco") != hipSuccess ||
@@ -766,7 +744,8 @@ int gptoss_prefill(llama_context *                ctx,
 
     if (!gptoss_hip_ok(
             gptoss_embedding_q8_0_launch(
-                buffers.cur, state->token_embedding, buffers.tokens, ubatch.n_tokens, state->stream),
+                buffers.cur, static_cast<const uint8_t *>(model.tok_embd->data), buffers.tokens, ubatch.n_tokens,
+                state->stream),
             "token embedding")) {
         return -1;
     }
@@ -987,8 +966,9 @@ int gptoss_decode(llama_context *                ctx,
     const auto & cparams = ctx->get_cparams();
 
     if (!gptoss_hip_ok(
-            gptoss_embedding_q8_0_launch(buffers.cur, state->token_embedding, buffers.token, 1, state->stream),
-                       "token embedding")) {
+            gptoss_embedding_q8_0_launch(buffers.cur, static_cast<const uint8_t *>(model.tok_embd->data),
+                                         buffers.token, 1, state->stream),
+            "token embedding")) {
         return -1;
     }
 
