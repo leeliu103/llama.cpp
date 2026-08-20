@@ -1,5 +1,6 @@
 #include "gptoss-extension.h"
 
+#include "extensions/hip-workspace.h"
 #include "extensions/llama-execution-extension.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -91,8 +92,7 @@ struct gptoss_context_state {
     const uint8_t * token_embedding      = nullptr;
     void *          token_embedding_copy = nullptr;
 
-    void * workspace      = nullptr;
-    size_t workspace_size = 0;
+    llama_hip_workspace workspace;
 };
 
 struct gptoss_q8_qkv_args {
@@ -257,42 +257,6 @@ struct gptoss_stream_guard {
 };
 
 size_t gptoss_tensor_alloc_size(const ggml_tensor * tensor);
-
-bool gptoss_workspace_reserve(gptoss_context_state * state, size_t size) {
-    if (size <= state->workspace_size) {
-        return true;
-    }
-
-    if (state->workspace != nullptr) {
-        if (!gptoss_hip_ok(hipStreamSynchronize(state->stream), "workspace synchronize") ||
-            !gptoss_hip_ok(hipFree(state->workspace), "workspace free")) {
-            return false;
-        }
-        state->workspace      = nullptr;
-        state->workspace_size = 0;
-    }
-
-    if (!gptoss_hip_ok(hipMalloc(&state->workspace, size), "workspace allocation")) {
-        return false;
-    }
-
-    state->workspace_size = size;
-    return true;
-}
-
-struct gptoss_arena {
-    explicit gptoss_arena(void * data) : data(static_cast<uint8_t *>(data)) {}
-
-    template <typename T> T * take(size_t count) {
-        offset     = GGML_PAD(offset, 256);
-        T * result = data == nullptr ? nullptr : reinterpret_cast<T *>(data + offset);
-        offset += count * sizeof(T);
-        return result;
-    }
-
-    uint8_t * data;
-    size_t    offset = 0;
-};
 
 struct gptoss_sequence_span {
     llama_seq_id sequence;
@@ -540,52 +504,48 @@ struct gptoss_prefill_buffers {
 
     uint8_t * final_q8;
     float *   logits;
-
-    size_t size;
 };
 
-gptoss_prefill_buffers gptoss_make_prefill_buffers(void *   workspace,
-                                                   uint32_t n_tokens,
-                                                   bool     output,
-                                                   uint32_t n_sequences,
-                                                   uint32_t n_base_table_elements,
-                                                   uint32_t n_swa_table_elements) {
+gptoss_prefill_buffers gptoss_make_prefill_buffers(llama_hip_workspace_cursor & cursor,
+                                                   uint32_t                     n_tokens,
+                                                   bool                         output,
+                                                   uint32_t                     n_sequences,
+                                                   uint32_t                     n_base_table_elements,
+                                                   uint32_t                     n_swa_table_elements) {
     const uint32_t route_count = n_tokens * gptoss_expert_used_count;
     const uint32_t schedule_capacity =
         (route_count + gptoss_ogs_block_m - 1) / gptoss_ogs_block_m + gptoss_expert_count - 1;
-    gptoss_arena           arena(workspace);
     gptoss_prefill_buffers result = {};
 
-    result.tokens             = arena.take<int32_t>(n_tokens);
-    result.positions          = arena.take<int32_t>(n_tokens);
-    result.base_write_rows    = arena.take<int64_t>(n_tokens);
-    result.swa_write_rows     = arena.take<int64_t>(n_tokens);
-    result.base_block_table   = arena.take<int32_t>(n_base_table_elements);
-    result.swa_block_table    = arena.take<int32_t>(n_swa_table_elements);
-    result.cu_seqlens_q       = arena.take<int32_t>(n_sequences + 1);
-    result.base_seq_lens      = arena.take<int32_t>(n_sequences);
-    result.swa_seq_lens       = arena.take<int32_t>(n_sequences);
-    result.cur                = arena.take<float>(static_cast<size_t>(n_tokens) * gptoss_hidden_size);
-    result.next               = arena.take<float>(static_cast<size_t>(n_tokens) * gptoss_hidden_size);
-    result.norm               = arena.take<__half>(static_cast<size_t>(n_tokens) * gptoss_hidden_size);
-    result.rope_base          = arena.take<float>(static_cast<size_t>(n_tokens) * gptoss_head_size);
-    result.rope_swa           = arena.take<float>(static_cast<size_t>(n_tokens) * gptoss_head_size);
-    result.qkv                = arena.take<__half>(static_cast<size_t>(n_tokens) * gptoss_qkv_size);
-    result.q                  = arena.take<__half>(static_cast<size_t>(n_tokens) * gptoss_query_size);
-    result.router_logits      = arena.take<float>(static_cast<size_t>(n_tokens) * gptoss_expert_count);
-    result.selected_ids       = arena.take<int32_t>(route_count);
-    result.selected_weights   = arena.take<float>(route_count);
-    result.gather_indices     = arena.take<int32_t>(route_count);
-    result.scatter_indices    = arena.take<int32_t>(route_count);
-    result.expert_counts      = arena.take<int32_t>(gptoss_expert_count);
-    result.route_offsets      = arena.take<int32_t>(gptoss_expert_count + 1);
-    result.block_offsets      = arena.take<int32_t>(gptoss_expert_count + 1);
-    result.block_schedule     = arena.take<int32_t>(schedule_capacity);
-    result.expert_activations = arena.take<__half>(static_cast<size_t>(route_count) * gptoss_intermediate_size);
-    result.expert_outputs     = arena.take<float>(static_cast<size_t>(route_count) * gptoss_hidden_size);
-    result.final_q8           = arena.take<uint8_t>(output ? gptoss_q8_1_row_size : 0);
-    result.logits             = arena.take<float>(output ? gptoss_vocabulary_size : 0);
-    result.size               = arena.offset;
+    result.tokens             = cursor.take<int32_t>(n_tokens);
+    result.positions          = cursor.take<int32_t>(n_tokens);
+    result.base_write_rows    = cursor.take<int64_t>(n_tokens);
+    result.swa_write_rows     = cursor.take<int64_t>(n_tokens);
+    result.base_block_table   = cursor.take<int32_t>(n_base_table_elements);
+    result.swa_block_table    = cursor.take<int32_t>(n_swa_table_elements);
+    result.cu_seqlens_q       = cursor.take<int32_t>(n_sequences + 1);
+    result.base_seq_lens      = cursor.take<int32_t>(n_sequences);
+    result.swa_seq_lens       = cursor.take<int32_t>(n_sequences);
+    result.cur                = cursor.take<float>(static_cast<size_t>(n_tokens) * gptoss_hidden_size);
+    result.next               = cursor.take<float>(static_cast<size_t>(n_tokens) * gptoss_hidden_size);
+    result.norm               = cursor.take<__half>(static_cast<size_t>(n_tokens) * gptoss_hidden_size);
+    result.rope_base          = cursor.take<float>(static_cast<size_t>(n_tokens) * gptoss_head_size);
+    result.rope_swa           = cursor.take<float>(static_cast<size_t>(n_tokens) * gptoss_head_size);
+    result.qkv                = cursor.take<__half>(static_cast<size_t>(n_tokens) * gptoss_qkv_size);
+    result.q                  = cursor.take<__half>(static_cast<size_t>(n_tokens) * gptoss_query_size);
+    result.router_logits      = cursor.take<float>(static_cast<size_t>(n_tokens) * gptoss_expert_count);
+    result.selected_ids       = cursor.take<int32_t>(route_count);
+    result.selected_weights   = cursor.take<float>(route_count);
+    result.gather_indices     = cursor.take<int32_t>(route_count);
+    result.scatter_indices    = cursor.take<int32_t>(route_count);
+    result.expert_counts      = cursor.take<int32_t>(gptoss_expert_count);
+    result.route_offsets      = cursor.take<int32_t>(gptoss_expert_count + 1);
+    result.block_offsets      = cursor.take<int32_t>(gptoss_expert_count + 1);
+    result.block_schedule     = cursor.take<int32_t>(schedule_capacity);
+    result.expert_activations = cursor.take<__half>(static_cast<size_t>(route_count) * gptoss_intermediate_size);
+    result.expert_outputs     = cursor.take<float>(static_cast<size_t>(route_count) * gptoss_hidden_size);
+    result.final_q8           = cursor.take<uint8_t>(output ? gptoss_q8_1_row_size : 0);
+    result.logits             = cursor.take<float>(output ? gptoss_vocabulary_size : 0);
 
     return result;
 }
@@ -609,40 +569,36 @@ struct gptoss_decode_buffers {
 
     uint8_t * final_q8;
     float *   logits;
-
-    size_t size;
 };
 
-gptoss_decode_buffers gptoss_make_decode_buffers(void *   workspace,
-                                                 size_t   n_base_rows,
-                                                 size_t   n_swa_rows,
-                                                 bool     output) {
+gptoss_decode_buffers gptoss_make_decode_buffers(llama_hip_workspace_cursor & cursor,
+                                                 size_t                       n_base_rows,
+                                                 size_t                       n_swa_rows,
+                                                 bool                         output) {
     const uint32_t partitions = static_cast<uint32_t>(std::min<size_t>(
         gptoss_max_attention_parts,
         std::max<size_t>(2, (n_base_rows + gptoss_swa_size - 1) / gptoss_swa_size)));
 
-    gptoss_arena          arena(workspace);
     gptoss_decode_buffers result = {};
 
-    result.token            = arena.take<int32_t>(1);
-    result.base_rows        = arena.take<int32_t>(n_base_rows + n_swa_rows);
+    result.token            = cursor.take<int32_t>(1);
+    result.base_rows        = cursor.take<int32_t>(n_base_rows + n_swa_rows);
     result.swa_rows         = result.base_rows == nullptr ? nullptr : result.base_rows + n_base_rows;
-    result.cur              = arena.take<float>(gptoss_hidden_size);
-    result.next             = arena.take<float>(gptoss_hidden_size);
-    result.rms_partials     = arena.take<float>(gptoss_decode_grid_blocks);
+    result.cur              = cursor.take<float>(gptoss_hidden_size);
+    result.next             = cursor.take<float>(gptoss_hidden_size);
+    result.rms_partials     = cursor.take<float>(gptoss_decode_grid_blocks);
     result.activation_scratch =
-        arena.take<__half>(gptoss_hidden_size * (1 + gptoss_expert_used_count));
-    result.query            = arena.take<__half>(gptoss_query_size);
-    result.router_scores    = arena.take<float>(gptoss_expert_count);
-    result.selected_experts = arena.take<int32_t>(gptoss_expert_used_count);
-    result.selected_weights = arena.take<float>(gptoss_expert_used_count);
+        cursor.take<__half>(gptoss_hidden_size * (1 + gptoss_expert_used_count));
+    result.query            = cursor.take<__half>(gptoss_query_size);
+    result.router_scores    = cursor.take<float>(gptoss_expert_count);
+    result.selected_experts = cursor.take<int32_t>(gptoss_expert_used_count);
+    result.selected_weights = cursor.take<float>(gptoss_expert_used_count);
     result.attention_parts =
-        arena.take<float>(static_cast<size_t>(gptoss_query_head_count) * partitions * gptoss_head_size);
-    result.attention_meta       = arena.take<float2>(static_cast<size_t>(gptoss_query_head_count) * partitions);
+        cursor.take<float>(static_cast<size_t>(gptoss_query_head_count) * partitions * gptoss_head_size);
+    result.attention_meta       = cursor.take<float2>(static_cast<size_t>(gptoss_query_head_count) * partitions);
     result.attention_partitions = partitions;
-    result.final_q8             = arena.take<uint8_t>(output ? gptoss_q8_1_row_size : 0);
-    result.logits               = arena.take<float>(output ? gptoss_vocabulary_size : 0);
-    result.size                 = arena.offset;
+    result.final_q8             = cursor.take<uint8_t>(output ? gptoss_q8_1_row_size : 0);
+    result.logits               = cursor.take<float>(output ? gptoss_vocabulary_size : 0);
 
     return result;
 }
@@ -664,9 +620,7 @@ void gptoss_context_free(llama_context * ctx) {
     if (state->token_embedding_copy != nullptr) {
         (void) hipFree(state->token_embedding_copy);
     }
-    if (state->workspace != nullptr) {
-        (void) hipFree(state->workspace);
-    }
+    (void) gptoss_hip_ok(state->workspace.free(), "workspace free");
 
     if (state->q8_qkv_module != nullptr) {
         (void) hipModuleUnload(state->q8_qkv_module);
@@ -927,17 +881,25 @@ int gptoss_prefill(llama_context *                ctx,
         return -1;
     }
 
-    auto buffers = gptoss_make_prefill_buffers(
-        nullptr, ubatch.n_tokens, output, static_cast<uint32_t>(spans.size()),
+    llama_hip_workspace_cursor measure;
+    (void) gptoss_make_prefill_buffers(
+        measure, ubatch.n_tokens, output, static_cast<uint32_t>(spans.size()),
         static_cast<uint32_t>(base_fa.block_table.size()), static_cast<uint32_t>(swa_fa.block_table.size()));
-    if (!gptoss_workspace_reserve(state, buffers.size)) {
+    if (!measure.valid()) {
+        LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
         return -1;
     }
-    buffers =
-        gptoss_make_prefill_buffers(state->workspace, ubatch.n_tokens, output,
-                                    static_cast<uint32_t>(spans.size()),
-                                    static_cast<uint32_t>(base_fa.block_table.size()),
-                                    static_cast<uint32_t>(swa_fa.block_table.size()));
+    if (!gptoss_hip_ok(state->workspace.reserve(measure.size()), "workspace reserve")) {
+        return -1;
+    }
+    llama_hip_workspace_cursor bind(state->workspace.data(), measure.size());
+    auto buffers = gptoss_make_prefill_buffers(bind, ubatch.n_tokens, output, static_cast<uint32_t>(spans.size()),
+                                               static_cast<uint32_t>(base_fa.block_table.size()),
+                                               static_cast<uint32_t>(swa_fa.block_table.size()));
+    if (!bind.valid() || bind.size() != measure.size()) {
+        LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
+        return -1;
+    }
 
     gptoss_stream_guard stream_guard(state->stream);
     if (!gptoss_hip_ok(hipMemcpyAsync(buffers.tokens, ubatch.token, ubatch.n_tokens * sizeof(int32_t),
@@ -1221,11 +1183,21 @@ int gptoss_decode(llama_context *                ctx,
         return -1;
     }
 
-    auto buffers = gptoss_make_decode_buffers(nullptr, base.read_rows.size(), swa.read_rows.size(), output);
-    if (!gptoss_workspace_reserve(state, buffers.size)) {
+    llama_hip_workspace_cursor measure;
+    (void) gptoss_make_decode_buffers(measure, base.read_rows.size(), swa.read_rows.size(), output);
+    if (!measure.valid()) {
+        LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
         return -1;
     }
-    buffers = gptoss_make_decode_buffers(state->workspace, base.read_rows.size(), swa.read_rows.size(), output);
+    if (!gptoss_hip_ok(state->workspace.reserve(measure.size()), "workspace reserve")) {
+        return -1;
+    }
+    llama_hip_workspace_cursor bind(state->workspace.data(), measure.size());
+    auto buffers = gptoss_make_decode_buffers(bind, base.read_rows.size(), swa.read_rows.size(), output);
+    if (!bind.valid() || bind.size() != measure.size()) {
+        LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
+        return -1;
+    }
 
     gptoss_stream_guard stream_guard(state->stream);
     if (!gptoss_hip_ok(
