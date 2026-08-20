@@ -1,5 +1,6 @@
 #include "gptoss-extension.h"
 
+#include "extensions/hip-aot-loader.h"
 #include "extensions/hip-workspace.h"
 #include "extensions/llama-execution-extension.h"
 #include "ggml-backend.h"
@@ -25,8 +26,6 @@
 #include <cstring>
 #include <limits>
 #include <utility>
-
-#define GPTOSS_AOT_DIR "/app/llama.cpp/src/extensions/gptoss/build/gfx1201"
 
 namespace {
 
@@ -245,6 +244,13 @@ bool gptoss_context_init(llama_context * ctx) {
         return false;
     }
 
+    hipDeviceProp_t properties{};
+    if (!gptoss_hip_ok(hipGetDeviceProperties(&properties, 0), "get device properties")) {
+        return false;
+    }
+
+    const llama_hip_aot_loader aot_loader(GPTOSS_AOT_ROOT, properties);
+
     auto * state                   = new gptoss_context_state;
     ctx->execution_extension_state = state;
 
@@ -253,19 +259,19 @@ bool gptoss_context_init(llama_context * ctx) {
         return false;
     }
 
-    if (hipModuleLoad(&state->q8_qkv_module, GPTOSS_AOT_DIR "/q8_qkv.hsaco") != hipSuccess ||
+    if (!aot_loader.load(&state->q8_qkv_module, "q8_qkv.hsaco") ||
         hipModuleGetFunction(&state->q8_qkv, state->q8_qkv_module, "gptoss_q8_0_w8a16_qkv_bias") != hipSuccess ||
-        hipModuleLoad(&state->q8_attn_out_module, GPTOSS_AOT_DIR "/q8_attn_out.hsaco") != hipSuccess ||
+        !aot_loader.load(&state->q8_attn_out_module, "q8_attn_out.hsaco") ||
         hipModuleGetFunction(&state->q8_attn_out, state->q8_attn_out_module,
                              "gptoss_q8_0_w8a16_attn_output_bias_residual") != hipSuccess ||
-        hipModuleLoad(&state->fa_full_module, GPTOSS_AOT_DIR "/fa_full.hsaco") != hipSuccess ||
+        !aot_loader.load(&state->fa_full_module, "fa_full.hsaco") ||
         hipModuleGetFunction(&state->fa_full, state->fa_full_module, gptoss_fa_name) != hipSuccess ||
-        hipModuleLoad(&state->fa_swa_module, GPTOSS_AOT_DIR "/fa_sw128.hsaco") != hipSuccess ||
+        !aot_loader.load(&state->fa_swa_module, "fa_sw128.hsaco") ||
         hipModuleGetFunction(&state->fa_swa, state->fa_swa_module, gptoss_fa_name) != hipSuccess ||
-        hipModuleLoad(&state->ogs_w13_module, GPTOSS_AOT_DIR "/ogs_w13.hsaco") != hipSuccess ||
+        !aot_loader.load(&state->ogs_w13_module, "ogs_w13.hsaco") ||
         hipModuleGetFunction(&state->ogs_w13, state->ogs_w13_module,
                              "_matmul_NNN_fp16xfp16xmxfp4_64x128x128x1_swiglu") != hipSuccess ||
-        hipModuleLoad(&state->ogs_w2_module, GPTOSS_AOT_DIR "/ogs_w2.hsaco") != hipSuccess ||
+        !aot_loader.load(&state->ogs_w2_module, "ogs_w2.hsaco") ||
         hipModuleGetFunction(&state->ogs_w2, state->ogs_w2_module, "_matmul_NNN_fp32xfp16xmxfp4_64x128x128x1") !=
             hipSuccess ||
         hipblasCreate(&state->hipblas) != HIPBLAS_STATUS_SUCCESS ||

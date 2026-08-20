@@ -471,8 +471,7 @@ def _compile_kernel(backend, target, spec):
     return compiled.asm[backend.binary_ext]
 
 
-def _compile_arch(arch, specs):
-    output_dir = ROOT / "build" / arch
+def _compile_arch(arch, specs, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     target = GPUTarget("hip", arch, 32)
@@ -492,10 +491,15 @@ def main():
         choices=("gfx1201",),
         required=True,
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+    )
     args = parser.parse_args()
 
     specs = _build_kernel_specs()
-    _compile_arch(args.arch, specs)
+    _compile_arch(args.arch, specs, args.output_dir)
 
 
 if __name__ == "__main__":
