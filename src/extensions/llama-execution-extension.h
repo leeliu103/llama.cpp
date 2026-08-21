@@ -25,8 +25,4 @@ struct llama_execution_extension {
     size_t (*tensor_alloc_size)(const ggml_tensor * tensor);
 };
 
-bool llama_execution_extensions_register();
-
-bool llama_execution_extension_register(llm_arch arch, const llama_execution_extension * extension);
-
 const llama_execution_extension * llama_execution_extension_get(llm_arch arch);
