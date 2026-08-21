@@ -29,7 +29,8 @@
 
 namespace {
 
-constexpr const char * gptoss_fa_name = "kernel_unified_attention_2d";
+constexpr const char * gptoss_fa_name            = "kernel_unified_attention_2d";
+constexpr size_t       gptoss_workspace_headroom = 4 * 1024 * 1024;
 
 struct gptoss_context_state {
     hipStream_t stream = nullptr;
@@ -319,7 +320,7 @@ int gptoss_prefill(llama_context *                ctx,
         LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
         return -1;
     }
-    if (!gptoss_hip_ok(state->workspace.reserve(measure.size()), "workspace reserve")) {
+    if (!gptoss_hip_ok(state->workspace.reserve(measure.size(), gptoss_workspace_headroom), "workspace reserve")) {
         return -1;
     }
     llama_hip_workspace_cursor bind(state->workspace.data(), measure.size());
@@ -555,7 +556,7 @@ int gptoss_decode(llama_context *                ctx,
         LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
         return -1;
     }
-    if (!gptoss_hip_ok(state->workspace.reserve(measure.size()), "workspace reserve")) {
+    if (!gptoss_hip_ok(state->workspace.reserve(measure.size(), gptoss_workspace_headroom), "workspace reserve")) {
         return -1;
     }
     llama_hip_workspace_cursor bind(state->workspace.data(), measure.size());

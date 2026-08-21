@@ -22,9 +22,14 @@ public:
     }
 
     // The caller must select the allocation device and synchronize users before storage is freed.
-    hipError_t reserve(size_t size) {
+    hipError_t reserve(size_t size, size_t preferred_headroom = 0) {
         if (size <= capacity_) {
             return hipSuccess;
+        }
+
+        size_t allocation_size = size;
+        if (preferred_headroom <= std::numeric_limits<size_t>::max() - size) {
+            allocation_size += preferred_headroom;
         }
 
         hipError_t error = free();
@@ -33,10 +38,17 @@ public:
         }
 
         void * data = nullptr;
-        error       = hipMalloc(&data, size);
+        error       = hipMalloc(&data, allocation_size);
+        if (error == hipErrorOutOfMemory && allocation_size != size) {
+            (void) hipGetLastError();
+            data            = nullptr;
+            allocation_size = size;
+            error           = hipMalloc(&data, allocation_size);
+        }
+
         if (error == hipSuccess) {
             data_     = data;
-            capacity_ = size;
+            capacity_ = allocation_size;
         }
         return error;
     }
