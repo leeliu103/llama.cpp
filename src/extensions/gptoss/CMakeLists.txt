@@ -83,7 +83,6 @@ foreach(architecture IN LISTS LLAMA_GPTOSS_AOT_ARCHITECTURES)
             --output-dir "${gptoss_aot_output_dir}"
         DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-aot.py"
-            "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-aot-deps.json"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernel/matmul_q8_0_w8a16.py"
         COMMENT "Generating GPT-OSS AOT kernels for ${architecture}"
         VERBATIM
