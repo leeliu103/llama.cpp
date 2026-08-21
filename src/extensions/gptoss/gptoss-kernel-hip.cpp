@@ -18,7 +18,7 @@ __global__ void gptoss_build_rope_cache_f32(float *         cache,
                                             float           theta_scale);
 __global__ void gptoss_qkv_rope_cache_f16(__half *,
                                           __half *,
-                                          uint16_t *,
+                                          __half *,
                                           const __half *,
                                           const float *,
                                           const int64_t *);
@@ -96,7 +96,7 @@ hipError_t gptoss_qkv_rope_cache_launch(__half *        q,
                                         hipStream_t     stream) {
     hipLaunchKernelGGL(gptoss_qkv_rope_cache_f16,
                        dim3(n_tokens, gptoss_query_head_count / gptoss_kv_head_count + 1), dim3(256), 0, stream, q,
-                       cache_k, reinterpret_cast<uint16_t *>(cache_v), qkv, rope_cache, kv_dst_rows);
+                       cache_k, cache_v, qkv, rope_cache, kv_dst_rows);
     return hipGetLastError();
 }
 

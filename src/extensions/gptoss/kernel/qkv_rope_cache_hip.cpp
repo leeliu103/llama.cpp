@@ -8,7 +8,6 @@
 namespace {
 
 constexpr uint32_t attention_head_count    = gptoss_query_head_count;
-constexpr uint32_t attention_head_count_kv = gptoss_kv_head_count;
 constexpr uint32_t attention_head_size     = gptoss_head_size;
 
 __device__ float rope_yarn_ramp(float low, float high, int dimension) {
@@ -72,14 +71,14 @@ __global__ void gptoss_build_rope_cache_f32(float *               cache,
 
 __launch_bounds__(256) __global__ void gptoss_qkv_rope_cache_f16(__half *        q,
                                                                  __half *        cache_k,
-                                                                 uint16_t *      cache_v,
+                                                                 __half *        cache_v,
                                                                  const __half *  qkv,
                                                                  const float *   rope_cache,
                                                                  const int64_t * kv_dst_rows) {
     constexpr uint32_t half_head_size = attention_head_size / 2;
-    constexpr uint32_t query_size     = attention_head_count * attention_head_size;
-    constexpr uint32_t key_value_size = attention_head_count_kv * attention_head_size;
-    constexpr uint32_t qkv_size       = query_size + 2 * key_value_size;
+    constexpr uint32_t query_size     = gptoss_query_size;
+    constexpr uint32_t key_value_size = gptoss_key_value_size;
+    constexpr uint32_t qkv_size       = gptoss_qkv_size;
     constexpr uint32_t query_groups   = attention_head_count / 8;
 
     const uint32_t token     = blockIdx.x;
@@ -124,7 +123,6 @@ __launch_bounds__(256) __global__ void gptoss_qkv_rope_cache_f16(__half *       
     cache_k[dst + pair]                  = __float2half_rn(y0);
     cache_k[dst + pair + half_head_size] = __float2half_rn(y1);
 
-    const uint16_t * qkv_bits            = reinterpret_cast<const uint16_t *>(qkv);
-    cache_v[dst + pair]                  = qkv_bits[src_v + pair];
-    cache_v[dst + pair + half_head_size] = qkv_bits[src_v + pair + half_head_size];
+    cache_v[dst + pair]                  = qkv[src_v + pair];
+    cache_v[dst + pair + half_head_size] = qkv[src_v + pair + half_head_size];
 }
