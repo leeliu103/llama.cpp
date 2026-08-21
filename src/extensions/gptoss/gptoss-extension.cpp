@@ -695,6 +695,14 @@ int gptoss_decode(llama_context *                ctx,
     return gptoss_hip_ok(hipStreamSynchronize(state->stream), "decode synchronize") ? 0 : -1;
 }
 
+int gptoss_execute(llama_context *                ctx,
+                   const llama_ubatch &           ubatch,
+                   const llama_memory_context_i * mctx,
+                   float *                        logits_out) {
+    return ubatch.n_tokens > 1 ? gptoss_prefill(ctx, ubatch, mctx, logits_out) :
+                                 gptoss_decode(ctx, ubatch, mctx, logits_out);
+}
+
 size_t gptoss_tensor_alloc_size(const ggml_tensor * tensor) {
     if (tensor->type != GGML_TYPE_MXFP4 || std::strstr(tensor->name, ".ffn_up_exps.weight") == nullptr) {
         return 0;
@@ -721,5 +729,5 @@ size_t gptoss_tensor_alloc_size(const ggml_tensor * tensor) {
 
 const llama_execution_extension gptoss_execution_extension = {
     gptoss_model_init, gptoss_context_init, gptoss_context_free,
-    gptoss_prefill,    gptoss_decode,       gptoss_tensor_alloc_size,
+    gptoss_execute,    gptoss_tensor_alloc_size,
 };

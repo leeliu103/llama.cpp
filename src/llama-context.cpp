@@ -1858,8 +1858,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ABORT("%s: failed to apply execution extension memory context\n", __func__);
             }
 
-            const int ret = ubatch.n_tokens > 1 ? extension->prefill(this, ubatch, mctx.get(), logits_out) :
-                                                  extension->decode(this, ubatch, mctx.get(), logits_out);
+            const int ret = extension->execute(this, ubatch, mctx.get(), logits_out);
 
             if (ret != 0) {
                 GGML_ABORT("%s: execution extension failed with status %d\n", __func__, ret);
