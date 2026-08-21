@@ -1865,7 +1865,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
 
             n_outputs_prev += n_outputs;
-            n_tokens_prev += ubatch.n_tokens;
             continue;
         }
 

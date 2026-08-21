@@ -309,16 +309,7 @@ int gptoss_prefill(llama_context *                ctx,
 
     const uint32_t n_sequences = static_cast<uint32_t>(kv_batch.query_offsets.size() - 1);
 
-    bool output = false;
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        if (ubatch.output[i] != 0) {
-            output = true;
-            break;
-        }
-    }
-    if ((logits_out != nullptr) != output) {
-        return -1;
-    }
+    const bool output = logits_out != nullptr;
 
     llama_hip_workspace_cursor measure;
     (void) gptoss_make_prefill_buffers(measure, ubatch.n_tokens, output, n_sequences,
@@ -556,10 +547,7 @@ int gptoss_decode(llama_context *                ctx,
         return -1;
     }
 
-    const bool output = ubatch.output[0] != 0;
-    if ((logits_out != nullptr) != output) {
-        return -1;
-    }
+    const bool output = logits_out != nullptr;
 
     llama_hip_workspace_cursor measure;
     (void) gptoss_make_decode_buffers(measure, kv_batch.base.read_rows.size(), kv_batch.swa.read_rows.size(), output);
