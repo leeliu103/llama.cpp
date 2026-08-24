@@ -1,5 +1,6 @@
 #include "llama-context.h"
 
+#include "extensions/llama-execution-extension.h"
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -95,6 +96,9 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    const auto * extension =
+        !hparams.vocab_only && !hparams.no_alloc ? llama_execution_extension_get(model.arch) : nullptr;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -426,6 +430,7 @@ llama_context::llama_context(
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
+            extension == nullptr &&
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
@@ -458,7 +463,9 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        sched_reserve();
+        if (extension == nullptr) {
+            sched_reserve();
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -476,13 +483,25 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    if (extension != nullptr && !extension->context_init(this)) {
+        throw std::runtime_error("execution extension initialization failed");
+    }
 }
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
-    if (!model.hparams.no_alloc) {
+    if (!model.hparams.vocab_only && !model.hparams.no_alloc) {
+        const auto * extension = llama_execution_extension_get(model.arch);
+
+        if (extension != nullptr) {
+            extension->context_free(this);
+        }
+    }
+
+    if (!model.hparams.no_alloc && sched) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -703,11 +722,9 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
-    if (!sched) {
-        return;
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
     }
-
-    ggml_backend_sched_synchronize(sched.get());
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1650,6 +1667,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
+    const auto * extension =
+        !hparams.vocab_only && !hparams.no_alloc ? llama_execution_extension_get(model.arch) : nullptr;
+
     const int64_t n_vocab = vocab.n_tokens();
     const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
     const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
@@ -1657,6 +1677,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
     const bool has_samplers = !sampling.samplers.empty();
+
+    if (extension != nullptr) {
+        bool has_layer_inputs = false;
+        for (bool enabled : cparams.embeddings_layer_inp) {
+            if (enabled) {
+                has_layer_inputs = true;
+                break;
+            }
+        }
+
+        if (output_all || cparams.embeddings_nextn || has_layer_inputs || has_samplers) {
+            LLAMA_LOG_ERROR("%s: requested output mode is not supported by execution extensions\n", __func__);
+            return -1;
+        }
+    }
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
@@ -1726,12 +1761,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     output_swaps.clear();
 
-    sched_reserve();
-
     bool did_optimize = false;
 
-    // handle any pending shifts/copies
-    memory_update(false);
+    if (extension == nullptr) {
+        sched_reserve();
+
+        // handle any pending shifts/copies
+        memory_update(false);
+    }
 
     llama_memory_context_ptr mctx;
 
@@ -1753,7 +1790,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
                 {
-                    if (!did_optimize) {
+                    if (extension == nullptr && !did_optimize) {
                         did_optimize = true;
 
                         if (memory_update(true)) {
@@ -1809,6 +1846,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
+        }
+
+        if (extension != nullptr) {
+            GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
+            GGML_ASSERT((n_outputs_prev + n_outputs) * n_vocab <= (int64_t) logits.size);
+
+            float * logits_out = n_outputs > 0 ? logits.data + n_outputs_prev * n_vocab : nullptr;
+
+            if (!mctx->apply()) {
+                GGML_ABORT("%s: failed to apply execution extension memory context\n", __func__);
+            }
+
+            const int ret = extension->execute(this, ubatch, mctx.get(), logits_out);
+
+            if (ret != 0) {
+                GGML_ABORT("%s: execution extension failed with status %d\n", __func__, ret);
+            }
+
+            n_outputs_prev += n_outputs;
+            continue;
         }
 
         ggml_status status;
@@ -3256,6 +3313,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+
+    if (!sched) {
+        return ret;
+    }
+
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();

@@ -1,5 +1,6 @@
 #include "llama-model.h"
 
+#include "extensions/llama-execution-extension.h"
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
@@ -1264,10 +1265,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
     const auto & tensor_split = params.tensor_split;
 
+    const auto * extension         = llama_execution_extension_get(arch);
+    const auto   tensor_alloc_size = extension != nullptr ? extension->tensor_alloc_size : nullptr;
+
+    if (tensor_alloc_size != nullptr && ml.no_alloc) {
+        throw std::runtime_error("custom tensor allocation sizes do not support no_alloc");
+    }
+
+    if (tensor_alloc_size != nullptr && (split_mode == LLAMA_SPLIT_MODE_ROW || split_mode == LLAMA_SPLIT_MODE_TENSOR)) {
+        throw std::runtime_error("custom tensor allocation sizes do not support split buffers");
+    }
+
     const int n_layer_all = hparams.n_layer_all;
     const int n_gpu_layers = this->n_gpu_layers();
 
-    const bool use_mmap_buffer = true;
+    const bool use_mmap_buffer = tensor_alloc_size == nullptr;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
@@ -1601,7 +1613,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                buf = tensor_alloc_size != nullptr ?
+                          ggml_backend_alloc_ctx_tensors_from_buft_ext(ctx, buft, tensor_alloc_size) :
+                          ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);  // real buffer
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));

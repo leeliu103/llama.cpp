@@ -47,6 +47,8 @@ struct llama_context {
 
     ~llama_context();
 
+    void * execution_extension_state = nullptr;
+
     // reserve a new backend scheduler (if needed)
     // for example, when:
     //   - changing loras
