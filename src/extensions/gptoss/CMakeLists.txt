@@ -5,6 +5,7 @@ endif()
 set(LLAMA_GPTOSS_HIP_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-kernel-hip.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-repack-hip.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/decode_megakernel_hip.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/kernel/embedding_q8_0_hip.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/kernel/lm_head_mmvq_hip.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/kernel/moe_combine_hip.cpp"

@@ -5,6 +5,62 @@
 
 #include <cstdint>
 
+constexpr uint32_t gptoss_decode_grid_blocks = 120;
+constexpr uint32_t gptoss_decode_block_x     = 32;
+constexpr uint32_t gptoss_decode_block_y     = 8;
+
+struct gptoss_decode_layer_params {
+    float *       next;
+    const float * cur;
+    float *       rms_partials;
+
+    __half * activation_scratch;
+    __half * query;
+    float *  attn_parts;
+    float2 * attn_meta;
+    float *  router;
+    int32_t * expert_ids;
+    float *   expert_weights;
+
+    __half *        cache_k;
+    __half *        cache_v;
+    const int32_t * kv_rows;
+
+    const float *  attn_norm;
+    const int8_t * qkv_values;
+    const float *  attn_q_bias;
+    const float *  attn_k_bias;
+    const float *  attn_v_bias;
+
+    const int8_t * attn_output_values;
+    const float *  attn_output_bias;
+    const float *  attn_sinks;
+
+    const float * post_attention_norm;
+    const float * router_weight;
+    const float * router_bias;
+
+    const uint8_t * moe_down_values;
+    const uint8_t * moe_gate_up_values;
+    const float *   moe_down_bias;
+    const float *   moe_gate_up_bias;
+
+    uint32_t n_kv;
+    uint32_t kv_write_row;
+    uint32_t attn_parallel_blocks;
+    int32_t  position;
+    float    rms_epsilon;
+    float    rope_freq_scale;
+    float    rope_ext_factor;
+    float    rope_attn_factor;
+    float    rope_corr_low;
+    float    rope_corr_high;
+    float    rope_theta_scale;
+    uint32_t reuse_attention_rms;
+};
+
+static_assert(sizeof(gptoss_decode_layer_params) == 272);
+
 hipError_t gptoss_embedding_q8_0_launch(float *         output,
                                         const uint8_t * weight,
                                         const int32_t * tokens,
@@ -75,3 +131,5 @@ hipError_t gptoss_lm_head_mmvq_launch(const uint8_t * weight,
                                       const __half *  activation,
                                       float *         logits,
                                       hipStream_t     stream);
+
+hipError_t gptoss_decode_layer_launch(bool swa, const gptoss_decode_layer_params & params, hipStream_t stream);
