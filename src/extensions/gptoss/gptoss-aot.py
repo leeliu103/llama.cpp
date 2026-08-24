@@ -25,6 +25,7 @@ from matmul_q8_0_w8a16 import (
     gptoss_q8_0_w8a16_attn_output_bias_residual,
     gptoss_q8_0_w8a16_qkv_bias,
 )
+from router import gptoss_router
 
 
 @dataclass(frozen=True)
@@ -313,6 +314,29 @@ def _build_kernel_specs():
                 "BLOCK_N": 128,
                 "BLOCK_K": 128,
                 "GROUP_M_SIZE": 4,
+            },
+            compiler_options=_matmul_compiler_options(
+                num_warps=4,
+                num_stages=1,
+                waves_per_eu=0,
+            ),
+            assume_32_bit_pointer_range=True,
+        ),
+        KernelSpec(
+            output_name="router.hsaco",
+            kernel=gptoss_router,
+            runtime_types={
+                "output_ptr": "*fp32",
+                "activation_ptr": "*fp32",
+                "weight_ptr": "*fp32",
+                "m_size": "i32",
+            },
+            kernel_constants={
+                "N_SIZE": 32,
+                "K_SIZE": 2880,
+                "BLOCK_M": 8,
+                "BLOCK_N": 32,
+                "BLOCK_K": 16,
             },
             compiler_options=_matmul_compiler_options(
                 num_warps=4,

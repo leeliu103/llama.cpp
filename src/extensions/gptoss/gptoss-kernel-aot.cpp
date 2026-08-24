@@ -9,6 +9,10 @@ constexpr uint32_t gptoss_q8_block_n       = 128;
 constexpr uint32_t gptoss_q8_threads       = 128;
 constexpr uint32_t gptoss_q8_shared_memory = 16384;
 
+constexpr uint32_t gptoss_router_block_m       = 8;
+constexpr uint32_t gptoss_router_threads       = 128;
+constexpr uint32_t gptoss_router_shared_memory = 2048;
+
 constexpr uint32_t gptoss_fa_block_q       = 8;
 constexpr uint32_t gptoss_fa_threads       = 128;
 constexpr uint32_t gptoss_fa_shared_memory = 8192;
@@ -60,6 +64,23 @@ hipError_t gptoss_q8_attention_output_launch(hipFunction_t  function,
         ((gptoss_hidden_size + gptoss_q8_block_n - 1) / gptoss_q8_block_n);
     return hipModuleLaunchKernel(
         function, blocks, 1, 1, gptoss_q8_threads, 1, 1, gptoss_q8_shared_memory, stream, kernel_params, nullptr);
+}
+
+hipError_t gptoss_router_launch(hipFunction_t  function,
+                                float *        output,
+                                const float *  activation,
+                                const float *  weight,
+                                uint32_t       n_tokens,
+                                hipStream_t    stream) {
+    int32_t n_tokens_i32    = static_cast<int32_t>(n_tokens);
+    void *  global_scratch  = nullptr;
+    void *  profile_scratch = nullptr;
+    void * kernel_params[] = {
+        &output, &activation, &weight, &n_tokens_i32, &global_scratch, &profile_scratch,
+    };
+    const uint32_t blocks = (n_tokens + gptoss_router_block_m - 1) / gptoss_router_block_m;
+    return hipModuleLaunchKernel(function, blocks, 1, 1, gptoss_router_threads, 1, 1, gptoss_router_shared_memory,
+                                 stream, kernel_params, nullptr);
 }
 
 hipError_t gptoss_fa_launch(hipFunction_t  function,

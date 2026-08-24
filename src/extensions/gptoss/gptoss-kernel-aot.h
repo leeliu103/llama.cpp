@@ -26,6 +26,13 @@ hipError_t gptoss_q8_attention_output_launch(hipFunction_t  function,
                                              uint32_t       n_tokens,
                                              hipStream_t    stream);
 
+hipError_t gptoss_router_launch(hipFunction_t  function,
+                                float *        output,
+                                const float *  activation,
+                                const float *  weight,
+                                uint32_t       n_tokens,
+                                hipStream_t    stream);
+
 hipError_t gptoss_fa_launch(hipFunction_t  function,
                             __half *        output,
                             const __half *  query,

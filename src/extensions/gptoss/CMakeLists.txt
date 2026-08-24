@@ -29,8 +29,6 @@ target_sources(llama PRIVATE
     ${LLAMA_GPTOSS_HIP_SOURCES}
 )
 
-target_link_libraries(llama PRIVATE roc::hipblas)
-
 set(GPTOSS_AOT_ROOT "${CMAKE_CURRENT_BINARY_DIR}")
 
 target_compile_definitions(llama PRIVATE
@@ -59,6 +57,7 @@ endif()
 set(LLAMA_GPTOSS_AOT_KERNELS
     q8_qkv.hsaco
     q8_attn_out.hsaco
+    router.hsaco
     fa_full.hsaco
     fa_sw128.hsaco
     ogs_w13.hsaco
@@ -84,6 +83,7 @@ foreach(architecture IN LISTS LLAMA_GPTOSS_AOT_ARCHITECTURES)
         DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-aot.py"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernel/matmul_q8_0_w8a16.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernel/router.py"
         COMMENT "Generating GPT-OSS AOT kernels for ${architecture}"
         VERBATIM
     )

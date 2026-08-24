@@ -18,7 +18,6 @@
 #include "llama-model.h"
 
 #include <hip/hip_runtime_api.h>
-#include <hipblas/hipblas.h>
 
 #include <cmath>
 #include <cstddef>
@@ -37,6 +36,7 @@ struct gptoss_context_state {
 
     hipModule_t q8_qkv_module      = nullptr;
     hipModule_t q8_attn_out_module = nullptr;
+    hipModule_t router_module      = nullptr;
     hipModule_t fa_full_module     = nullptr;
     hipModule_t fa_swa_module      = nullptr;
     hipModule_t ogs_w13_module     = nullptr;
@@ -44,12 +44,11 @@ struct gptoss_context_state {
 
     hipFunction_t q8_qkv      = nullptr;
     hipFunction_t q8_attn_out = nullptr;
+    hipFunction_t router      = nullptr;
     hipFunction_t fa_full     = nullptr;
     hipFunction_t fa_swa      = nullptr;
     hipFunction_t ogs_w13     = nullptr;
     hipFunction_t ogs_w2      = nullptr;
-
-    hipblasHandle_t hipblas = nullptr;
 
     llama_hip_workspace workspace;
 };
@@ -76,9 +75,6 @@ void gptoss_context_free(llama_context * ctx) {
         (void) hipStreamSynchronize(state->stream);
     }
 
-    if (state->hipblas != nullptr) {
-        (void) hipblasDestroy(state->hipblas);
-    }
     (void) gptoss_hip_ok(state->workspace.free(), "workspace free");
 
     if (state->q8_qkv_module != nullptr) {
@@ -86,6 +82,9 @@ void gptoss_context_free(llama_context * ctx) {
     }
     if (state->q8_attn_out_module != nullptr) {
         (void) hipModuleUnload(state->q8_attn_out_module);
+    }
+    if (state->router_module != nullptr) {
+        (void) hipModuleUnload(state->router_module);
     }
     if (state->fa_full_module != nullptr) {
         (void) hipModuleUnload(state->fa_full_module);
@@ -265,6 +264,8 @@ bool gptoss_context_init(llama_context * ctx) {
         !aot_loader.load(&state->q8_attn_out_module, "q8_attn_out.hsaco") ||
         hipModuleGetFunction(&state->q8_attn_out, state->q8_attn_out_module,
                              "gptoss_q8_0_w8a16_attn_output_bias_residual") != hipSuccess ||
+        !aot_loader.load(&state->router_module, "router.hsaco") ||
+        hipModuleGetFunction(&state->router, state->router_module, "gptoss_router") != hipSuccess ||
         !aot_loader.load(&state->fa_full_module, "fa_full.hsaco") ||
         hipModuleGetFunction(&state->fa_full, state->fa_full_module, gptoss_fa_name) != hipSuccess ||
         !aot_loader.load(&state->fa_swa_module, "fa_sw128.hsaco") ||
@@ -274,9 +275,7 @@ bool gptoss_context_init(llama_context * ctx) {
                              "_matmul_NNN_fp16xfp16xmxfp4_64x128x128x1_swiglu") != hipSuccess ||
         !aot_loader.load(&state->ogs_w2_module, "ogs_w2.hsaco") ||
         hipModuleGetFunction(&state->ogs_w2, state->ogs_w2_module, "_matmul_NNN_fp32xfp16xmxfp4_64x128x128x1") !=
-            hipSuccess ||
-        hipblasCreate(&state->hipblas) != HIPBLAS_STATUS_SUCCESS ||
-        hipblasSetStream(state->hipblas, state->stream) != HIPBLAS_STATUS_SUCCESS) {
+            hipSuccess) {
         gptoss_context_free(ctx);
         return false;
     }
@@ -397,9 +396,6 @@ int gptoss_prefill(llama_context *                ctx,
         return -1;
     }
 
-    const float alpha = 1.0f;
-    const float beta  = 0.0f;
-
     for (uint32_t il = 0; il < gptoss_layer_count; ++il) {
         const llama_layer & layer  = model.layers[il];
         const bool          is_swa = hparams.is_swa(il);
@@ -459,11 +455,10 @@ int gptoss_prefill(llama_context *                ctx,
                            "post-attention RMS norm")) {
             return -1;
         }
-        if (hipblasSgemm(state->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_N, gptoss_expert_count, ubatch.n_tokens,
-                         gptoss_hidden_size, &alpha, static_cast<const float *>(layer.ffn_gate_inp->data),
-                         gptoss_hidden_size, buffers.cur, gptoss_hidden_size, &beta, buffers.router_logits,
-                         gptoss_expert_count) != HIPBLAS_STATUS_SUCCESS) {
-            LLAMA_LOG_ERROR("%s: router projection failed\n", __func__);
+        if (!gptoss_hip_ok(gptoss_router_launch(state->router, buffers.router_logits, buffers.cur,
+                                                static_cast<const float *>(layer.ffn_gate_inp->data), ubatch.n_tokens,
+                                                state->stream),
+                           "router projection")) {
             return -1;
         }
 
