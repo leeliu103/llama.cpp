@@ -3,7 +3,15 @@ if (NOT CMAKE_HIP_ARCHITECTURES)
 endif()
 
 set(LLAMA_GPTOSS_HIP_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-kernel-hip.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-repack-hip.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/embedding_q8_0_hip.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/lm_head_mmvq_hip.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/moe_combine_hip.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/ogs_build_routes_hip.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/qkv_rope_cache_hip.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/rms_norm_hip.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/topk_hip.cpp"
 )
 
 set_source_files_properties(
