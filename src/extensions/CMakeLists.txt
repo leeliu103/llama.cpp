@@ -6,3 +6,5 @@ target_sources(llama PRIVATE
 )
 
 target_link_libraries(llama PRIVATE hip::host)
+
+add_subdirectory(gptoss)
