@@ -94,3 +94,4 @@ endforeach()
 add_custom_target(llama-gptoss-aot
     DEPENDS ${LLAMA_GPTOSS_AOT_OUTPUTS}
 )
+add_dependencies(llama llama-gptoss-aot)
