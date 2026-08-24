@@ -165,6 +165,7 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -393,6 +394,9 @@ public:
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+
+    const llama_kv_cache * get_cache() const;
+    const llama_kv_cache::slot_info & get_slot_info() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
