@@ -24,11 +24,16 @@ set_source_files_properties(
 target_sources(llama PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-kernel-aot.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-buffers.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-extension.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-kv.cpp"
     ${LLAMA_GPTOSS_HIP_SOURCES}
 )
 
 set(GPTOSS_AOT_ROOT "${CMAKE_CURRENT_BINARY_DIR}")
+
+target_compile_definitions(llama PRIVATE
+    "GPTOSS_AOT_ROOT=\"${GPTOSS_AOT_ROOT}\""
+)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
