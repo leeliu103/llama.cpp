@@ -20,9 +20,11 @@ gptoss_prefill_buffers gptoss_make_prefill_buffers(llama_hip_workspace_cursor & 
                                                    uint32_t                     n_swa_table_elements) {
     gptoss_prefill_buffers result = {};
 
-    result.route_count       = n_tokens * gptoss_expert_used_count;
+    result.route_count = n_tokens * gptoss_expert_used_count;
+    const uint32_t ogs_block_m =
+        result.route_count <= gptoss_ogs_small_max_m ? gptoss_ogs_block_m_small : gptoss_ogs_block_m;
     result.schedule_capacity =
-        (result.route_count + gptoss_ogs_block_m - 1) / gptoss_ogs_block_m + gptoss_expert_count - 1;
+        (result.route_count + ogs_block_m - 1) / ogs_block_m + gptoss_expert_count - 1;
 
     result.tokens             = cursor.take<int32_t>(n_tokens);
     result.positions          = cursor.take<int32_t>(n_tokens);

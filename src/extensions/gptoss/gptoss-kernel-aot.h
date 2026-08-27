@@ -59,6 +59,7 @@ hipError_t gptoss_ogs_w13_launch(hipFunction_t  function,
                                  const int32_t * block_offsets,
                                  const int32_t * block_schedule,
                                  uint32_t        schedule_capacity,
+                                 bool            use_small_tiles,
                                  hipStream_t     stream);
 
 hipError_t gptoss_ogs_w2_launch(hipFunction_t  function,
@@ -74,4 +75,5 @@ hipError_t gptoss_ogs_w2_launch(hipFunction_t  function,
                                 const int32_t * block_offsets,
                                 const int32_t * block_schedule,
                                 uint32_t        schedule_capacity,
+                                bool            use_small_tiles,
                                 hipStream_t     stream);

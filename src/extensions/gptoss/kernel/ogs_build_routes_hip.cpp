@@ -24,7 +24,9 @@ __launch_bounds__(gptoss_routing_threads, 1) __global__ void gptoss_ogs_build_ro
     __shared__ int32_t cursors[gptoss_expert_count];
     __shared__ int32_t tile_offsets[gptoss_expert_count];
 
-    const uint32_t thread = threadIdx.x;
+    const uint32_t thread  = threadIdx.x;
+    const uint32_t block_m =
+        route_count <= gptoss_ogs_small_max_m ? gptoss_ogs_block_m_small : gptoss_ogs_block_m;
     if (thread < gptoss_expert_count) {
         histogram[thread] = 0;
     }
@@ -53,7 +55,7 @@ __launch_bounds__(gptoss_routing_threads, 1) __global__ void gptoss_ogs_build_ro
             cursors[expert]       = route_offset;
             tile_offsets[expert]  = tile_offset;
             route_offset += histogram[expert];
-            tile_offset += (histogram[expert] + (int32_t) gptoss_ogs_block_m - 1) / (int32_t) gptoss_ogs_block_m;
+            tile_offset += (histogram[expert] + (int32_t) block_m - 1) / (int32_t) block_m;
         }
         route_offsets[gptoss_expert_count] = route_offset;
         block_offsets[gptoss_expert_count] = tile_offset;
@@ -71,7 +73,7 @@ __launch_bounds__(gptoss_routing_threads, 1) __global__ void gptoss_ogs_build_ro
     }
 
     for (uint32_t expert = thread; expert < gptoss_expert_count; expert += blockDim.x) {
-        const uint32_t tile_count  = ((uint32_t) histogram[expert] + gptoss_ogs_block_m - 1) / gptoss_ogs_block_m;
+        const uint32_t tile_count  = ((uint32_t) histogram[expert] + block_m - 1) / block_m;
         const uint32_t destination = (uint32_t) tile_offsets[expert];
         for (uint32_t tile = 0; tile < tile_count; ++tile) {
             block_schedule[destination + tile] = (int32_t) ((tile << 16) | expert);

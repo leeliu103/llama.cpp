@@ -3,7 +3,7 @@
 import argparse
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 os.environ["AITER_AOT_IMPORT"] = "1"
@@ -266,7 +266,7 @@ def _ogs_kernel_constants(
 def _build_kernel_specs():
     ogs_w13, ogs_w2 = _make_ogs_kernels()
 
-    return (
+    specs = (
         KernelSpec(
             output_name="q8_qkv.hsaco",
             kernel=gptoss_q8_0_w8a16_qkv_bias,
@@ -438,6 +438,35 @@ def _build_kernel_specs():
             assume_32_bit_pointer_range=True,
         ),
     )
+
+    spec_by_name = {spec.output_name: spec for spec in specs}
+    ogs_w13_spec = spec_by_name["ogs_w13.hsaco"]
+    ogs_w2_spec = spec_by_name["ogs_w2.hsaco"]
+    specs += (
+        replace(
+            ogs_w13_spec,
+            output_name="ogs_w13_small.hsaco",
+            kernel_constants={
+                **ogs_w13_spec.kernel_constants,
+                "BLOCK_M": 16,
+                "BLOCK_N": 64,
+                "BLOCK_K": 512,
+                "grid_n": 90,
+            },
+        ),
+        replace(
+            ogs_w2_spec,
+            output_name="ogs_w2_small.hsaco",
+            kernel_constants={
+                **ogs_w2_spec.kernel_constants,
+                "BLOCK_M": 16,
+                "BLOCK_N": 64,
+                "BLOCK_K": 512,
+                "grid_n": 45,
+            },
+        ),
+    )
+    return specs
 
 
 def _compile_kernel(backend, target, spec):

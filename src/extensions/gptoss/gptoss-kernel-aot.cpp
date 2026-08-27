@@ -18,6 +18,7 @@ constexpr uint32_t gptoss_fa_threads       = 128;
 constexpr uint32_t gptoss_fa_shared_memory = 8192;
 
 constexpr uint32_t gptoss_ogs_block_n       = 128;
+constexpr uint32_t gptoss_ogs_block_n_small = 64;
 constexpr uint32_t gptoss_ogs_threads       = 128;
 constexpr uint32_t gptoss_ogs_shared_memory = 16384;
 
@@ -123,6 +124,7 @@ hipError_t gptoss_ogs_w13_launch(hipFunction_t  function,
                                  const int32_t * block_offsets,
                                  const int32_t * block_schedule,
                                  uint32_t        schedule_capacity,
+                                 bool            use_small_tiles,
                                  hipStream_t     stream) {
     int32_t grid_m_i32      = static_cast<int32_t>(schedule_capacity);
     void *  global_scratch  = nullptr;
@@ -133,7 +135,8 @@ hipError_t gptoss_ogs_w13_launch(hipFunction_t  function,
         &gather_indices,  &expert_counts,    &route_offsets,   &block_offsets,
         &block_schedule,  &grid_m_i32,       &global_scratch,  &profile_scratch,
     };
-    const uint32_t grid_n = (2 * gptoss_intermediate_size + gptoss_ogs_block_n - 1) / gptoss_ogs_block_n;
+    const uint32_t block_n = use_small_tiles ? gptoss_ogs_block_n_small : gptoss_ogs_block_n;
+    const uint32_t grid_n  = (2 * gptoss_intermediate_size + block_n - 1) / block_n;
     return hipModuleLaunchKernel(function, schedule_capacity * grid_n, 1, 1, gptoss_ogs_threads, 1, 1,
                                  gptoss_ogs_shared_memory, stream, kernel_params, nullptr);
 }
@@ -151,6 +154,7 @@ hipError_t gptoss_ogs_w2_launch(hipFunction_t  function,
                                 const int32_t * block_offsets,
                                 const int32_t * block_schedule,
                                 uint32_t        schedule_capacity,
+                                bool            use_small_tiles,
                                 hipStream_t     stream) {
     int32_t route_count_i32 = static_cast<int32_t>(route_count);
     int32_t grid_m_i32      = static_cast<int32_t>(schedule_capacity);
@@ -161,7 +165,8 @@ hipError_t gptoss_ogs_w2_launch(hipFunction_t  function,
         &scales,           &bias,            &scatter_indices, &route_count_i32, &expert_counts,  &route_offsets,
         &block_offsets,    &block_schedule,  &grid_m_i32,      &global_scratch,  &profile_scratch,
     };
-    const uint32_t grid_n = (gptoss_hidden_size + gptoss_ogs_block_n - 1) / gptoss_ogs_block_n;
+    const uint32_t block_n = use_small_tiles ? gptoss_ogs_block_n_small : gptoss_ogs_block_n;
+    const uint32_t grid_n  = (gptoss_hidden_size + block_n - 1) / block_n;
     return hipModuleLaunchKernel(function, schedule_capacity * grid_n, 1, 1, gptoss_ogs_threads, 1, 1,
                                  gptoss_ogs_shared_memory, stream, kernel_params, nullptr);
 }

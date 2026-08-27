@@ -25,6 +25,8 @@ constexpr uint32_t gptoss_quant_block_size = 32;
 constexpr uint32_t gptoss_mxfp4_block_size = 32;
 constexpr uint32_t gptoss_ogs_alignment     = 256;
 constexpr uint32_t gptoss_ogs_block_m       = 64;
+constexpr uint32_t gptoss_ogs_block_m_small = 16;
+constexpr uint32_t gptoss_ogs_small_max_m   = 512;
 
 constexpr uint32_t gptoss_mxfp4_padded_size =
     (gptoss_intermediate_size + gptoss_ogs_alignment - 1) / gptoss_ogs_alignment * gptoss_ogs_alignment;

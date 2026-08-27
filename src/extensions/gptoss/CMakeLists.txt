@@ -62,6 +62,8 @@ set(LLAMA_GPTOSS_AOT_KERNELS
     fa_sw128.hsaco
     ogs_w13.hsaco
     ogs_w2.hsaco
+    ogs_w13_small.hsaco
+    ogs_w2_small.hsaco
 )
 
 set(LLAMA_GPTOSS_AOT_OUTPUTS)
