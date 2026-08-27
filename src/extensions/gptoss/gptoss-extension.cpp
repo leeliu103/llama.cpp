@@ -42,6 +42,9 @@ struct gptoss_context_state {
     hipModule_t ogs_w13_module     = nullptr;
     hipModule_t ogs_w2_module      = nullptr;
 
+    hipModule_t ogs_w13_small_module = nullptr;
+    hipModule_t ogs_w2_small_module  = nullptr;
+
     hipFunction_t q8_qkv      = nullptr;
     hipFunction_t q8_attn_out = nullptr;
     hipFunction_t router      = nullptr;
@@ -49,6 +52,9 @@ struct gptoss_context_state {
     hipFunction_t fa_swa      = nullptr;
     hipFunction_t ogs_w13     = nullptr;
     hipFunction_t ogs_w2      = nullptr;
+
+    hipFunction_t ogs_w13_small = nullptr;
+    hipFunction_t ogs_w2_small  = nullptr;
 
     llama_hip_workspace workspace;
 };
@@ -97,6 +103,12 @@ void gptoss_context_free(llama_context * ctx) {
     }
     if (state->ogs_w2_module != nullptr) {
         (void) hipModuleUnload(state->ogs_w2_module);
+    }
+    if (state->ogs_w13_small_module != nullptr) {
+        (void) hipModuleUnload(state->ogs_w13_small_module);
+    }
+    if (state->ogs_w2_small_module != nullptr) {
+        (void) hipModuleUnload(state->ogs_w2_small_module);
     }
     if (state->stream != nullptr) {
         (void) hipStreamDestroy(state->stream);
@@ -280,6 +292,16 @@ bool gptoss_context_init(llama_context * ctx) {
         return false;
     }
 
+    if (!aot_loader.load(&state->ogs_w13_small_module, "ogs_w13_small.hsaco") ||
+        hipModuleGetFunction(&state->ogs_w13_small, state->ogs_w13_small_module,
+                             "_matmul_NNN_fp16xfp16xmxfp4_16x64x512x1_swiglu") != hipSuccess ||
+        !aot_loader.load(&state->ogs_w2_small_module, "ogs_w2_small.hsaco") ||
+        hipModuleGetFunction(&state->ogs_w2_small, state->ogs_w2_small_module,
+                             "_matmul_NNN_fp32xfp16xmxfp4_16x64x512x1") != hipSuccess) {
+        gptoss_context_free(ctx);
+        return false;
+    }
+
     return true;
 }
 
@@ -309,7 +331,8 @@ int gptoss_prefill(llama_context *                ctx,
 
     const uint32_t n_sequences = static_cast<uint32_t>(kv_batch.query_offsets.size() - 1);
 
-    const bool output = logits_out != nullptr;
+    const bool output    = logits_out != nullptr;
+    const bool small_ogs = ubatch.n_tokens * gptoss_expert_used_count <= gptoss_ogs_small_max_m;
 
     llama_hip_workspace_cursor measure;
     (void) gptoss_make_prefill_buffers(measure, ubatch.n_tokens, output, n_sequences,
@@ -477,21 +500,22 @@ int gptoss_prefill(llama_context *                ctx,
 
         if (!gptoss_hip_ok(
                 gptoss_ogs_w13_launch(
-                    state->ogs_w13, buffers.expert_activations, buffers.norm,
+                    small_ogs ? state->ogs_w13_small : state->ogs_w13, buffers.expert_activations, buffers.norm,
                     moe + gptoss_moe_gate_up_values_offset, moe + gptoss_moe_gate_up_scales_offset,
                     static_cast<const float *>(layer.ffn_down_exps_b->data), buffers.gather_indices,
                     buffers.expert_counts, buffers.route_offsets, buffers.block_offsets, buffers.block_schedule,
-                    buffers.schedule_capacity, state->stream),
+                    buffers.schedule_capacity, small_ogs, state->stream),
                 "MoE gate/up projection")) {
             return -1;
         }
 
         if (!gptoss_hip_ok(
                 gptoss_ogs_w2_launch(
-                    state->ogs_w2, buffers.expert_outputs, buffers.expert_activations, moe,
+                    small_ogs ? state->ogs_w2_small : state->ogs_w2, buffers.expert_outputs,
+                    buffers.expert_activations, moe,
                     moe + gptoss_moe_down_scales_offset, static_cast<const float *>(layer.ffn_gate_exps_b->data),
                     buffers.scatter_indices, buffers.route_count, buffers.expert_counts, buffers.route_offsets,
-                    buffers.block_offsets, buffers.block_schedule, buffers.schedule_capacity, state->stream),
+                    buffers.block_offsets, buffers.block_schedule, buffers.schedule_capacity, small_ogs, state->stream),
                 "MoE down projection") ||
             !gptoss_hip_ok(gptoss_moe_combine_launch(buffers.cur, buffers.next, buffers.expert_outputs,
                                                      buffers.selected_weights, ubatch.n_tokens, state->stream),
