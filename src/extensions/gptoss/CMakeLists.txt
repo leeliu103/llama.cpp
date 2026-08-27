@@ -38,6 +38,7 @@ target_compile_definitions(llama PRIVATE
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(LLAMA_GPTOSS_AOT_SUPPORTED_ARCHITECTURES
+    gfx1100
     gfx1201
 )
 
@@ -55,6 +56,8 @@ if (NOT LLAMA_GPTOSS_AOT_ARCHITECTURES)
 endif()
 
 set(LLAMA_GPTOSS_AOT_KERNELS
+    decode_swa_gluon.hsaco
+    decode_full_gluon.hsaco
     q8_qkv.hsaco
     q8_attn_out.hsaco
     router.hsaco
@@ -84,6 +87,8 @@ foreach(architecture IN LISTS LLAMA_GPTOSS_AOT_ARCHITECTURES)
             --output-dir "${gptoss_aot_output_dir}"
         DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-aot.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernel/decode_megakernel_gluon.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernel/grid_sync.ll"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernel/matmul_q8_0_w8a16.py"
             "${CMAKE_CURRENT_SOURCE_DIR}/kernel/router.py"
         COMMENT "Generating GPT-OSS AOT kernels for ${architecture}"

@@ -1,6 +1,7 @@
 #include "gptoss-kernel-aot.h"
 
 #include "gptoss-config.h"
+#include "gptoss-kernel-hip.h"
 
 namespace {
 
@@ -21,6 +22,9 @@ constexpr uint32_t gptoss_ogs_block_n       = 128;
 constexpr uint32_t gptoss_ogs_block_n_small = 64;
 constexpr uint32_t gptoss_ogs_threads       = 128;
 constexpr uint32_t gptoss_ogs_shared_memory = 16384;
+
+constexpr uint32_t gptoss_decode_swa_gluon_shared_memory  = 2112;
+constexpr uint32_t gptoss_decode_full_gluon_shared_memory = 11776;
 
 }  // namespace
 
@@ -169,4 +173,62 @@ hipError_t gptoss_ogs_w2_launch(hipFunction_t  function,
     const uint32_t grid_n  = (gptoss_hidden_size + block_n - 1) / block_n;
     return hipModuleLaunchKernel(function, schedule_capacity * grid_n, 1, 1, gptoss_ogs_threads, 1, 1,
                                  gptoss_ogs_shared_memory, stream, kernel_params, nullptr);
+}
+
+hipError_t gptoss_decode_layer_gluon_launch(hipFunction_t                      function,
+                                            bool                               swa,
+                                            const gptoss_decode_layer_params & params,
+                                            hipStream_t                        stream) {
+    gptoss_decode_layer_params args = params;
+    void *                     global_scratch  = nullptr;
+    void *                     profile_scratch = nullptr;
+    void * kernel_params[] = {
+        &args.next,
+        &args.cur,
+        &args.rms_partials,
+        &args.activation_scratch,
+        &args.query,
+        &args.attn_parts,
+        &args.attn_meta,
+        &args.router,
+        &args.expert_ids,
+        &args.expert_weights,
+        &args.cache_k,
+        &args.cache_v,
+        &args.kv_rows,
+        &args.attn_norm,
+        &args.qkv_values,
+        &args.attn_q_bias,
+        &args.attn_k_bias,
+        &args.attn_v_bias,
+        &args.attn_output_values,
+        &args.attn_output_bias,
+        &args.attn_sinks,
+        &args.post_attention_norm,
+        &args.router_weight,
+        &args.router_bias,
+        &args.moe_down_values,
+        &args.moe_gate_up_values,
+        &args.moe_down_bias,
+        &args.moe_gate_up_bias,
+        &args.n_kv,
+        &args.kv_write_row,
+        &args.attn_parallel_blocks,
+        &args.position,
+        &args.rms_epsilon,
+        &args.rope_freq_scale,
+        &args.rope_ext_factor,
+        &args.rope_attn_factor,
+        &args.rope_corr_low,
+        &args.rope_corr_high,
+        &args.rope_theta_scale,
+        &args.reuse_attention_rms,
+        &global_scratch,
+        &profile_scratch,
+    };
+    const uint32_t shared_memory =
+        swa ? gptoss_decode_swa_gluon_shared_memory : gptoss_decode_full_gluon_shared_memory;
+    return hipModuleLaunchCooperativeKernel(function, gptoss_decode_grid_blocks, 1, 1,
+                                            gptoss_decode_block_x * gptoss_decode_block_y, 1, 1, shared_memory,
+                                            stream, kernel_params);
 }

@@ -39,6 +39,10 @@ struct gptoss_context_state {
     hipModule_t router_module      = nullptr;
     hipModule_t fa_full_module     = nullptr;
     hipModule_t fa_swa_module      = nullptr;
+
+    hipModule_t decode_swa_gluon_module  = nullptr;
+    hipModule_t decode_full_gluon_module = nullptr;
+
     hipModule_t ogs_w13_module     = nullptr;
     hipModule_t ogs_w2_module      = nullptr;
 
@@ -50,6 +54,10 @@ struct gptoss_context_state {
     hipFunction_t router      = nullptr;
     hipFunction_t fa_full     = nullptr;
     hipFunction_t fa_swa      = nullptr;
+
+    hipFunction_t decode_swa_gluon  = nullptr;
+    hipFunction_t decode_full_gluon = nullptr;
+
     hipFunction_t ogs_w13     = nullptr;
     hipFunction_t ogs_w2      = nullptr;
 
@@ -97,6 +105,12 @@ void gptoss_context_free(llama_context * ctx) {
     }
     if (state->fa_swa_module != nullptr) {
         (void) hipModuleUnload(state->fa_swa_module);
+    }
+    if (state->decode_swa_gluon_module != nullptr) {
+        (void) hipModuleUnload(state->decode_swa_gluon_module);
+    }
+    if (state->decode_full_gluon_module != nullptr) {
+        (void) hipModuleUnload(state->decode_full_gluon_module);
     }
     if (state->ogs_w13_module != nullptr) {
         (void) hipModuleUnload(state->ogs_w13_module);
@@ -267,6 +281,16 @@ bool gptoss_context_init(llama_context * ctx) {
     ctx->execution_extension_state = state;
 
     if (hipStreamCreateWithFlags(&state->stream, hipStreamNonBlocking) != hipSuccess) {
+        gptoss_context_free(ctx);
+        return false;
+    }
+
+    if (!aot_loader.load(&state->decode_swa_gluon_module, "decode_swa_gluon.hsaco") ||
+        hipModuleGetFunction(&state->decode_swa_gluon, state->decode_swa_gluon_module,
+                             "gptoss_decode_layer_swa_gluon_kernel") != hipSuccess ||
+        !aot_loader.load(&state->decode_full_gluon_module, "decode_full_gluon.hsaco") ||
+        hipModuleGetFunction(&state->decode_full_gluon, state->decode_full_gluon_module,
+                             "gptoss_decode_layer_full_gluon_kernel") != hipSuccess) {
         gptoss_context_free(ctx);
         return false;
     }
@@ -677,7 +701,10 @@ int gptoss_decode(llama_context *                ctx,
         params.rope_theta_scale     = std::pow(freq_base, -2.0f / gptoss_head_size);
         params.reuse_attention_rms  = il != 0;
 
-        if (!gptoss_hip_ok(gptoss_decode_layer_launch(is_swa, params, state->stream), "decode layer")) {
+        if (!gptoss_hip_ok(gptoss_decode_layer_gluon_launch(
+                               is_swa ? state->decode_swa_gluon : state->decode_full_gluon, is_swa, params,
+                               state->stream),
+                           "decode layer")) {
             return -1;
         }
 

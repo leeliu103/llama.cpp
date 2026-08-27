@@ -8,7 +8,10 @@
 
 namespace {
 
-constexpr uint32_t gptoss_max_attention_parts = 12;
+constexpr uint32_t gptoss_max_attention_parts                   = 12;
+constexpr uint32_t gptoss_decode_barrier_count                  = 4;
+constexpr uint32_t gptoss_decode_barrier_storage_element_count =
+    gptoss_decode_barrier_count * sizeof(int32_t) / sizeof(__half);
 
 }  // namespace
 
@@ -77,7 +80,8 @@ gptoss_decode_buffers gptoss_make_decode_buffers(llama_hip_workspace_cursor & cu
     result.next             = cursor.take<float>(gptoss_hidden_size);
     result.rms_partials     = cursor.take<float>(gptoss_decode_grid_blocks);
     result.activation_scratch =
-        cursor.take<__half>(gptoss_hidden_size * (1 + gptoss_expert_used_count));
+        cursor.take<__half>(gptoss_hidden_size + gptoss_expert_used_count * gptoss_mxfp4_padded_size +
+                            gptoss_decode_barrier_storage_element_count);
     result.query            = cursor.take<__half>(gptoss_query_size);
     result.router_scores    = cursor.take<float>(gptoss_expert_count);
     result.selected_experts = cursor.take<int32_t>(gptoss_expert_used_count);

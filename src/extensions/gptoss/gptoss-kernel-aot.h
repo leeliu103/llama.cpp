@@ -7,6 +7,8 @@
 
 constexpr uint32_t gptoss_fa_tile_size = 32;
 
+struct gptoss_decode_layer_params;
+
 hipError_t gptoss_q8_qkv_launch(hipFunction_t  function,
                                 __half *        output,
                                 const __half *  activation,
@@ -77,3 +79,8 @@ hipError_t gptoss_ogs_w2_launch(hipFunction_t  function,
                                 uint32_t        schedule_capacity,
                                 bool            use_small_tiles,
                                 hipStream_t     stream);
+
+hipError_t gptoss_decode_layer_gluon_launch(hipFunction_t                      function,
+                                            bool                               swa,
+                                            const gptoss_decode_layer_params & params,
+                                            hipStream_t                        stream);

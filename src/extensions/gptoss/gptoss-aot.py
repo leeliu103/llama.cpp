@@ -14,6 +14,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 )
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource, make_backend
+from triton.experimental.gluon._runtime import GluonASTSource
 from triton_kernels.matmul_details._matmul import _matmul as _ogs_matmul
 from triton_kernels.specialize import ClosureArg, FnSpecs, SpecializationModule
 from triton_kernels.swiglu import swiglu_fn
@@ -21,6 +22,12 @@ from triton_kernels.swiglu import swiglu_fn
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "kernel"))
 
+from decode_megakernel_gluon import (
+    GRID_SYNC_LL,
+    PARAM_TYPES,
+    gptoss_decode_layer_full_gluon_kernel,
+    gptoss_decode_layer_swa_gluon_kernel,
+)
 from matmul_q8_0_w8a16 import (
     gptoss_q8_0_w8a16_attn_output_bias_residual,
     gptoss_q8_0_w8a16_qkv_bias,
@@ -524,6 +531,37 @@ def _compile_kernel(backend, target, spec):
     return compiled.asm[backend.binary_ext]
 
 
+def _compile_gluon_kernel(backend, target, kernel, waves_per_eu):
+    source = GluonASTSource(
+        fn=kernel,
+        signature={"p": PARAM_TYPES},
+        attrs={},
+    )
+    options = backend.parse_options(
+        {
+            "num_warps": 8,
+            "num_stages": 1,
+            "waves_per_eu": waves_per_eu,
+            "launch_cooperative_grid": True,
+            "extern_libs": {
+                "grid_sync": GRID_SYNC_LL,
+            },
+        }
+    )
+    compiled = triton.compile(
+        source,
+        target=target,
+        options=options.__dict__,
+    )
+    if (
+        getattr(compiled.metadata, "global_scratch_size", 0)
+        or compiled.metadata.profile_scratch_size
+    ):
+        raise RuntimeError(f"{kernel.__name__}: unexpected Triton scratch")
+
+    return compiled.asm[backend.binary_ext]
+
+
 def _compile_arch(arch, specs, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -533,6 +571,26 @@ def _compile_arch(arch, specs, output_dir):
         (spec.output_name, _compile_kernel(backend, target, spec))
         for spec in specs
     ]
+    binaries += [
+        (
+            "decode_swa_gluon.hsaco",
+            _compile_gluon_kernel(
+                backend,
+                target,
+                gptoss_decode_layer_swa_gluon_kernel,
+                0,
+            ),
+        ),
+        (
+            "decode_full_gluon.hsaco",
+            _compile_gluon_kernel(
+                backend,
+                target,
+                gptoss_decode_layer_full_gluon_kernel,
+                6,
+            ),
+        ),
+    ]
     for name, binary in binaries:
         (output_dir / name).write_bytes(binary)
 
@@ -541,7 +599,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--arch",
-        choices=("gfx1201",),
+        choices=("gfx1100", "gfx1201"),
         required=True,
     )
     parser.add_argument(
