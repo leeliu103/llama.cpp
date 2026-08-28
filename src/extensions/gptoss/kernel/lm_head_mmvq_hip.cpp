@@ -27,7 +27,7 @@ struct block_q8_0 {
 static_assert(sizeof(block_q8_0) == 34);
 
 __device__ __forceinline__ float warp_sum(float value) {
-#if defined(__gfx1100__) || defined(__gfx1201__)
+#if defined(__gfx1100__) || defined(__gfx1151__) || defined(__gfx1201__)
     constexpr int  row_mask   = 0xf;
     constexpr int  bank_mask  = 0xf;
     constexpr bool bound_ctrl = true;

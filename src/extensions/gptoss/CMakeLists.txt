@@ -39,12 +39,20 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(LLAMA_GPTOSS_AOT_SUPPORTED_ARCHITECTURES
     gfx1100
+    gfx1151
     gfx1201
 )
 
 set(LLAMA_GPTOSS_AOT_ARCHITECTURES)
 foreach(architecture IN LISTS CMAKE_HIP_ARCHITECTURES)
     string(REGEX REPLACE ":.*$" "" architecture_base "${architecture}")
+    if (architecture_base STREQUAL "gfx1151")
+        set_property(
+            SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/kernel/decode_megakernel_hip.cpp"
+            TARGET_DIRECTORY llama
+            APPEND PROPERTY COMPILE_OPTIONS "-Xarch_${architecture}" -mcumode
+        )
+    endif()
     if (architecture_base IN_LIST LLAMA_GPTOSS_AOT_SUPPORTED_ARCHITECTURES)
         list(APPEND LLAMA_GPTOSS_AOT_ARCHITECTURES "${architecture_base}")
     endif()

@@ -33,7 +33,7 @@ static constexpr uint32_t moe_output_tile_size = warp_size;
 static constexpr uint32_t query_size           = gptoss_query_size;
 static constexpr uint32_t kv_size              = gptoss_key_value_size;
 
-#if defined(__gfx1100__)
+#if defined(__gfx1100__) || defined(__gfx1151__)
 static constexpr uint32_t q8_segment_size = 16u;
 #else
 static constexpr uint32_t q8_segment_size = 8u;
@@ -78,7 +78,7 @@ static __device__ __forceinline__ float round_f16(float value) {
 
 template <int width = warp_size> static __device__ __forceinline__ float warp_sum(float x) {
     static_assert(width == warp_size || width == warps_per_block, "unsupported reduction width");
-#if defined(__gfx1100__) || defined(__gfx1201__)
+#if defined(__gfx1100__) || defined(__gfx1151__) || defined(__gfx1201__)
     constexpr int  row_mask   = 0xf;
     constexpr int  bank_mask  = 0xf;
     constexpr bool bound_ctrl = true;
@@ -118,7 +118,7 @@ static __device__ __forceinline__ float block_sum(float value, float * warp_sums
 }
 
 static __device__ __forceinline__ float warp_max(float x) {
-#if defined(__gfx1100__) || defined(__gfx1201__)
+#if defined(__gfx1100__) || defined(__gfx1151__) || defined(__gfx1201__)
     constexpr int  row_mask   = 0xf;
     constexpr int  bank_mask  = 0xf;
     constexpr bool bound_ctrl = true;
@@ -179,10 +179,11 @@ static __device__ __forceinline__ mxfp4_row mxfp4_row_offset(const mxfp4_row & r
 }
 
 using unaligned_u32 = uint32_t __attribute__((aligned(1), may_alias));
+using unaligned_u64 = uint64_t __attribute__((aligned(1), may_alias));
 
 static __device__ __forceinline__ uint32_t load_q8_word(const void * data, int word) {
     const uint8_t * bytes = (const uint8_t *) data;
-#if defined(__gfx1100__)
+#if defined(__gfx1100__) || defined(__gfx1151__)
     return __builtin_nontemporal_load((const unaligned_u32 *) (bytes + 4 * word));
 #else
     uint32_t        value;
@@ -376,7 +377,12 @@ static __device__ __forceinline__ float mxfp4_dot_segment(const mxfp4_row & row,
                                                           uint32_t block,
                                                           uint32_t segment) {
     const uint8_t *  values           = row.values + (uint64_t) block * (mxfp4_block_size / 2u);
+#if defined(__gfx1151__)
+    const uint64_t packed_bits = __builtin_nontemporal_load((const unaligned_u64 *) (values + 8u * segment));
+    const uint2    packed      = __builtin_bit_cast(uint2, packed_bits);
+#else
     const uint2      packed           = *(const uint2 *) (values + 8u * segment);
+#endif
     const uint4      values0          = mxfp4_to_f16x8(packed.x);
     const uint4      values1          = mxfp4_to_f16x8(packed.y);
     const uint32_t * activation_pairs = (const uint32_t *) (x + (uint64_t) block * mxfp4_block_size + 16u * segment);
@@ -988,12 +994,27 @@ static __device__ void attention_output_residual_rms(const gptoss_decode_layer_p
         const q8_0_row row1 = q8_0_row_offset(row0, 1u, query_size, blocks_per_row);
         const q8_0_row row2 = q8_0_row_offset(row1, 1u, query_size, blocks_per_row);
         const q8_0_row row3 = q8_0_row_offset(row2, 1u, query_size, blocks_per_row);
-        const float4   dot  = q8_0_dot4(row0, row1, row2, row3, p.query, blocks_per_row);
+#if defined(__gfx1151__)
+        float4 row_bias;
+        float4 residual;
         if (threadIdx.y == 0 && threadIdx.x == 0) {
+            row_bias = *(const float4 *) (p.attn_output_bias + row);
+            residual = *(const float4 *) (p.cur + row);
+        }
+#endif
+        const float4 dot = q8_0_dot4(row0, row1, row2, row3, p.query, blocks_per_row);
+        if (threadIdx.y == 0 && threadIdx.x == 0) {
+#if defined(__gfx1151__)
+            const float next0 = (dot.x + row_bias.x) + residual.x;
+            const float next1 = (dot.y + row_bias.y) + residual.y;
+            const float next2 = (dot.z + row_bias.z) + residual.z;
+            const float next3 = (dot.w + row_bias.w) + residual.w;
+#else
             const float next0 = (dot.x + p.attn_output_bias[row]) + p.cur[row];
             const float next1 = (dot.y + p.attn_output_bias[row + 1u]) + p.cur[row + 1u];
             const float next2 = (dot.z + p.attn_output_bias[row + 2u]) + p.cur[row + 2u];
             const float next3 = (dot.w + p.attn_output_bias[row + 3u]) + p.cur[row + 3u];
+#endif
             p.next[row]       = next0;
             p.next[row + 1u]  = next1;
             p.next[row + 2u]  = next2;
@@ -1147,7 +1168,7 @@ static __device__ void select_experts(const gptoss_decode_layer_params & p, int3
 }
 
 static __device__ void moe_gate_up(const gptoss_decode_layer_params & p) {
-#if defined(__gfx1100__)
+#if defined(__gfx1100__) || defined(__gfx1151__)
     const uint32_t total_rows            = experts_used * intermediate_size;
     const uint32_t warp_global           = blockIdx.x * warps_per_block + threadIdx.y;
     const uint32_t warp_count            = gridDim.x * warps_per_block;
