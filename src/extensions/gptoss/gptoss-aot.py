@@ -541,7 +541,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--arch",
-        choices=("gfx1201",),
+        choices=("gfx1100", "gfx1201"),
         required=True,
     )
     parser.add_argument(

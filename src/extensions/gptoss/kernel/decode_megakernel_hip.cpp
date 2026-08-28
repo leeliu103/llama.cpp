@@ -33,6 +33,12 @@ static constexpr uint32_t moe_output_tile_size = warp_size;
 static constexpr uint32_t query_size           = gptoss_query_size;
 static constexpr uint32_t kv_size              = gptoss_key_value_size;
 
+#if defined(__gfx1100__)
+static constexpr uint32_t q8_segment_size = 16u;
+#else
+static constexpr uint32_t q8_segment_size = 8u;
+#endif
+
 static constexpr float attention_max_offset = 3.0f * 0.6931f;
 
 static constexpr uint32_t mxfp4_padded_dim              = gptoss_mxfp4_padded_size;
@@ -72,7 +78,7 @@ static __device__ __forceinline__ float round_f16(float value) {
 
 template <int width = warp_size> static __device__ __forceinline__ float warp_sum(float x) {
     static_assert(width == warp_size || width == warps_per_block, "unsupported reduction width");
-#if defined(__gfx1201__)
+#if defined(__gfx1100__) || defined(__gfx1201__)
     constexpr int  row_mask   = 0xf;
     constexpr int  bank_mask  = 0xf;
     constexpr bool bound_ctrl = true;
@@ -112,7 +118,7 @@ static __device__ __forceinline__ float block_sum(float value, float * warp_sums
 }
 
 static __device__ __forceinline__ float warp_max(float x) {
-#if defined(__gfx1201__)
+#if defined(__gfx1100__) || defined(__gfx1201__)
     constexpr int  row_mask   = 0xf;
     constexpr int  bank_mask  = 0xf;
     constexpr bool bound_ctrl = true;
@@ -172,11 +178,17 @@ static __device__ __forceinline__ mxfp4_row mxfp4_row_offset(const mxfp4_row & r
     };
 }
 
-static __device__ __forceinline__ uint32_t load_u32_unaligned(const void * data, int word) {
+using unaligned_u32 = uint32_t __attribute__((aligned(1), may_alias));
+
+static __device__ __forceinline__ uint32_t load_q8_word(const void * data, int word) {
     const uint8_t * bytes = (const uint8_t *) data;
+#if defined(__gfx1100__)
+    return __builtin_nontemporal_load((const unaligned_u32 *) (bytes + 4 * word));
+#else
     uint32_t        value;
     __builtin_memcpy(&value, bytes + 4 * word, sizeof(value));
     return value;
+#endif
 }
 
 using f16x2 = _Float16 __attribute__((ext_vector_type(2)));
@@ -204,8 +216,7 @@ static __device__ __forceinline__ float4 q8_0_dot4_segment(const q8_0_row & row0
                                                            const half * __restrict__ x,
                                                            uint32_t block,
                                                            uint32_t segment) {
-    constexpr uint32_t segment_size     = 8u;
-    const uint32_t     element_offset   = segment_size * segment;
+    const uint32_t     element_offset   = q8_segment_size * segment;
     const int8_t *     w0               = row0.values + (uint64_t) block * q8_block_size + element_offset;
     const int8_t *     w1               = row1.values + (uint64_t) block * q8_block_size + element_offset;
     const int8_t *     w2               = row2.values + (uint64_t) block * q8_block_size + element_offset;
@@ -216,11 +227,11 @@ static __device__ __forceinline__ float4 q8_0_dot4_segment(const q8_0_row & row0
     float              acc2             = 0.0f;
     float              acc3             = 0.0f;
 #pragma unroll
-    for (int word = 0; word < 2; ++word) {
-        const uint32_t q0 = load_u32_unaligned(w0, word);
-        const uint32_t q1 = load_u32_unaligned(w1, word);
-        const uint32_t q2 = load_u32_unaligned(w2, word);
-        const uint32_t q3 = load_u32_unaligned(w3, word);
+    for (uint32_t word = 0; word < q8_segment_size / 4u; ++word) {
+        const uint32_t q0 = load_q8_word(w0, word);
+        const uint32_t q1 = load_q8_word(w1, word);
+        const uint32_t q2 = load_q8_word(w2, word);
+        const uint32_t q3 = load_q8_word(w3, word);
         const uint2    v0 = q8_to_f16x4(q0);
         const uint2    v1 = q8_to_f16x4(q1);
         const uint2    v2 = q8_to_f16x4(q2);
@@ -280,7 +291,7 @@ static __device__ float4 q8_0_dot4(const q8_0_row & row0,
                                    const q8_0_row & row3,
                                    const half * __restrict__ x,
                                    uint32_t blocks) {
-    constexpr uint32_t segments_per_block = 4u;
+    constexpr uint32_t segments_per_block = q8_block_size / q8_segment_size;
     constexpr uint32_t block_stride       = block_size / segments_per_block;
     const uint32_t     tid                = threadIdx.y * warp_size + threadIdx.x;
     const uint32_t     segment            = tid % segments_per_block;
@@ -300,7 +311,7 @@ static __device__ float4 q8_0_dot4(const q8_0_row & row0,
 }
 
 static __device__ __forceinline__ uint4 mxfp4_to_f16x8(uint32_t codes) {
-    // Decode four low and four high nibbles, then restore their interleaved order.
+    // Decode four low and four high nibbles.
     constexpr uint32_t value_lut0    = 0x3e3c3800u;
     constexpr uint32_t value_lut1    = 0x46444240u;
     const uint32_t     low_magnitude = codes & 0x07070707u;
@@ -316,12 +327,50 @@ static __device__ __forceinline__ uint4 mxfp4_to_f16x8(uint32_t codes) {
     const uint2    high_values    = make_uint2(__builtin_amdgcn_perm(high_bytes, 0u, 0x05010400u),
                                                __builtin_amdgcn_perm(high_bytes, 0u, 0x07030602u));
 
+#if defined(__gfx1100__)
+    // Keep low and high nibbles grouped; activations are deinterleaved below.
+    return make_uint4(low_values.x, low_values.y, high_values.x, high_values.y);
+#else
     return make_uint4((low_values.x & 0x0000ffffu) | (high_values.x << 16),
                       (low_values.x >> 16) | (high_values.x & 0xffff0000u),
                       (low_values.y & 0x0000ffffu) | (high_values.y << 16),
                       (low_values.y >> 16) | (high_values.y & 0xffff0000u));
+#endif
 }
 
+#if defined(__gfx1100__)
+static __device__ __forceinline__ uint4 mxfp4_load_block(const uint8_t * values) {
+    using u32x4      = uint32_t __attribute__((ext_vector_type(4)));
+    const u32x4 bits = __builtin_nontemporal_load((const u32x4 *) values);
+    return __builtin_bit_cast(uint4, bits);
+}
+
+static __device__ __forceinline__ float mxfp4_dot_packed_segment(uint2 packed,
+                                                                 const uint32_t * activation_pairs) {
+    const uint4 values0 = mxfp4_to_f16x8(packed.x);
+    const uint4 values1 = mxfp4_to_f16x8(packed.y);
+    float       sum     = 0.0f;
+    const uint4 even_activations = make_uint4(
+        __builtin_amdgcn_perm(activation_pairs[1], activation_pairs[0], 0x05040100u),
+        __builtin_amdgcn_perm(activation_pairs[3], activation_pairs[2], 0x05040100u),
+        __builtin_amdgcn_perm(activation_pairs[5], activation_pairs[4], 0x05040100u),
+        __builtin_amdgcn_perm(activation_pairs[7], activation_pairs[6], 0x05040100u));
+    const uint4 odd_activations = make_uint4(
+        __builtin_amdgcn_perm(activation_pairs[1], activation_pairs[0], 0x07060302u),
+        __builtin_amdgcn_perm(activation_pairs[3], activation_pairs[2], 0x07060302u),
+        __builtin_amdgcn_perm(activation_pairs[5], activation_pairs[4], 0x07060302u),
+        __builtin_amdgcn_perm(activation_pairs[7], activation_pairs[6], 0x07060302u));
+    mad_f16x2(sum, __builtin_bit_cast(half2, values0.x), __builtin_bit_cast(half2, even_activations.x));
+    mad_f16x2(sum, __builtin_bit_cast(half2, values0.y), __builtin_bit_cast(half2, even_activations.y));
+    mad_f16x2(sum, __builtin_bit_cast(half2, values0.z), __builtin_bit_cast(half2, odd_activations.x));
+    mad_f16x2(sum, __builtin_bit_cast(half2, values0.w), __builtin_bit_cast(half2, odd_activations.y));
+    mad_f16x2(sum, __builtin_bit_cast(half2, values1.x), __builtin_bit_cast(half2, even_activations.z));
+    mad_f16x2(sum, __builtin_bit_cast(half2, values1.y), __builtin_bit_cast(half2, even_activations.w));
+    mad_f16x2(sum, __builtin_bit_cast(half2, values1.z), __builtin_bit_cast(half2, odd_activations.z));
+    mad_f16x2(sum, __builtin_bit_cast(half2, values1.w), __builtin_bit_cast(half2, odd_activations.w));
+    return sum;
+}
+#else
 static __device__ __forceinline__ float mxfp4_dot_segment(const mxfp4_row & row,
                                                           const half * __restrict__ x,
                                                           uint32_t block,
@@ -342,8 +391,35 @@ static __device__ __forceinline__ float mxfp4_dot_segment(const mxfp4_row & row,
     mad_f16x2(sum, __builtin_bit_cast(half2, values1.w), __builtin_bit_cast(half2, activation_pairs[7]));
     return e8m0_scale(row.scales[block]) * sum;
 }
+#endif
 
 static __device__ float2 mxfp4_dot2(const mxfp4_row & row0, const mxfp4_row & row1, const half * __restrict__ x) {
+#if defined(__gfx1100__)
+    constexpr uint32_t blocks = intermediate_size / mxfp4_block_size;
+    const uint32_t     lane   = threadIdx.x;
+    float              acc0   = 0.0f;
+    float              acc1   = 0.0f;
+    for (uint32_t block = lane; block < blocks; block += warp_size) {
+        const uint64_t value_offset = (uint64_t) block * (mxfp4_block_size / 2u);
+        const uint4    packed0      = mxfp4_load_block(row0.values + value_offset);
+        const uint4    packed1      = mxfp4_load_block(row1.values + value_offset);
+        const float    scale0       = e8m0_scale(row0.scales[block]);
+        const float    scale1       = e8m0_scale(row1.scales[block]);
+        const uint32_t * activation = (const uint32_t *) (x + (uint64_t) block * mxfp4_block_size);
+        {
+            const uint32_t * segment_x = activation;
+            acc0 += scale0 * mxfp4_dot_packed_segment(make_uint2(packed0.x, packed0.y), segment_x);
+            acc1 += scale1 * mxfp4_dot_packed_segment(make_uint2(packed1.x, packed1.y), segment_x);
+        }
+
+        {
+            const uint32_t * segment_x = activation + 8u;
+            acc0 += scale0 * mxfp4_dot_packed_segment(make_uint2(packed0.z, packed0.w), segment_x);
+            acc1 += scale1 * mxfp4_dot_packed_segment(make_uint2(packed1.z, packed1.w), segment_x);
+        }
+    }
+    return make_float2(warp_sum(acc0), warp_sum(acc1));
+#else
     constexpr uint32_t blocks             = intermediate_size / mxfp4_block_size;
     constexpr uint32_t segments_per_block = 2u;
     constexpr uint32_t block_stride       = warp_size / segments_per_block;
@@ -356,8 +432,10 @@ static __device__ float2 mxfp4_dot2(const mxfp4_row & row0, const mxfp4_row & ro
         acc1 += mxfp4_dot_segment(row1, x, block, segment);
     }
     return make_float2(warp_sum(acc0), warp_sum(acc1));
+#endif
 }
 
+#if !defined(__gfx1100__)
 static __device__ float4 mxfp4_dot4(const mxfp4_row & row0,
                                     const mxfp4_row & row1,
                                     const mxfp4_row & row2,
@@ -380,6 +458,7 @@ static __device__ float4 mxfp4_dot4(const mxfp4_row & row0,
     }
     return make_float4(warp_sum(acc0), warp_sum(acc1), warp_sum(acc2), warp_sum(acc3));
 }
+#endif
 
 static __device__ __forceinline__ float swiglu_oai(float gate, float up) {
     gate            = fminf(gate, 7.0f);
@@ -1019,6 +1098,12 @@ static __device__ void select_experts(const gptoss_decode_layer_params & p, int3
 
 #pragma unroll
     for (uint32_t selected = 0; selected < experts_used; ++selected) {
+#if defined(__gfx1100__)
+        const float              best_score  = warp_max(score);
+        const unsigned long long best_mask   = __ballot(score == best_score);
+        // The first set lane preserves the lower-index tie break.
+        const uint32_t           best_expert = (uint32_t) (__ffsll(best_mask) - 1);
+#else
         float    best_score  = score;
         uint32_t best_expert = lane;
 
@@ -1031,6 +1116,7 @@ static __device__ void select_experts(const gptoss_decode_layer_params & p, int3
                 best_expert = other_expert;
             }
         }
+#endif
 
         if (lane == 0) {
             ids[selected] = (int32_t) best_expert;
@@ -1061,6 +1147,32 @@ static __device__ void select_experts(const gptoss_decode_layer_params & p, int3
 }
 
 static __device__ void moe_gate_up(const gptoss_decode_layer_params & p) {
+#if defined(__gfx1100__)
+    const uint32_t total_rows            = experts_used * intermediate_size;
+    const uint32_t warp_global           = blockIdx.x * warps_per_block + threadIdx.y;
+    const uint32_t warp_count            = gridDim.x * warps_per_block;
+    const uint32_t lane                  = threadIdx.x;
+    const half * __restrict__ normalized = normalized_activation(p);
+    half * __restrict__ expert_output    = expert_activations(p);
+    __shared__ int32_t ids[experts_used];
+
+    select_experts(p, ids);
+    __syncthreads();
+
+    for (uint32_t task = warp_global; task < total_rows; task += warp_count) {
+        const uint32_t slot                = task / intermediate_size;
+        const uint32_t row                 = task - slot * intermediate_size;
+        const uint32_t expert              = (uint32_t) ids[slot];
+        const uint64_t logical_expert_row  = (uint64_t) expert * intermediate_size + row;
+        const uint64_t physical_expert_row = (uint64_t) expert * 2u * mxfp4_padded_dim + 2u * row;
+        const mxfp4_row gate               = mxfp4_row_at(p.moe_gate_up_values, physical_expert_row);
+        const float2    dot                = mxfp4_dot2(gate, mxfp4_row_offset(gate, 1u), normalized);
+        if (lane == 0) {
+            const float2 bias = *(const float2 *) (p.moe_gate_up_bias + 2u * logical_expert_row);
+            expert_output[task] = __float2half_rn(swiglu_oai(dot.x + bias.x, dot.y + bias.y));
+        }
+    }
+#else
     const uint32_t out_blocks            = intermediate_size / moe_output_tile_size;
     const uint32_t total_blocks          = experts_used * out_blocks;
     const uint32_t lane                  = threadIdx.x;
@@ -1113,6 +1225,7 @@ static __device__ void moe_gate_up(const gptoss_decode_layer_params & p) {
             __syncthreads();
         }
     }
+#endif
 }
 
 static __device__ void moe_down_residual_rms(const gptoss_decode_layer_params & p) {

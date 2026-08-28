@@ -38,6 +38,7 @@ target_compile_definitions(llama PRIVATE
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(LLAMA_GPTOSS_AOT_SUPPORTED_ARCHITECTURES
+    gfx1100
     gfx1201
 )
 
