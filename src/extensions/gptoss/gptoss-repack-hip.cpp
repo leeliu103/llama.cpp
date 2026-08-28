@@ -40,6 +40,9 @@ constexpr uint32_t mxfp4_source_scale_row_size = expert_dimension / mxfp4_block_
 constexpr uint32_t mxfp4_packed_value_row_size = padded_expert_dimension / 2;
 constexpr uint32_t mxfp4_packed_scale_row_size = padded_expert_dimension / mxfp4_block_values;
 
+// Duplicate scales in unused value-row padding for decode locality.
+static_assert(mxfp4_source_value_row_size + mxfp4_source_scale_row_size <= mxfp4_packed_value_row_size);
+
 constexpr size_t mxfp4_native_weight_size =
     static_cast<size_t>(expert_count) * expert_dimension * mxfp4_source_row_size;
 constexpr size_t mxfp4_down_values_size       = gptoss_moe_down_values_size;
@@ -100,6 +103,10 @@ __global__ void repack_mxfp4_down_kernel(uint8_t * dst_values, uint8_t * dst_sca
             const uint8_t * block = src_row + (k_byte / 16) * mxfp4_block_bytes;
             value                 = repack_mxfp4_pair(block, k_byte % 16);
         }
+        else if (src_row != nullptr && k_byte < mxfp4_source_value_row_size + mxfp4_source_scale_row_size) {
+            const uint32_t scale_index = k_byte - mxfp4_source_value_row_size;
+            value                      = src_row[scale_index * mxfp4_block_bytes];
+        }
 
         dst_values[dst_row * mxfp4_packed_value_row_size + k_byte] = value;
     }
@@ -137,6 +144,10 @@ __global__ void repack_mxfp4_gate_up_kernel(uint8_t *       dst_values,
         if (src_row != nullptr && k_byte < mxfp4_source_value_row_size) {
             const uint8_t * block = src_row + (k_byte / 16) * mxfp4_block_bytes;
             value                 = repack_mxfp4_pair(block, k_byte % 16);
+        }
+        else if (src_row != nullptr && k_byte < mxfp4_source_value_row_size + mxfp4_source_scale_row_size) {
+            const uint32_t scale_index = k_byte - mxfp4_source_value_row_size;
+            value                      = src_row[scale_index * mxfp4_block_bytes];
         }
 
         dst_values[dst_row * mxfp4_packed_value_row_size + k_byte] = value;

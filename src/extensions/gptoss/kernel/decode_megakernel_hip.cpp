@@ -37,11 +37,9 @@ static constexpr float attention_max_offset = 3.0f * 0.6931f;
 
 static constexpr uint32_t mxfp4_padded_dim              = gptoss_mxfp4_padded_size;
 static constexpr uint32_t mxfp4_value_row_bytes         = mxfp4_padded_dim / 2u;
-static constexpr uint32_t mxfp4_scale_row_bytes         = mxfp4_padded_dim / mxfp4_block_size;
+static constexpr uint32_t mxfp4_scale_tail_offset       = intermediate_size / 2u;
 static constexpr uint64_t qkv_values_bytes              = gptoss_qkv_values_size;
 static constexpr uint64_t attention_output_values_bytes = gptoss_attention_output_values_size;
-static constexpr uint64_t moe_down_values_bytes          = gptoss_moe_down_values_size;
-static constexpr uint64_t moe_gate_up_values_bytes       = gptoss_moe_gate_up_values_size;
 
 struct q8_0_row {
     const int8_t * values;
@@ -159,17 +157,18 @@ static __device__ __forceinline__ q8_0_row q8_0_row_offset(const q8_0_row & row,
     };
 }
 
-static __device__ __forceinline__ mxfp4_row mxfp4_row_at(const uint8_t * values, const uint8_t * scales, uint64_t row) {
+static __device__ __forceinline__ mxfp4_row mxfp4_row_at(const uint8_t * values, uint64_t row) {
+    const uint8_t * row_values = values + row * mxfp4_value_row_bytes;
     return {
-        values + row * mxfp4_value_row_bytes,
-        scales + row * mxfp4_scale_row_bytes,
+        row_values,
+        row_values + mxfp4_scale_tail_offset,
     };
 }
 
 static __device__ __forceinline__ mxfp4_row mxfp4_row_offset(const mxfp4_row & row, uint64_t offset) {
     return {
         row.values + offset * mxfp4_value_row_bytes,
-        row.scales + offset * mxfp4_scale_row_bytes,
+        row.scales + offset * mxfp4_value_row_bytes,
     };
 }
 
@@ -1067,7 +1066,6 @@ static __device__ void moe_gate_up(const gptoss_decode_layer_params & p) {
     const uint32_t lane                  = threadIdx.x;
     const half * __restrict__ normalized = normalized_activation(p);
     half * __restrict__ expert_output    = expert_activations(p);
-    const uint8_t * __restrict__ scales  = p.moe_gate_up_values + moe_gate_up_values_bytes;
     __shared__ int32_t ids[experts_used];
     __shared__ float   act[moe_output_tile_size];
 
@@ -1086,7 +1084,7 @@ static __device__ void moe_gate_up(const gptoss_decode_layer_params & p) {
         const uint32_t  row_base            = output_block * moe_output_tile_size;
         const uint64_t  logical_expert_row  = (uint64_t) expert * intermediate_size + row_base;
         const uint64_t  physical_expert_row = (uint64_t) expert * 2u * mxfp4_padded_dim + 2u * row_base;
-        const mxfp4_row gate_tile           = mxfp4_row_at(p.moe_gate_up_values, scales, physical_expert_row);
+        const mxfp4_row gate_tile           = mxfp4_row_at(p.moe_gate_up_values, physical_expert_row);
         const mxfp4_row up_tile             = mxfp4_row_offset(gate_tile, 1u);
         const float * __restrict__ bias     = p.moe_gate_up_bias + 2u * logical_expert_row;
 
@@ -1122,7 +1120,6 @@ static __device__ void moe_down_residual_rms(const gptoss_decode_layer_params & 
     const uint32_t warp_count             = gridDim.x * warps_per_block;
     const uint32_t lane                   = threadIdx.x;
     const half * __restrict__ activations = expert_activations(p);
-    const uint8_t * __restrict__ scales   = p.moe_down_values + moe_down_values_bytes;
     float * __restrict__ next             = p.next;
     __shared__ float rms_warp_partials[warps_per_block];
 
@@ -1135,7 +1132,7 @@ static __device__ void moe_down_residual_rms(const gptoss_decode_layer_params & 
     for (uint32_t slot = 0; slot < experts_used; ++slot) {
         const uint32_t expert = (uint32_t) p.expert_ids[slot];
         slots[slot]           = {
-            mxfp4_row_at(p.moe_down_values, scales, (uint64_t) expert * mxfp4_padded_dim),
+            mxfp4_row_at(p.moe_down_values, (uint64_t) expert * mxfp4_padded_dim),
             activations + (uint64_t) slot * intermediate_size,
             p.moe_down_bias + (uint64_t) expert * hidden_size,
             p.expert_weights[slot],
