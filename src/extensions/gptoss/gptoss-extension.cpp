@@ -9,6 +9,7 @@
 #include "gptoss-kernel-aot.h"
 #include "gptoss-buffers.h"
 #include "gptoss-config.h"
+#include "gptoss-decode-aql.h"
 #include "gptoss-kernel-hip.h"
 #include "gptoss-kv.h"
 #include "gptoss-repack-hip.h"
@@ -19,6 +20,7 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -32,7 +34,8 @@ constexpr const char * gptoss_fa_name            = "kernel_unified_attention_2d"
 constexpr size_t       gptoss_workspace_headroom = 4 * 1024 * 1024;
 
 struct gptoss_context_state {
-    hipStream_t stream = nullptr;
+    hipStream_t         stream     = nullptr;
+    gptoss_decode_aql * decode_aql = nullptr;
 
     hipModule_t q8_qkv_module      = nullptr;
     hipModule_t q8_attn_out_module = nullptr;
@@ -80,6 +83,8 @@ void gptoss_context_free(llama_context * ctx) {
     if (state->stream != nullptr) {
         (void) hipStreamSynchronize(state->stream);
     }
+
+    gptoss_decode_aql_destroy(state->decode_aql);
 
     (void) gptoss_hip_ok(state->workspace.free(), "workspace free");
 
@@ -267,6 +272,12 @@ bool gptoss_context_init(llama_context * ctx) {
     ctx->execution_extension_state = state;
 
     if (hipStreamCreateWithFlags(&state->stream, hipStreamNonBlocking) != hipSuccess) {
+        gptoss_context_free(ctx);
+        return false;
+    }
+
+    state->decode_aql = gptoss_decode_aql_create(properties.multiProcessorCount);
+    if (state->decode_aql == nullptr) {
         gptoss_context_free(ctx);
         return false;
     }
@@ -614,6 +625,8 @@ int gptoss_decode(llama_context *                ctx,
     float * current = buffers.cur;
     float * next    = buffers.next;
 
+    std::array<gptoss_decode_layer_params, gptoss_layer_count> layer_params{};
+
     for (uint32_t il = 0; il < gptoss_layer_count; ++il) {
         const llama_layer & layer  = model.layers[il];
         const bool          is_swa = hparams.is_swa(il);
@@ -635,7 +648,7 @@ int gptoss_decode(llama_context *                ctx,
         const uint8_t * output_weight = static_cast<const uint8_t *>(layer.wo->data);
         const uint8_t * moe           = static_cast<const uint8_t *>(layer.ffn_gate_exps->data);
 
-        gptoss_decode_layer_params params = {};
+        auto & params                     = layer_params[il];
         params.next                      = next;
         params.cur                       = current;
         params.rms_partials              = buffers.rms_partials;
@@ -677,27 +690,33 @@ int gptoss_decode(llama_context *                ctx,
         params.rope_theta_scale     = std::pow(freq_base, -2.0f / gptoss_head_size);
         params.reuse_attention_rms  = il != 0;
 
-        if (!gptoss_hip_ok(gptoss_decode_layer_launch(is_swa, params, state->stream), "decode layer")) {
-            return -1;
-        }
-
         std::swap(current, next);
     }
 
-    if (output) {
-        if (!gptoss_hip_ok(gptoss_rms_norm_launch(
-                               current, static_cast<const float *>(model.output_norm->data), buffers.activation_scratch,
-                               hparams.f_norm_rms_eps, 1, state->stream),
-                           "output RMS norm") ||
-            !gptoss_hip_ok(gptoss_lm_head_mmvq_launch(static_cast<const uint8_t *>(model.output->data),
-                                                      buffers.activation_scratch, buffers.logits, state->stream),
-                           "LM head") ||
-            !gptoss_hip_ok(
-                               hipMemcpyAsync(logits_out, buffers.logits, static_cast<size_t>(gptoss_vocabulary_size) * sizeof(float),
-                               hipMemcpyDeviceToHost, state->stream),
-                "logits download")) {
-            return -1;
-        }
+    if (!gptoss_hip_ok(hipStreamSynchronize(state->stream), "decode input synchronize")) {
+        return -1;
+    }
+    if (!gptoss_decode_aql_launch(state->decode_aql, layer_params.data())) {
+        LLAMA_LOG_ERROR("%s: AQL decode launch failed\n", __func__);
+        return -1;
+    }
+
+    if (!output) {
+        return 0;
+    }
+
+    if (!gptoss_hip_ok(gptoss_rms_norm_launch(
+                           current, static_cast<const float *>(model.output_norm->data), buffers.activation_scratch,
+                           hparams.f_norm_rms_eps, 1, state->stream),
+                       "output RMS norm") ||
+        !gptoss_hip_ok(gptoss_lm_head_mmvq_launch(static_cast<const uint8_t *>(model.output->data),
+                                                  buffers.activation_scratch, buffers.logits, state->stream),
+                       "LM head") ||
+        !gptoss_hip_ok(
+                           hipMemcpyAsync(logits_out, buffers.logits, static_cast<size_t>(gptoss_vocabulary_size) * sizeof(float),
+                           hipMemcpyDeviceToHost, state->stream),
+            "logits download")) {
+        return -1;
     }
 
     return gptoss_hip_ok(hipStreamSynchronize(state->stream), "decode synchronize") ? 0 : -1;

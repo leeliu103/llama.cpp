@@ -132,4 +132,4 @@ hipError_t gptoss_lm_head_mmvq_launch(const uint8_t * weight,
                                       float *         logits,
                                       hipStream_t     stream);
 
-hipError_t gptoss_decode_layer_launch(bool swa, const gptoss_decode_layer_params & params, hipStream_t stream);
+hipError_t gptoss_decode_aql_get_launch_info(void ** marker_address, int * active_blocks);

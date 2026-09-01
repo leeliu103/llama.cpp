@@ -22,6 +22,7 @@ set_source_files_properties(
 )
 
 target_sources(llama PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-decode-aql.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-kernel-aot.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-buffers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-extension.cpp"

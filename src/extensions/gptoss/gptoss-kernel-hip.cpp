@@ -34,8 +34,6 @@ __global__ void gptoss_ogs_build_routes(const int32_t *,
                                         uint32_t);
 __global__ void gptoss_moe_combine_residual_f32(float *, const float *, const float *, const float *, uint32_t);
 __global__ void gptoss_lm_head_mmvq_q8_0_f16_kernel(const uint8_t *, const __half *, float *);
-__global__ void gptoss_decode_layer_swa_kernel(gptoss_decode_layer_params);
-__global__ void gptoss_decode_layer_full_kernel(gptoss_decode_layer_params);
 
 hipError_t gptoss_embedding_q8_0_launch(float *         output,
                                         const uint8_t * weight,
@@ -146,13 +144,4 @@ hipError_t gptoss_lm_head_mmvq_launch(const uint8_t * weight,
     hipLaunchKernelGGL(gptoss_lm_head_mmvq_q8_0_f16_kernel, dim3(gptoss_vocabulary_size / 4), dim3(32, 4), 0, stream,
                        weight, activation, logits);
     return hipGetLastError();
-}
-
-hipError_t gptoss_decode_layer_launch(bool swa, const gptoss_decode_layer_params & params, hipStream_t stream) {
-    const void * kernel = swa ? reinterpret_cast<const void *>(gptoss_decode_layer_swa_kernel) :
-                                reinterpret_cast<const void *>(gptoss_decode_layer_full_kernel);
-
-    void * kernel_params[] = { const_cast<gptoss_decode_layer_params *>(&params) };
-    return hipLaunchCooperativeKernel(kernel, dim3(gptoss_decode_grid_blocks),
-                                      dim3(gptoss_decode_block_x, gptoss_decode_block_y), kernel_params, 0, stream);
 }

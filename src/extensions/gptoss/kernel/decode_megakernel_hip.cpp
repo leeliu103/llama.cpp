@@ -1309,8 +1309,11 @@ static __device__ void moe_down_residual_rms(const gptoss_decode_layer_params & 
 
 }  // namespace
 
+extern "C" __device__ uint32_t gptoss_decode_aql_marker = 1;
+
 // Complete sliding-window decode layer.
-__launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_swa_kernel(gptoss_decode_layer_params p) {
+extern "C" __launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_swa_kernel(
+        gptoss_decode_layer_params p) {
     cg::grid_group grid = cg::this_grid();
 
     attention_rms_norm(p);
@@ -1331,7 +1334,8 @@ __launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_swa_kernel(
 // Complete full-context decode layer. The producer writes flash-style partials
 // for all heads and partitions; the cooperative grid combines directly to
 // FP16 and continues through the shared output/MoE stages.
-__launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_full_kernel(gptoss_decode_layer_params p) {
+extern "C" __launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_full_kernel(
+        gptoss_decode_layer_params p) {
     cg::grid_group grid = cg::this_grid();
 
     attention_rms_norm(p);
@@ -1349,4 +1353,34 @@ __launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_full_kernel
     moe_gate_up(p);
     grid.sync();
     moe_down_residual_rms(p);
+}
+
+hipError_t gptoss_decode_aql_get_launch_info(void ** marker_address, int * active_blocks) {
+    if (marker_address == nullptr || active_blocks == nullptr) {
+        return hipErrorInvalidValue;
+    }
+
+    *marker_address = nullptr;
+    *active_blocks  = 0;
+
+    hipError_t error = hipGetSymbolAddress(marker_address, HIP_SYMBOL(gptoss_decode_aql_marker));
+    if (error != hipSuccess) {
+        return error;
+    }
+
+    int swa_blocks  = 0;
+    int full_blocks = 0;
+    error = hipOccupancyMaxActiveBlocksPerMultiprocessor(
+        &swa_blocks, gptoss_decode_layer_swa_kernel, block_size, 0);
+    if (error != hipSuccess) {
+        return error;
+    }
+    error = hipOccupancyMaxActiveBlocksPerMultiprocessor(
+        &full_blocks, gptoss_decode_layer_full_kernel, block_size, 0);
+    if (error != hipSuccess) {
+        return error;
+    }
+
+    *active_blocks = swa_blocks < full_blocks ? swa_blocks : full_blocks;
+    return hipSuccess;
 }
