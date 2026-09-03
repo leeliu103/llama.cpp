@@ -22,7 +22,8 @@ __global__ void gptoss_qkv_rope_cache_f16(__half *,
                                           const __half *,
                                           const float *,
                                           const int64_t *);
-__global__ void gptoss_biased_topk_softmax_kernel(const float *, const float *, int32_t *, float *, uint32_t);
+__global__ void gptoss_biased_topk_softmax_kernel(
+    const float *, const float *, int32_t *, float *, uint32_t, uint32_t);
 __global__ void gptoss_ogs_build_routes(const int32_t *,
                                         int32_t *,
                                         int32_t *,
@@ -31,11 +32,13 @@ __global__ void gptoss_ogs_build_routes(const int32_t *,
                                         int32_t *,
                                         int32_t *,
                                         uint32_t,
+                                        uint32_t,
                                         uint32_t);
 __global__ void gptoss_moe_combine_residual_f32(float *, const float *, const float *, const float *, uint32_t);
 __global__ void gptoss_lm_head_mmvq_q8_0_f16_kernel(const uint8_t *, const __half *, float *);
-__global__ void gptoss_decode_layer_swa_kernel(gptoss_decode_layer_params);
-__global__ void gptoss_decode_layer_full_kernel(gptoss_decode_layer_params);
+__global__ void gptoss_lm_head_mmvq_batch_q8_0_f16_kernel(const uint8_t *, const __half *, float *, uint32_t);
+extern "C" __global__ void gptoss_decode_layer_swa_kernel(gptoss_decode_layer_params);
+extern "C" __global__ void gptoss_decode_layer_full_kernel(gptoss_decode_layer_params);
 
 hipError_t gptoss_embedding_q8_0_launch(float *         output,
                                         const uint8_t * weight,
@@ -105,9 +108,10 @@ hipError_t gptoss_biased_topk_softmax_launch(const float * router_logits,
                                              int32_t *     selected_ids,
                                              float *       selected_weights,
                                              uint32_t      n_tokens,
+                                             uint32_t      expert_count,
                                              hipStream_t   stream) {
     hipLaunchKernelGGL(gptoss_biased_topk_softmax_kernel, dim3((n_tokens + 3) / 4), dim3(32, 4), 0, stream,
-                       router_logits, router_bias, selected_ids, selected_weights, n_tokens);
+                       router_logits, router_bias, selected_ids, selected_weights, n_tokens, expert_count);
     return hipGetLastError();
 }
 
@@ -120,10 +124,11 @@ hipError_t gptoss_ogs_build_routes_launch(const int32_t * expert_ids,
                                           int32_t *       block_schedule,
                                           uint32_t        route_count,
                                           uint32_t        schedule_capacity,
+                                          uint32_t        expert_count,
                                           hipStream_t     stream) {
     hipLaunchKernelGGL(gptoss_ogs_build_routes, dim3(1), dim3(256), 0, stream, expert_ids, gather_token_indices,
                        scatter_route_indices, expert_counts, route_offsets, block_offsets, block_schedule, route_count,
-                       schedule_capacity);
+                       schedule_capacity, expert_count);
     return hipGetLastError();
 }
 
@@ -145,6 +150,17 @@ hipError_t gptoss_lm_head_mmvq_launch(const uint8_t * weight,
                                       hipStream_t     stream) {
     hipLaunchKernelGGL(gptoss_lm_head_mmvq_q8_0_f16_kernel, dim3(gptoss_vocabulary_size / 4), dim3(32, 4), 0, stream,
                        weight, activation, logits);
+    return hipGetLastError();
+}
+
+hipError_t gptoss_lm_head_mmvq_batch_launch(const uint8_t * weight,
+                                            const __half *  activation,
+                                            float *         logits,
+                                            uint32_t        n_tokens,
+                                            hipStream_t     stream) {
+    hipLaunchKernelGGL(gptoss_lm_head_mmvq_batch_q8_0_f16_kernel,
+                       dim3(gptoss_vocabulary_size / 4, (n_tokens + 3) / 4), dim3(32, 4), 0, stream, weight,
+                       activation, logits, n_tokens);
     return hipGetLastError();
 }
 

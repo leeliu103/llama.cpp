@@ -9,6 +9,7 @@
 #include "gptoss-kernel-aot.h"
 #include "gptoss-buffers.h"
 #include "gptoss-config.h"
+#include "gptoss-decode-aql.h"
 #include "gptoss-kernel-hip.h"
 #include "gptoss-kv.h"
 #include "gptoss-repack-hip.h"
@@ -19,6 +20,7 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -32,7 +34,9 @@ constexpr const char * gptoss_fa_name            = "kernel_unified_attention_2d"
 constexpr size_t       gptoss_workspace_headroom = 4 * 1024 * 1024;
 
 struct gptoss_context_state {
-    hipStream_t stream = nullptr;
+    hipStream_t                 stream     = nullptr;
+    const gptoss_model_config * config     = nullptr;
+    gptoss_decode_aql *         decode_aql = nullptr;
 
     hipModule_t q8_qkv_module      = nullptr;
     hipModule_t q8_attn_out_module = nullptr;
@@ -68,6 +72,18 @@ bool gptoss_hip_ok(hipError_t error, const char * operation) {
     return false;
 }
 
+const gptoss_model_config * gptoss_get_model_config(const llama_hparams & hparams) {
+    if (hparams.n_layer_all == gptoss_config_20b.layer_count &&
+        hparams.n_expert == gptoss_config_20b.expert_count) {
+        return &gptoss_config_20b;
+    }
+    if (hparams.n_layer_all == gptoss_config_120b.layer_count &&
+        hparams.n_expert == gptoss_config_120b.expert_count) {
+        return &gptoss_config_120b;
+    }
+    return nullptr;
+}
+
 size_t gptoss_tensor_alloc_size(const ggml_tensor * tensor);
 
 void gptoss_context_free(llama_context * ctx) {
@@ -80,6 +96,8 @@ void gptoss_context_free(llama_context * ctx) {
     if (state->stream != nullptr) {
         (void) hipStreamSynchronize(state->stream);
     }
+
+    gptoss_decode_aql_destroy(state->decode_aql);
 
     (void) gptoss_hip_ok(state->workspace.free(), "workspace free");
 
@@ -119,10 +137,10 @@ void gptoss_context_free(llama_context * ctx) {
 
 bool gptoss_model_init(llama_model * model) {
     const llama_hparams & hparams = model->hparams;
+    const auto *          config  = gptoss_get_model_config(hparams);
 
     if (model->n_devices() != 1 || model->n_gpu_layers() <= hparams.n_layer_all || model->has_tensor_overrides() ||
-        hparams.n_layer_all != gptoss_layer_count || hparams.n_embd != gptoss_hidden_size ||
-        hparams.n_ff_exp != gptoss_intermediate_size || hparams.n_expert != gptoss_expert_count ||
+        config == nullptr || hparams.n_embd != gptoss_hidden_size || hparams.n_ff_exp != gptoss_intermediate_size ||
         hparams.n_expert_used != gptoss_expert_used_count || hparams.n_expert_groups != 0 ||
         hparams.n_group_used != 0 || hparams.n_swa != gptoss_swa_size ||
         model->vocab.n_tokens() != gptoss_vocabulary_size) {
@@ -161,7 +179,7 @@ bool gptoss_model_init(llama_model * model) {
         return false;
     }
 
-    for (uint32_t il = 0; il < gptoss_layer_count; ++il) {
+    for (uint32_t il = 0; il < config->layer_count; ++il) {
         const llama_layer & layer = model->layers[il];
 
         if (hparams.is_swa(il) != (il % 2 == 0) || hparams.n_head(il) != gptoss_query_head_count ||
@@ -220,7 +238,7 @@ bool gptoss_model_init(llama_model * model) {
 
     bool success = true;
 
-    for (uint32_t il = 0; il < gptoss_layer_count; ++il) {
+    for (uint32_t il = 0; il < config->layer_count; ++il) {
         llama_layer & layer = model->layers[il];
 
         if (!gptoss_repack_qkv_launch(static_cast<uint8_t *>(layer.wq->data), static_cast<uint8_t *>(layer.wk->data),
@@ -230,7 +248,7 @@ bool gptoss_model_init(llama_model * model) {
                 static_cast<uint8_t *>(layer.ffn_gate_exps->data), static_cast<uint8_t *>(layer.ffn_down_exps->data),
                 static_cast<uint8_t *>(layer.ffn_up_exps->data), static_cast<float *>(layer.ffn_gate_exps_b->data),
                 static_cast<float *>(layer.ffn_down_exps_b->data), static_cast<float *>(layer.ffn_up_exps_b->data),
-                scratch)) {
+                config->expert_count, scratch)) {
             success = false;
             break;
         }
@@ -244,8 +262,9 @@ bool gptoss_model_init(llama_model * model) {
 
 bool gptoss_context_init(llama_context * ctx) {
     const auto & cparams = ctx->get_cparams();
+    const auto * config  = gptoss_get_model_config(ctx->get_model().hparams);
 
-    if (!cparams.causal_attn || !cparams.flash_attn || !cparams.offload_kqv) {
+    if (config == nullptr || !cparams.causal_attn || !cparams.flash_attn || !cparams.offload_kqv) {
         return false;
     }
 
@@ -264,6 +283,7 @@ bool gptoss_context_init(llama_context * ctx) {
     const llama_hip_aot_loader aot_loader(GPTOSS_AOT_ROOT, properties);
 
     auto * state                   = new gptoss_context_state;
+    state->config                  = config;
     ctx->execution_extension_state = state;
 
     if (hipStreamCreateWithFlags(&state->stream, hipStreamNonBlocking) != hipSuccess) {
@@ -271,31 +291,44 @@ bool gptoss_context_init(llama_context * ctx) {
         return false;
     }
 
+    state->decode_aql = gptoss_decode_aql_create(properties.multiProcessorCount, config->layer_count);
+    if (state->decode_aql == nullptr) {
+        gptoss_context_free(ctx);
+        return false;
+    }
+
+    const bool   is_120b          = config->expert_count == gptoss_config_120b.expert_count;
+    const char * router_file      = is_120b ? "router_128.hsaco" : "router_32.hsaco";
+    const char * ogs_w13_file     = is_120b ? "ogs_w13_128.hsaco" : "ogs_w13_32.hsaco";
+    const char * ogs_w2_file      = is_120b ? "ogs_w2_128.hsaco" : "ogs_w2_32.hsaco";
+    const char * ogs_w13_small_file = is_120b ? "ogs_w13_small_128.hsaco" : "ogs_w13_small_32.hsaco";
+    const char * ogs_w2_small_file  = is_120b ? "ogs_w2_small_128.hsaco" : "ogs_w2_small_32.hsaco";
+
     if (!aot_loader.load(&state->q8_qkv_module, "q8_qkv.hsaco") ||
         hipModuleGetFunction(&state->q8_qkv, state->q8_qkv_module, "gptoss_q8_0_w8a16_qkv_bias") != hipSuccess ||
         !aot_loader.load(&state->q8_attn_out_module, "q8_attn_out.hsaco") ||
         hipModuleGetFunction(&state->q8_attn_out, state->q8_attn_out_module,
                              "gptoss_q8_0_w8a16_attn_output_bias_residual") != hipSuccess ||
-        !aot_loader.load(&state->router_module, "router.hsaco") ||
+        !aot_loader.load(&state->router_module, router_file) ||
         hipModuleGetFunction(&state->router, state->router_module, "gptoss_router") != hipSuccess ||
         !aot_loader.load(&state->fa_full_module, "fa_full.hsaco") ||
         hipModuleGetFunction(&state->fa_full, state->fa_full_module, gptoss_fa_name) != hipSuccess ||
         !aot_loader.load(&state->fa_swa_module, "fa_sw128.hsaco") ||
         hipModuleGetFunction(&state->fa_swa, state->fa_swa_module, gptoss_fa_name) != hipSuccess ||
-        !aot_loader.load(&state->ogs_w13_module, "ogs_w13.hsaco") ||
+        !aot_loader.load(&state->ogs_w13_module, ogs_w13_file) ||
         hipModuleGetFunction(&state->ogs_w13, state->ogs_w13_module,
                              "_matmul_NNN_fp16xfp16xmxfp4_64x128x128x1_swiglu") != hipSuccess ||
-        !aot_loader.load(&state->ogs_w2_module, "ogs_w2.hsaco") ||
+        !aot_loader.load(&state->ogs_w2_module, ogs_w2_file) ||
         hipModuleGetFunction(&state->ogs_w2, state->ogs_w2_module, "_matmul_NNN_fp32xfp16xmxfp4_64x128x128x1") !=
             hipSuccess) {
         gptoss_context_free(ctx);
         return false;
     }
 
-    if (!aot_loader.load(&state->ogs_w13_small_module, "ogs_w13_small.hsaco") ||
+    if (!aot_loader.load(&state->ogs_w13_small_module, ogs_w13_small_file) ||
         hipModuleGetFunction(&state->ogs_w13_small, state->ogs_w13_small_module,
                              "_matmul_NNN_fp16xfp16xmxfp4_16x64x512x1_swiglu") != hipSuccess ||
-        !aot_loader.load(&state->ogs_w2_small_module, "ogs_w2_small.hsaco") ||
+        !aot_loader.load(&state->ogs_w2_small_module, ogs_w2_small_file) ||
         hipModuleGetFunction(&state->ogs_w2_small, state->ogs_w2_small_module,
                              "_matmul_NNN_fp32xfp16xmxfp4_16x64x512x1") != hipSuccess) {
         gptoss_context_free(ctx);
@@ -310,10 +343,11 @@ int gptoss_prefill(llama_context *                ctx,
                    const llama_memory_context_i * mctx,
                    float *                        logits_out) {
     auto * state = static_cast<gptoss_context_state *>(ctx->execution_extension_state);
-    if (state == nullptr || ubatch.token == nullptr || mctx == nullptr ||
+    if (state == nullptr || state->config == nullptr || ubatch.token == nullptr || mctx == nullptr ||
         ubatch.n_tokens > std::numeric_limits<int32_t>::max() / gptoss_expert_used_count) {
         return -1;
     }
+    const auto & config = *state->config;
     const auto *   iswa = static_cast<const llama_kv_cache_iswa_context *>(mctx);
     gptoss_kv_batch kv_batch;
     if (!gptoss_build_kv_batch(ubatch, *iswa, kv_batch)) {
@@ -331,11 +365,16 @@ int gptoss_prefill(llama_context *                ctx,
 
     const uint32_t n_sequences = static_cast<uint32_t>(kv_batch.query_offsets.size() - 1);
 
-    const bool output    = logits_out != nullptr;
+    uint32_t n_outputs = 0;
+    if (logits_out != nullptr) {
+        for (uint32_t row = 0; row < ubatch.n_tokens; ++row) {
+            n_outputs += ubatch.output[row] != 0;
+        }
+    }
     const bool small_ogs = ubatch.n_tokens * gptoss_expert_used_count <= gptoss_ogs_small_max_m;
 
     llama_hip_workspace_cursor measure;
-    (void) gptoss_make_prefill_buffers(measure, ubatch.n_tokens, output, n_sequences,
+    (void) gptoss_make_prefill_buffers(measure, ubatch.n_tokens, n_outputs, config.expert_count, n_sequences,
                                        static_cast<uint32_t>(base_fa.row_indices.size()),
                                        static_cast<uint32_t>(swa_fa.row_indices.size()));
     if (!measure.valid()) {
@@ -346,7 +385,7 @@ int gptoss_prefill(llama_context *                ctx,
         return -1;
     }
     llama_hip_workspace_cursor bind(state->workspace.data(), measure.size());
-    auto buffers = gptoss_make_prefill_buffers(bind, ubatch.n_tokens, output, n_sequences,
+    auto buffers = gptoss_make_prefill_buffers(bind, ubatch.n_tokens, n_outputs, config.expert_count, n_sequences,
                                                static_cast<uint32_t>(base_fa.row_indices.size()),
                                                static_cast<uint32_t>(swa_fa.row_indices.size()));
     if (!bind.valid() || bind.size() != measure.size()) {
@@ -419,7 +458,11 @@ int gptoss_prefill(llama_context *                ctx,
         return -1;
     }
 
-    for (uint32_t il = 0; il < gptoss_layer_count; ++il) {
+    const size_t moe_down_scales_offset    = gptoss_moe_down_scales_offset(config.expert_count);
+    const size_t moe_gate_up_values_offset = gptoss_moe_gate_up_values_offset(config.expert_count);
+    const size_t moe_gate_up_scales_offset = gptoss_moe_gate_up_scales_offset(config.expert_count);
+
+    for (uint32_t il = 0; il < config.layer_count; ++il) {
         const llama_layer & layer  = model.layers[il];
         const bool          is_swa = hparams.is_swa(il);
         const auto &        kv     = is_swa ? kv_batch.swa : kv_batch.base;
@@ -480,20 +523,21 @@ int gptoss_prefill(llama_context *                ctx,
         }
         if (!gptoss_hip_ok(gptoss_router_launch(state->router, buffers.router_logits, buffers.cur,
                                                 static_cast<const float *>(layer.ffn_gate_inp->data), ubatch.n_tokens,
-                                                state->stream),
+                                                config.expert_count, state->stream),
                            "router projection")) {
             return -1;
         }
 
         if (!gptoss_hip_ok(gptoss_biased_topk_softmax_launch(
                                buffers.router_logits, static_cast<const float *>(layer.ffn_gate_inp_b->data),
-                               buffers.selected_ids, buffers.selected_weights, ubatch.n_tokens, state->stream),
+                               buffers.selected_ids, buffers.selected_weights, ubatch.n_tokens, config.expert_count,
+                               state->stream),
                            "expert selection") ||
             !gptoss_hip_ok(
                 gptoss_ogs_build_routes_launch(buffers.selected_ids, buffers.gather_indices, buffers.scatter_indices,
                                                buffers.expert_counts, buffers.route_offsets, buffers.block_offsets,
                                                buffers.block_schedule, buffers.route_count, buffers.schedule_capacity,
-                                               state->stream),
+                                               config.expert_count, state->stream),
                 "expert route build")) {
             return -1;
         }
@@ -501,7 +545,7 @@ int gptoss_prefill(llama_context *                ctx,
         if (!gptoss_hip_ok(
                 gptoss_ogs_w13_launch(
                     small_ogs ? state->ogs_w13_small : state->ogs_w13, buffers.expert_activations, buffers.norm,
-                    moe + gptoss_moe_gate_up_values_offset, moe + gptoss_moe_gate_up_scales_offset,
+                    moe + moe_gate_up_values_offset, moe + moe_gate_up_scales_offset,
                     static_cast<const float *>(layer.ffn_down_exps_b->data), buffers.gather_indices,
                     buffers.expert_counts, buffers.route_offsets, buffers.block_offsets, buffers.block_schedule,
                     buffers.schedule_capacity, small_ogs, state->stream),
@@ -513,7 +557,7 @@ int gptoss_prefill(llama_context *                ctx,
                 gptoss_ogs_w2_launch(
                     small_ogs ? state->ogs_w2_small : state->ogs_w2, buffers.expert_outputs,
                     buffers.expert_activations, moe,
-                    moe + gptoss_moe_down_scales_offset, static_cast<const float *>(layer.ffn_gate_exps_b->data),
+                    moe + moe_down_scales_offset, static_cast<const float *>(layer.ffn_gate_exps_b->data),
                     buffers.scatter_indices, buffers.route_count, buffers.expert_counts, buffers.route_offsets,
                     buffers.block_offsets, buffers.block_schedule, buffers.schedule_capacity, small_ogs, state->stream),
                 "MoE down projection") ||
@@ -524,26 +568,47 @@ int gptoss_prefill(llama_context *                ctx,
         }
     }
 
-    size_t output_idx = 0;
-    for (uint32_t row = 0; row < ubatch.n_tokens; ++row) {
-        if (ubatch.output[row] == 0) {
-            continue;
+    if (n_outputs > 0) {
+        if (n_outputs == ubatch.n_tokens) {
+            if (!gptoss_hip_ok(gptoss_rms_norm_launch(
+                                   buffers.cur, static_cast<const float *>(model.output_norm->data), buffers.norm,
+                                   hparams.f_norm_rms_eps, n_outputs, state->stream),
+                               "output RMS norm")) {
+                return -1;
+            }
         }
-        if (!gptoss_hip_ok(gptoss_rms_norm_launch(
-                               buffers.cur + static_cast<size_t>(row) * gptoss_hidden_size,
-                               static_cast<const float *>(model.output_norm->data), buffers.norm,
-                               hparams.f_norm_rms_eps, 1, state->stream),
-                           "output RMS norm") ||
-            !gptoss_hip_ok(gptoss_lm_head_mmvq_launch(static_cast<const uint8_t *>(model.output->data),
-                                                      buffers.norm, buffers.logits, state->stream),
-                           "LM head") ||
-            !gptoss_hip_ok(hipMemcpyAsync(logits_out + output_idx * gptoss_vocabulary_size, buffers.logits,
-                                          static_cast<size_t>(gptoss_vocabulary_size) * sizeof(float),
+        else {
+            size_t output_idx = 0;
+            for (uint32_t row = 0; row < ubatch.n_tokens; ++row) {
+                if (ubatch.output[row] == 0) {
+                    continue;
+                }
+                if (!gptoss_hip_ok(gptoss_rms_norm_launch(
+                                       buffers.cur + static_cast<size_t>(row) * gptoss_hidden_size,
+                                       static_cast<const float *>(model.output_norm->data),
+                                       buffers.norm + output_idx * gptoss_hidden_size, hparams.f_norm_rms_eps, 1,
+                                       state->stream),
+                                   "output RMS norm")) {
+                    return -1;
+                }
+                ++output_idx;
+            }
+        }
+
+        const hipError_t lm_head_status = n_outputs == 1 ?
+                                              gptoss_lm_head_mmvq_launch(
+                                                  static_cast<const uint8_t *>(model.output->data), buffers.norm,
+                                                  buffers.logits, state->stream) :
+                                              gptoss_lm_head_mmvq_batch_launch(
+                                                  static_cast<const uint8_t *>(model.output->data), buffers.norm,
+                                                  buffers.logits, n_outputs, state->stream);
+        if (!gptoss_hip_ok(lm_head_status, "LM head") ||
+            !gptoss_hip_ok(hipMemcpyAsync(logits_out, buffers.logits,
+                                          static_cast<size_t>(n_outputs) * gptoss_vocabulary_size * sizeof(float),
                                           hipMemcpyDeviceToHost, state->stream),
                            "logits download")) {
             return -1;
         }
-        ++output_idx;
     }
 
     if (!gptoss_hip_ok(hipStreamSynchronize(state->stream), "prefill synchronize")) {
@@ -557,9 +622,11 @@ int gptoss_decode(llama_context *                ctx,
                   const llama_memory_context_i * mctx,
                   float *                        logits_out) {
     auto * state = static_cast<gptoss_context_state *>(ctx->execution_extension_state);
-    if (state == nullptr || ubatch.n_tokens != 1 || ubatch.token == nullptr || mctx == nullptr) {
+    if (state == nullptr || state->config == nullptr || ubatch.n_tokens != 1 || ubatch.token == nullptr ||
+        mctx == nullptr) {
         return -1;
     }
+    const auto & config = *state->config;
     const auto *   iswa = static_cast<const llama_kv_cache_iswa_context *>(mctx);
     gptoss_kv_batch kv_batch;
     if (!gptoss_build_kv_batch(ubatch, *iswa, kv_batch)) {
@@ -570,7 +637,8 @@ int gptoss_decode(llama_context *                ctx,
     const bool output = logits_out != nullptr;
 
     llama_hip_workspace_cursor measure;
-    (void) gptoss_make_decode_buffers(measure, kv_batch.base.read_rows.size(), kv_batch.swa.read_rows.size(), output);
+    (void) gptoss_make_decode_buffers(
+        measure, kv_batch.base.read_rows.size(), kv_batch.swa.read_rows.size(), output, config.expert_count);
     if (!measure.valid()) {
         LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
         return -1;
@@ -579,8 +647,8 @@ int gptoss_decode(llama_context *                ctx,
         return -1;
     }
     llama_hip_workspace_cursor bind(state->workspace.data(), measure.size());
-    auto buffers =
-        gptoss_make_decode_buffers(bind, kv_batch.base.read_rows.size(), kv_batch.swa.read_rows.size(), output);
+    auto buffers = gptoss_make_decode_buffers(
+        bind, kv_batch.base.read_rows.size(), kv_batch.swa.read_rows.size(), output, config.expert_count);
     if (!bind.valid() || bind.size() != measure.size()) {
         LLAMA_LOG_ERROR("%s: invalid workspace layout\n", __func__);
         return -1;
@@ -614,7 +682,11 @@ int gptoss_decode(llama_context *                ctx,
     float * current = buffers.cur;
     float * next    = buffers.next;
 
-    for (uint32_t il = 0; il < gptoss_layer_count; ++il) {
+    std::array<gptoss_decode_layer_params, gptoss_config_120b.layer_count> layer_params{};
+
+    const size_t moe_gate_up_values_offset = gptoss_moe_gate_up_values_offset(config.expert_count);
+
+    for (uint32_t il = 0; il < config.layer_count; ++il) {
         const llama_layer & layer  = model.layers[il];
         const bool          is_swa = hparams.is_swa(il);
         const auto &        kv     = is_swa ? kv_batch.swa : kv_batch.base;
@@ -635,8 +707,8 @@ int gptoss_decode(llama_context *                ctx,
         const uint8_t * output_weight = static_cast<const uint8_t *>(layer.wo->data);
         const uint8_t * moe           = static_cast<const uint8_t *>(layer.ffn_gate_exps->data);
 
-        gptoss_decode_layer_params params = {};
-        params.next                      = next;
+        auto & params                     = layer_params[il];
+        params.next                       = next;
         params.cur                       = current;
         params.rms_partials              = buffers.rms_partials;
         params.activation_scratch        = buffers.activation_scratch;
@@ -661,9 +733,10 @@ int gptoss_decode(llama_context *                ctx,
         params.router_weight       = static_cast<const float *>(layer.ffn_gate_inp->data);
         params.router_bias         = static_cast<const float *>(layer.ffn_gate_inp_b->data);
         params.moe_down_values     = moe;
-        params.moe_gate_up_values  = moe + gptoss_moe_gate_up_values_offset;
+        params.moe_gate_up_values  = moe + moe_gate_up_values_offset;
         params.moe_down_bias       = static_cast<const float *>(layer.ffn_gate_exps_b->data);
         params.moe_gate_up_bias    = static_cast<const float *>(layer.ffn_down_exps_b->data);
+        params.expert_count        = config.expert_count;
         params.n_kv                = static_cast<uint32_t>(kv.read_rows.size());
         params.kv_write_row        = static_cast<uint32_t>(kv.write_rows[0]);
         params.attn_parallel_blocks = buffers.attention_partitions;
@@ -677,11 +750,15 @@ int gptoss_decode(llama_context *                ctx,
         params.rope_theta_scale     = std::pow(freq_base, -2.0f / gptoss_head_size);
         params.reuse_attention_rms  = il != 0;
 
-        if (!gptoss_hip_ok(gptoss_decode_layer_launch(is_swa, params, state->stream), "decode layer")) {
-            return -1;
-        }
-
         std::swap(current, next);
+    }
+
+    if (!gptoss_hip_ok(hipStreamSynchronize(state->stream), "decode input synchronize")) {
+        return -1;
+    }
+    if (!gptoss_decode_aql_launch(state->decode_aql, layer_params.data())) {
+        LLAMA_LOG_ERROR("%s: AQL decode launch failed\n", __func__);
+        return -1;
     }
 
     if (output) {

@@ -32,7 +32,6 @@ constexpr uint32_t mxfp4_block_values      = gptoss_mxfp4_block_size;
 constexpr uint32_t mxfp4_block_bytes       = mxfp4_scale_bytes + mxfp4_block_values / 2;
 constexpr uint32_t expert_dimension        = gptoss_intermediate_size;
 constexpr uint32_t padded_expert_dimension = gptoss_mxfp4_padded_size;
-constexpr uint32_t expert_count            = gptoss_expert_count;
 
 constexpr uint32_t mxfp4_source_row_size       = expert_dimension / mxfp4_block_values * mxfp4_block_bytes;
 constexpr uint32_t mxfp4_source_value_row_size = expert_dimension / 2;
@@ -42,15 +41,6 @@ constexpr uint32_t mxfp4_packed_scale_row_size = padded_expert_dimension / mxfp4
 
 // Duplicate scales in unused value-row padding for decode locality.
 static_assert(mxfp4_source_value_row_size + mxfp4_source_scale_row_size <= mxfp4_packed_value_row_size);
-
-constexpr size_t mxfp4_native_weight_size =
-    static_cast<size_t>(expert_count) * expert_dimension * mxfp4_source_row_size;
-constexpr size_t mxfp4_down_values_size       = gptoss_moe_down_values_size;
-constexpr size_t mxfp4_gate_up_values_offset  = gptoss_moe_gate_up_values_offset;
-constexpr size_t mxfp4_gate_up_scales_offset  = gptoss_moe_gate_up_scales_offset;
-
-constexpr uint32_t expert_bias_elements = expert_count * expert_dimension;
-constexpr size_t   expert_bias_size     = static_cast<size_t>(expert_bias_elements) * sizeof(float);
 
 __global__ void repack_q8_0_kernel(int8_t *        dst_values,
                                    uint16_t *      dst_scale_bits,
@@ -164,10 +154,10 @@ __global__ void repack_mxfp4_gate_up_kernel(uint8_t *       dst_values,
     }
 }
 
-__global__ void repack_gate_up_bias_kernel(float * dst, const float * gate, const float * up) {
+__global__ void repack_gate_up_bias_kernel(float * dst, const float * gate, const float * up, uint32_t element_count) {
     const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (index >= expert_bias_elements) {
+    if (index >= element_count) {
         return;
     }
 
@@ -219,7 +209,16 @@ bool gptoss_repack_moe_launch(uint8_t * gate,
                               float *   gate_bias,
                               float *   down_bias,
                               float *   up_bias,
+                              uint32_t  expert_count,
                               uint8_t * scratch) {
+    const size_t mxfp4_native_weight_size =
+        static_cast<size_t>(expert_count) * expert_dimension * mxfp4_source_row_size;
+    const size_t mxfp4_down_values_size      = gptoss_moe_down_values_size(expert_count);
+    const size_t mxfp4_gate_up_values_offset = gptoss_moe_gate_up_values_offset(expert_count);
+    const size_t mxfp4_gate_up_scales_offset = gptoss_moe_gate_up_scales_offset(expert_count);
+    const uint32_t expert_bias_elements      = expert_count * expert_dimension;
+    const size_t   expert_bias_size          = static_cast<size_t>(expert_bias_elements) * sizeof(float);
+
     uint8_t * saved_gate = scratch;
     uint8_t * saved_down = saved_gate + mxfp4_native_weight_size;
     uint8_t * saved_up   = saved_down + mxfp4_native_weight_size;
@@ -266,7 +265,7 @@ bool gptoss_repack_moe_launch(uint8_t * gate,
     const uint32_t bias_grid_size = (expert_bias_elements + repack_threads - 1) / repack_threads;
 
     hipLaunchKernelGGL(repack_gate_up_bias_kernel, dim3(bias_grid_size), dim3(repack_threads), 0, nullptr,
-                       packed_gate_up_bias, saved_gate_bias, saved_up_bias);
+                       packed_gate_up_bias, saved_gate_bias, saved_up_bias, expert_bias_elements);
 
     return hipGetLastError() == hipSuccess;
 }

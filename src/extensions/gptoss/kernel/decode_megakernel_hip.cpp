@@ -20,7 +20,6 @@ static constexpr uint32_t query_head_count    = gptoss_query_head_count;
 static constexpr uint32_t kv_head_count       = gptoss_kv_head_count;
 static constexpr uint32_t head_size           = gptoss_head_size;
 static constexpr uint32_t sliding_window_size = gptoss_swa_size;
-static constexpr uint32_t expert_count        = gptoss_expert_count;
 static constexpr uint32_t experts_used        = gptoss_expert_used_count;
 static constexpr uint32_t intermediate_size   = gptoss_intermediate_size;
 
@@ -633,16 +632,12 @@ static __device__ void qkv_rope_cache(const gptoss_decode_layer_params & p) {
 }
 
 // The active window can intersect at most two globally aligned flash tiles.
-// Keep both partials within one Q-head block, then combine them in the same
+// Keep both partials within one Q-head iteration, then combine them in the same
 // partition order as standalone flash attention. Before the window fills it
 // naturally covers the complete history.
-static __device__ void sliding_window_attention(const gptoss_decode_layer_params & p) {
+static __device__ void sliding_window_attention_head(const gptoss_decode_layer_params & p, uint32_t query_head) {
     const uint32_t lane       = threadIdx.x;
     const uint32_t warp       = threadIdx.y;
-    const uint32_t query_head = blockIdx.x;
-    if (query_head >= query_head_count) {
-        return;
-    }
 
     constexpr uint32_t tile_keys = 128u;
     static_assert(sliding_window_size == tile_keys, "SWA window must cover one flash tile");
@@ -772,6 +767,13 @@ static __device__ void sliding_window_attention(const gptoss_decode_layer_params
         half *      output       = p.query + (uint64_t) query_head * head_size;
         output[lane]             = __float2half_rn(out0);
         output[lane + warp_size] = __float2half_rn(out1);
+    }
+    __syncthreads();
+}
+
+static __device__ void sliding_window_attention(const gptoss_decode_layer_params & p) {
+    for (uint32_t query_head = blockIdx.x; query_head < query_head_count; query_head += gridDim.x) {
+        sliding_window_attention_head(p, query_head);
     }
 }
 
@@ -1030,10 +1032,9 @@ static __device__ void attention_output_residual_rms(const gptoss_decode_layer_p
     }
 }
 
-static __device__ void full_attention_combine(const gptoss_decode_layer_params & p) {
-    const uint32_t head = blockIdx.x;
+static __device__ void full_attention_combine_head(const gptoss_decode_layer_params & p, uint32_t head) {
     const uint32_t tid  = threadIdx.y * warp_size + threadIdx.x;
-    if (head >= query_head_count || tid >= head_size) {
+    if (tid >= head_size) {
         return;
     }
 
@@ -1056,6 +1057,12 @@ static __device__ void full_attention_combine(const gptoss_decode_layer_params &
     const float output = numerator / denominator;
 
     p.query[(uint64_t) head * head_size + tid] = __float2half_rn(output);
+}
+
+static __device__ void full_attention_combine(const gptoss_decode_layer_params & p) {
+    for (uint32_t head = blockIdx.x; head < query_head_count; head += gridDim.x) {
+        full_attention_combine_head(p, head);
+    }
 }
 
 static __device__ void post_attention_norm_and_router(const gptoss_decode_layer_params & p) {
@@ -1083,7 +1090,7 @@ static __device__ void post_attention_norm_and_router(const gptoss_decode_layer_
 
     const uint32_t   column_pairs = hidden_size / 2u;
     __shared__ float router_warp_sums[warps_per_block];
-    for (uint32_t expert = blockIdx.x; expert < expert_count; expert += gridDim.x) {
+    for (uint32_t expert = blockIdx.x; expert < p.expert_count; expert += gridDim.x) {
         // Router weights consume FP32 normalization; FP16 scratch feeds the MXFP4 projections.
         const float2 * weight_pairs = (const float2 *) (p.router_weight + expert * hidden_size);
         float          acc          = 0.0f;
@@ -1100,7 +1107,7 @@ static __device__ void post_attention_norm_and_router(const gptoss_decode_layer_
             p.router[expert] = acc + p.router_bias[expert];
         }
         // Protect shared partials only when this block will process another expert.
-        if (gridDim.x < expert_count) {
+        if (gridDim.x < p.expert_count) {
             __syncthreads();
         }
     }
@@ -1111,23 +1118,50 @@ static __device__ void select_experts(const gptoss_decode_layer_params & p, int3
         return;
     }
 
-    const uint32_t lane  = threadIdx.x;
-    float          score = p.router[lane];
-    if (isnan(score)) {
-        score = -FLT_MAX;
+    constexpr uint32_t experts_per_lane = gptoss_max_expert_count / warp_size;
+
+    const uint32_t lane = threadIdx.x;
+    float          scores[experts_per_lane];
+
+#pragma unroll
+    for (uint32_t i = 0; i < experts_per_lane; ++i) {
+        const uint32_t expert = lane + i * warp_size;
+        float          score  = expert < p.expert_count ? p.router[expert] : -INFINITY;
+        scores[i]             = isnan(score) ? -FLT_MAX : score;
     }
 
 #pragma unroll
     for (uint32_t selected = 0; selected < experts_used; ++selected) {
-#if defined(__gfx1100__)
-        const float              best_score  = warp_max(score);
-        const unsigned long long best_mask   = __ballot(score == best_score);
-        // The first set lane preserves the lower-index tie break.
-        const uint32_t           best_expert = (uint32_t) (__ffsll(best_mask) - 1);
-#else
-        float    best_score  = score;
+        float    best_score  = scores[0];
         uint32_t best_expert = lane;
 
+#pragma unroll
+        for (uint32_t i = 1; i < experts_per_lane; ++i) {
+            const uint32_t expert = lane + i * warp_size;
+            if (scores[i] > best_score || (scores[i] == best_score && expert < best_expert)) {
+                best_score  = scores[i];
+                best_expert = expert;
+            }
+        }
+
+#if defined(__gfx1100__)
+        if (p.expert_count == warp_size) {
+            best_score                         = warp_max(best_score);
+            const unsigned long long best_mask = __ballot(scores[0] == best_score);
+            best_expert                        = (uint32_t) (__ffsll(best_mask) - 1);
+        }
+        else {
+#    pragma unroll
+            for (uint32_t offset = warp_size / 2; offset > 0; offset >>= 1) {
+                const float    other_score  = __shfl_xor(best_score, offset, warp_size);
+                const uint32_t other_expert = __shfl_xor(best_expert, offset, warp_size);
+                if (other_score > best_score || (other_score == best_score && other_expert < best_expert)) {
+                    best_score  = other_score;
+                    best_expert = other_expert;
+                }
+            }
+        }
+#else
 #pragma unroll
         for (uint32_t offset = warp_size / 2; offset > 0; offset >>= 1) {
             const float    other_score  = __shfl_xor(best_score, offset, warp_size);
@@ -1142,8 +1176,12 @@ static __device__ void select_experts(const gptoss_decode_layer_params & p, int3
         if (lane == 0) {
             ids[selected] = (int32_t) best_expert;
         }
-        if (lane == best_expert) {
-            score = -INFINITY;
+
+#pragma unroll
+        for (uint32_t i = 0; i < experts_per_lane; ++i) {
+            if (lane + i * warp_size == best_expert) {
+                scores[i] = -INFINITY;
+            }
         }
     }
 
@@ -1309,8 +1347,11 @@ static __device__ void moe_down_residual_rms(const gptoss_decode_layer_params & 
 
 }  // namespace
 
+extern "C" __device__ uint32_t gptoss_decode_aql_marker = 1;
+
 // Complete sliding-window decode layer.
-__launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_swa_kernel(gptoss_decode_layer_params p) {
+extern "C" __launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_swa_kernel(
+        gptoss_decode_layer_params p) {
     cg::grid_group grid = cg::this_grid();
 
     attention_rms_norm(p);
@@ -1331,7 +1372,8 @@ __launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_swa_kernel(
 // Complete full-context decode layer. The producer writes flash-style partials
 // for all heads and partitions; the cooperative grid combines directly to
 // FP16 and continues through the shared output/MoE stages.
-__launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_full_kernel(gptoss_decode_layer_params p) {
+extern "C" __launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_full_kernel(
+        gptoss_decode_layer_params p) {
     cg::grid_group grid = cg::this_grid();
 
     attention_rms_norm(p);
@@ -1349,4 +1391,34 @@ __launch_bounds__(block_size, 1) __global__ void gptoss_decode_layer_full_kernel
     moe_gate_up(p);
     grid.sync();
     moe_down_residual_rms(p);
+}
+
+hipError_t gptoss_decode_aql_get_launch_info(void ** marker_address, int * active_blocks) {
+    if (marker_address == nullptr || active_blocks == nullptr) {
+        return hipErrorInvalidValue;
+    }
+
+    *marker_address = nullptr;
+    *active_blocks  = 0;
+
+    hipError_t error = hipGetSymbolAddress(marker_address, HIP_SYMBOL(gptoss_decode_aql_marker));
+    if (error != hipSuccess) {
+        return error;
+    }
+
+    int swa_blocks  = 0;
+    int full_blocks = 0;
+    error = hipOccupancyMaxActiveBlocksPerMultiprocessor(
+        &swa_blocks, gptoss_decode_layer_swa_kernel, block_size, 0);
+    if (error != hipSuccess) {
+        return error;
+    }
+    error = hipOccupancyMaxActiveBlocksPerMultiprocessor(
+        &full_blocks, gptoss_decode_layer_full_kernel, block_size, 0);
+    if (error != hipSuccess) {
+        return error;
+    }
+
+    *active_blocks = swa_blocks < full_blocks ? swa_blocks : full_blocks;
+    return hipSuccess;
 }

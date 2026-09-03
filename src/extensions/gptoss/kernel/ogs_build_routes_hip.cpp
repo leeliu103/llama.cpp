@@ -19,15 +19,16 @@ __launch_bounds__(gptoss_routing_threads, 1) __global__ void gptoss_ogs_build_ro
     int32_t * __restrict__ block_offsets,
     int32_t * __restrict__ block_schedule,
     uint32_t route_count,
-    uint32_t schedule_capacity) {
-    __shared__ int32_t histogram[gptoss_expert_count];
-    __shared__ int32_t cursors[gptoss_expert_count];
-    __shared__ int32_t tile_offsets[gptoss_expert_count];
+    uint32_t schedule_capacity,
+    uint32_t expert_count) {
+    __shared__ int32_t histogram[gptoss_max_expert_count];
+    __shared__ int32_t cursors[gptoss_max_expert_count];
+    __shared__ int32_t tile_offsets[gptoss_max_expert_count];
 
     const uint32_t thread  = threadIdx.x;
     const uint32_t block_m =
         route_count <= gptoss_ogs_small_max_m ? gptoss_ogs_block_m_small : gptoss_ogs_block_m;
-    if (thread < gptoss_expert_count) {
+    if (thread < expert_count) {
         histogram[thread] = 0;
     }
     for (uint32_t index = thread; index < schedule_capacity; index += blockDim.x) {
@@ -37,19 +38,19 @@ __launch_bounds__(gptoss_routing_threads, 1) __global__ void gptoss_ogs_build_ro
 
     for (uint32_t route = thread; route < route_count; route += blockDim.x) {
         const int32_t expert = expert_ids[route];
-        if ((uint32_t) expert < gptoss_expert_count) {
+        if ((uint32_t) expert < expert_count) {
             atomicAdd(&histogram[expert], 1);
         }
     }
     __syncthreads();
 
-    if (thread < gptoss_expert_count) {
+    if (thread < expert_count) {
         expert_counts[thread] = histogram[thread];
     }
     if (thread == 0) {
         int32_t route_offset = 0;
         int32_t tile_offset  = 0;
-        for (uint32_t expert = 0; expert < gptoss_expert_count; ++expert) {
+        for (uint32_t expert = 0; expert < expert_count; ++expert) {
             route_offsets[expert] = route_offset;
             block_offsets[expert] = tile_offset;
             cursors[expert]       = route_offset;
@@ -57,22 +58,22 @@ __launch_bounds__(gptoss_routing_threads, 1) __global__ void gptoss_ogs_build_ro
             route_offset += histogram[expert];
             tile_offset += (histogram[expert] + (int32_t) block_m - 1) / (int32_t) block_m;
         }
-        route_offsets[gptoss_expert_count] = route_offset;
-        block_offsets[gptoss_expert_count] = tile_offset;
+        route_offsets[expert_count] = route_offset;
+        block_offsets[expert_count] = tile_offset;
     }
     __syncthreads();
 
     for (uint32_t route = thread; route < route_count; route += blockDim.x) {
         const uint32_t token  = route / gptoss_expert_used_count;
         const int32_t  expert = expert_ids[route];
-        if ((uint32_t) expert < gptoss_expert_count) {
+        if ((uint32_t) expert < expert_count) {
             const int32_t destination          = atomicAdd(&cursors[expert], 1);
             gather_token_indices[destination]  = (int32_t) token;
             scatter_route_indices[destination] = (int32_t) route;
         }
     }
 
-    for (uint32_t expert = thread; expert < gptoss_expert_count; expert += blockDim.x) {
+    for (uint32_t expert = thread; expert < expert_count; expert += blockDim.x) {
         const uint32_t tile_count  = ((uint32_t) histogram[expert] + block_m - 1) / block_m;
         const uint32_t destination = (uint32_t) tile_offsets[expert];
         for (uint32_t tile = 0; tile < tile_count; ++tile) {

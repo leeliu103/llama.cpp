@@ -10,6 +10,7 @@ namespace {
 constexpr int hidden_size           = gptoss_hidden_size;
 constexpr int vocabulary_size       = gptoss_vocabulary_size;
 constexpr int rows_per_block        = 4;
+constexpr int tokens_per_block      = 4;
 constexpr int block_size            = 128;
 constexpr int warp_size             = 32;
 constexpr int warp_count            = block_size / warp_size;
@@ -174,5 +175,90 @@ __launch_bounds__(block_size) __global__ void gptoss_lm_head_mmvq_q8_0_f16_kerne
         logits[first_row + 1] = sum.y;
         logits[first_row + 2] = sum.z;
         logits[first_row + 3] = sum.w;
+    }
+}
+
+__launch_bounds__(block_size) __global__ void gptoss_lm_head_mmvq_batch_q8_0_f16_kernel(
+    const uint8_t * __restrict__ weight,
+    const __half * __restrict__ activation,
+    float * __restrict__ logits,
+    uint32_t n_tokens) {
+    __shared__ float warp_sums[tokens_per_block][rows_per_block][warp_count - 1][warp_size];
+
+    const int          lane        = threadIdx.x;
+    const int          warp        = threadIdx.y;
+    const int          thread      = warp * warp_size + lane;
+    const int          first_row   = blockIdx.x * rows_per_block;
+    const int          first_token = blockIdx.y * tokens_per_block;
+    const block_q8_0 * rows[rows_per_block];
+#pragma unroll
+    for (int row = 0; row < rows_per_block; ++row) {
+        rows[row] =
+            reinterpret_cast<const block_q8_0 *>(weight) + static_cast<uint64_t>(first_row + row) * blocks_per_row;
+    }
+
+    float4 sums[tokens_per_block];
+#pragma unroll
+    for (int token = 0; token < tokens_per_block; ++token) {
+        sums[token] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    const int segment      = thread % segments_per_q8_block;
+    const int block_stride = block_size / segments_per_q8_block;
+    for (int block = thread / segments_per_q8_block; block < blocks_per_row; block += block_stride) {
+#pragma unroll
+        for (int token = 0; token < tokens_per_block; ++token) {
+            const uint32_t token_index = first_token + token;
+            if (token_index < n_tokens) {
+                const float4 dot = q8_0_dot4_segment(
+                    rows[0][block], rows[1][block], rows[2][block], rows[3][block],
+                    activation + static_cast<uint64_t>(token_index) * hidden_size + block * quant_block_size,
+                    segment);
+                sums[token].x += dot.x;
+                sums[token].y += dot.y;
+                sums[token].z += dot.z;
+                sums[token].w += dot.w;
+            }
+        }
+    }
+
+    if (warp > 0) {
+#pragma unroll
+        for (int token = 0; token < tokens_per_block; ++token) {
+            warp_sums[token][0][warp - 1][lane] = sums[token].x;
+            warp_sums[token][1][warp - 1][lane] = sums[token].y;
+            warp_sums[token][2][warp - 1][lane] = sums[token].z;
+            warp_sums[token][3][warp - 1][lane] = sums[token].w;
+        }
+    }
+    __syncthreads();
+
+    if (warp > 0) {
+        return;
+    }
+
+#pragma unroll
+    for (int token = 0; token < tokens_per_block; ++token) {
+#pragma unroll
+        for (int index = 0; index < warp_count - 1; ++index) {
+            sums[token].x += warp_sums[token][0][index][lane];
+            sums[token].y += warp_sums[token][1][index][lane];
+            sums[token].z += warp_sums[token][2][index][lane];
+            sums[token].w += warp_sums[token][3][index][lane];
+        }
+
+        sums[token].x = warp_sum(sums[token].x);
+        sums[token].y = warp_sum(sums[token].y);
+        sums[token].z = warp_sum(sums[token].z);
+        sums[token].w = warp_sum(sums[token].w);
+
+        const uint32_t token_index = first_token + token;
+        if (lane == 0 && token_index < n_tokens) {
+            float * token_logits       = logits + static_cast<uint64_t>(token_index) * vocabulary_size;
+            token_logits[first_row]     = sums[token].x;
+            token_logits[first_row + 1] = sums[token].y;
+            token_logits[first_row + 2] = sums[token].z;
+            token_logits[first_row + 3] = sums[token].w;
+        }
     }
 }

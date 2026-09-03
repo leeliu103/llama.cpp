@@ -22,6 +22,7 @@ set_source_files_properties(
 )
 
 target_sources(llama PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-decode-aql.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-kernel-aot.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-buffers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/gptoss-extension.cpp"
@@ -66,13 +67,18 @@ endif()
 set(LLAMA_GPTOSS_AOT_KERNELS
     q8_qkv.hsaco
     q8_attn_out.hsaco
-    router.hsaco
+    router_32.hsaco
+    router_128.hsaco
     fa_full.hsaco
     fa_sw128.hsaco
-    ogs_w13.hsaco
-    ogs_w2.hsaco
-    ogs_w13_small.hsaco
-    ogs_w2_small.hsaco
+    ogs_w13_32.hsaco
+    ogs_w13_128.hsaco
+    ogs_w2_32.hsaco
+    ogs_w2_128.hsaco
+    ogs_w13_small_32.hsaco
+    ogs_w13_small_128.hsaco
+    ogs_w2_small_32.hsaco
+    ogs_w2_small_128.hsaco
 )
 
 set(LLAMA_GPTOSS_AOT_OUTPUTS)

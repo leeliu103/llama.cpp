@@ -31,6 +31,7 @@ hipError_t gptoss_router_launch(hipFunction_t  function,
                                 const float *  activation,
                                 const float *  weight,
                                 uint32_t       n_tokens,
+                                uint32_t       expert_count,
                                 hipStream_t    stream);
 
 hipError_t gptoss_fa_launch(hipFunction_t  function,

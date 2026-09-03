@@ -72,6 +72,7 @@ hipError_t gptoss_router_launch(hipFunction_t  function,
                                 const float *  activation,
                                 const float *  weight,
                                 uint32_t       n_tokens,
+                                uint32_t       expert_count,
                                 hipStream_t    stream) {
     int32_t n_tokens_i32    = static_cast<int32_t>(n_tokens);
     void *  global_scratch  = nullptr;
@@ -80,8 +81,10 @@ hipError_t gptoss_router_launch(hipFunction_t  function,
         &output, &activation, &weight, &n_tokens_i32, &global_scratch, &profile_scratch,
     };
     const uint32_t blocks = (n_tokens + gptoss_router_block_m - 1) / gptoss_router_block_m;
-    return hipModuleLaunchKernel(function, blocks, 1, 1, gptoss_router_threads, 1, 1, gptoss_router_shared_memory,
-                                 stream, kernel_params, nullptr);
+    const uint32_t shared_memory =
+        expert_count == gptoss_config_120b.expert_count ? 16384 : gptoss_router_shared_memory;
+    return hipModuleLaunchKernel(function, blocks, 1, 1, gptoss_router_threads, 1, 1, shared_memory, stream,
+                                 kernel_params, nullptr);
 }
 
 hipError_t gptoss_fa_launch(hipFunction_t  function,

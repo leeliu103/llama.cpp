@@ -56,7 +56,8 @@ struct gptoss_decode_layer_params {
     float    rope_corr_low;
     float    rope_corr_high;
     float    rope_theta_scale;
-    uint32_t reuse_attention_rms;
+    uint16_t expert_count;
+    uint16_t reuse_attention_rms;
 };
 
 static_assert(sizeof(gptoss_decode_layer_params) == 272);
@@ -107,6 +108,7 @@ hipError_t gptoss_biased_topk_softmax_launch(const float * router_logits,
                                              int32_t *     selected_ids,
                                              float *       selected_weights,
                                              uint32_t      n_tokens,
+                                             uint32_t      expert_count,
                                              hipStream_t   stream);
 
 hipError_t gptoss_ogs_build_routes_launch(const int32_t * expert_ids,
@@ -118,6 +120,7 @@ hipError_t gptoss_ogs_build_routes_launch(const int32_t * expert_ids,
                                           int32_t *       block_schedule,
                                           uint32_t        route_count,
                                           uint32_t        schedule_capacity,
+                                          uint32_t        expert_count,
                                           hipStream_t     stream);
 
 hipError_t gptoss_moe_combine_launch(float *       output,
@@ -132,4 +135,12 @@ hipError_t gptoss_lm_head_mmvq_launch(const uint8_t * weight,
                                       float *         logits,
                                       hipStream_t     stream);
 
+hipError_t gptoss_lm_head_mmvq_batch_launch(const uint8_t * weight,
+                                            const __half *  activation,
+                                            float *         logits,
+                                            uint32_t        n_tokens,
+                                            hipStream_t     stream);
+
 hipError_t gptoss_decode_layer_launch(bool swa, const gptoss_decode_layer_params & params, hipStream_t stream);
+
+hipError_t gptoss_decode_aql_get_launch_info(void ** marker_address, int * active_blocks);

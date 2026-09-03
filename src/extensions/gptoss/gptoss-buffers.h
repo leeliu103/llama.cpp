@@ -47,7 +47,8 @@ struct gptoss_prefill_buffers {
 
 gptoss_prefill_buffers gptoss_make_prefill_buffers(llama_hip_workspace_cursor & cursor,
                                                    uint32_t                     n_tokens,
-                                                   bool                         output,
+                                                   uint32_t                     n_outputs,
+                                                   uint32_t                     expert_count,
                                                    uint32_t                     n_sequences,
                                                    uint32_t                     n_base_table_elements,
                                                    uint32_t                     n_swa_table_elements);
@@ -75,4 +76,5 @@ struct gptoss_decode_buffers {
 gptoss_decode_buffers gptoss_make_decode_buffers(llama_hip_workspace_cursor & cursor,
                                                  size_t                       n_base_rows,
                                                  size_t                       n_swa_rows,
-                                                 bool                         output);
+                                                 bool                         output,
+                                                 uint32_t                     expert_count);

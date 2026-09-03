@@ -12,4 +12,5 @@ bool gptoss_repack_moe_launch(uint8_t * gate,
                               float *   gate_bias,
                               float *   down_bias,
                               float *   up_bias,
+                              uint32_t  expert_count,
                               uint8_t * scratch);

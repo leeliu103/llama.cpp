@@ -323,7 +323,7 @@ def _build_kernel_specs():
             assume_32_bit_pointer_range=True,
         ),
         KernelSpec(
-            output_name="router.hsaco",
+            output_name="router_32.hsaco",
             kernel=gptoss_router,
             runtime_types={
                 "output_ptr": "*fp32",
@@ -348,7 +348,7 @@ def _build_kernel_specs():
         _fa_kernel_spec("fa_full.hsaco", 0),
         _fa_kernel_spec("fa_sw128.hsaco", 128),
         KernelSpec(
-            output_name="ogs_w13.hsaco",
+            output_name="ogs_w13_32.hsaco",
             kernel=ogs_w13,
             runtime_types={
                 "Y": "*fp16",
@@ -394,7 +394,7 @@ def _build_kernel_specs():
             assume_32_bit_pointer_range=True,
         ),
         KernelSpec(
-            output_name="ogs_w2.hsaco",
+            output_name="ogs_w2_32.hsaco",
             kernel=ogs_w2,
             runtime_types={
                 "Y": "*fp32",
@@ -440,12 +440,13 @@ def _build_kernel_specs():
     )
 
     spec_by_name = {spec.output_name: spec for spec in specs}
-    ogs_w13_spec = spec_by_name["ogs_w13.hsaco"]
-    ogs_w2_spec = spec_by_name["ogs_w2.hsaco"]
+    router_spec = spec_by_name["router_32.hsaco"]
+    ogs_w13_spec = spec_by_name["ogs_w13_32.hsaco"]
+    ogs_w2_spec = spec_by_name["ogs_w2_32.hsaco"]
     specs += (
         replace(
             ogs_w13_spec,
-            output_name="ogs_w13_small.hsaco",
+            output_name="ogs_w13_small_32.hsaco",
             kernel_constants={
                 **ogs_w13_spec.kernel_constants,
                 "BLOCK_M": 16,
@@ -456,13 +457,58 @@ def _build_kernel_specs():
         ),
         replace(
             ogs_w2_spec,
-            output_name="ogs_w2_small.hsaco",
+            output_name="ogs_w2_small_32.hsaco",
             kernel_constants={
                 **ogs_w2_spec.kernel_constants,
                 "BLOCK_M": 16,
                 "BLOCK_N": 64,
                 "BLOCK_K": 512,
                 "grid_n": 45,
+            },
+        ),
+    )
+
+    specs_32 = {spec.output_name: spec for spec in specs}
+    specs += (
+        replace(
+            router_spec,
+            output_name="router_128.hsaco",
+            kernel_constants={
+                **router_spec.kernel_constants,
+                "N_SIZE": 128,
+                "BLOCK_N": 128,
+            },
+        ),
+        replace(
+            ogs_w13_spec,
+            output_name="ogs_w13_128.hsaco",
+            kernel_constants={
+                **ogs_w13_spec.kernel_constants,
+                "N_EXPTS_TOT": 128,
+            },
+        ),
+        replace(
+            ogs_w2_spec,
+            output_name="ogs_w2_128.hsaco",
+            kernel_constants={
+                **ogs_w2_spec.kernel_constants,
+                "N_EXPTS_TOT": 128,
+            },
+        ),
+        replace(
+            specs_32["ogs_w13_small_32.hsaco"],
+            output_name="ogs_w13_small_128.hsaco",
+            kernel_constants={
+                **specs_32["ogs_w13_small_32.hsaco"].kernel_constants,
+                "N_EXPTS_TOT": 128,
+            },
+        ),
+        replace(
+            specs_32["ogs_w2_small_32.hsaco"],
+            output_name="ogs_w2_small_128.hsaco",
+            kernel_constants={
+                **specs_32["ogs_w2_small_32.hsaco"].kernel_constants,
+                "N_EXPTS_TOT": 128,
             },
         ),
     )

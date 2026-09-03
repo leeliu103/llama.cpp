@@ -14,7 +14,8 @@ constexpr uint32_t gptoss_max_attention_parts = 12;
 
 gptoss_prefill_buffers gptoss_make_prefill_buffers(llama_hip_workspace_cursor & cursor,
                                                    uint32_t                     n_tokens,
-                                                   bool                         output,
+                                                   uint32_t                     n_outputs,
+                                                   uint32_t                     expert_count,
                                                    uint32_t                     n_sequences,
                                                    uint32_t                     n_base_table_elements,
                                                    uint32_t                     n_swa_table_elements) {
@@ -23,8 +24,8 @@ gptoss_prefill_buffers gptoss_make_prefill_buffers(llama_hip_workspace_cursor & 
     result.route_count = n_tokens * gptoss_expert_used_count;
     const uint32_t ogs_block_m =
         result.route_count <= gptoss_ogs_small_max_m ? gptoss_ogs_block_m_small : gptoss_ogs_block_m;
-    result.schedule_capacity =
-        (result.route_count + ogs_block_m - 1) / ogs_block_m + gptoss_expert_count - 1;
+    result.schedule_capacity = std::min(
+        result.route_count, (result.route_count + ogs_block_m - 1) / ogs_block_m + expert_count - 1);
 
     result.tokens             = cursor.take<int32_t>(n_tokens);
     result.positions          = cursor.take<int32_t>(n_tokens);
@@ -42,20 +43,20 @@ gptoss_prefill_buffers gptoss_make_prefill_buffers(llama_hip_workspace_cursor & 
     result.rope_swa           = cursor.take<float>(static_cast<size_t>(n_tokens) * gptoss_head_size);
     result.qkv                = cursor.take<__half>(static_cast<size_t>(n_tokens) * gptoss_qkv_size);
     result.q                  = cursor.take<__half>(static_cast<size_t>(n_tokens) * gptoss_query_size);
-    result.router_logits      = cursor.take<float>(static_cast<size_t>(n_tokens) * gptoss_expert_count);
+    result.router_logits      = cursor.take<float>(static_cast<size_t>(n_tokens) * expert_count);
     result.selected_ids       = cursor.take<int32_t>(result.route_count);
     result.selected_weights   = cursor.take<float>(result.route_count);
     result.gather_indices     = cursor.take<int32_t>(result.route_count);
     result.scatter_indices    = cursor.take<int32_t>(result.route_count);
-    result.expert_counts      = cursor.take<int32_t>(gptoss_expert_count);
-    result.route_offsets      = cursor.take<int32_t>(gptoss_expert_count + 1);
-    result.block_offsets      = cursor.take<int32_t>(gptoss_expert_count + 1);
+    result.expert_counts      = cursor.take<int32_t>(expert_count);
+    result.route_offsets      = cursor.take<int32_t>(expert_count + 1);
+    result.block_offsets      = cursor.take<int32_t>(expert_count + 1);
     result.block_schedule     = cursor.take<int32_t>(result.schedule_capacity);
     result.expert_activations =
         cursor.take<__half>(static_cast<size_t>(result.route_count) * gptoss_intermediate_size);
     result.expert_outputs     =
         cursor.take<float>(static_cast<size_t>(result.route_count) * gptoss_hidden_size);
-    result.logits             = cursor.take<float>(output ? gptoss_vocabulary_size : 0);
+    result.logits             = cursor.take<float>(static_cast<size_t>(n_outputs) * gptoss_vocabulary_size);
 
     return result;
 }
@@ -63,7 +64,8 @@ gptoss_prefill_buffers gptoss_make_prefill_buffers(llama_hip_workspace_cursor & 
 gptoss_decode_buffers gptoss_make_decode_buffers(llama_hip_workspace_cursor & cursor,
                                                  size_t                       n_base_rows,
                                                  size_t                       n_swa_rows,
-                                                 bool                         output) {
+                                                 bool                         output,
+                                                 uint32_t                     expert_count) {
     const uint32_t partitions = static_cast<uint32_t>(std::min<size_t>(
         gptoss_max_attention_parts,
         std::max<size_t>(2, (n_base_rows + gptoss_swa_size - 1) / gptoss_swa_size)));
@@ -79,7 +81,7 @@ gptoss_decode_buffers gptoss_make_decode_buffers(llama_hip_workspace_cursor & cu
     result.activation_scratch =
         cursor.take<__half>(gptoss_hidden_size * (1 + gptoss_expert_used_count));
     result.query            = cursor.take<__half>(gptoss_query_size);
-    result.router_scores    = cursor.take<float>(gptoss_expert_count);
+    result.router_scores    = cursor.take<float>(expert_count);
     result.selected_experts = cursor.take<int32_t>(gptoss_expert_used_count);
     result.selected_weights = cursor.take<float>(gptoss_expert_used_count);
     result.attention_parts =
