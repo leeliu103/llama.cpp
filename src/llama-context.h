@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "extensions/llama-execution-extension.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -46,6 +47,10 @@ struct llama_context {
                   llama_context_params params);
 
     ~llama_context();
+
+    void * execution_extension_state = nullptr;
+
+    const llama_execution_extension_stats & get_execution_extension_stats() const;
 
     // reserve a new backend scheduler (if needed)
     // for example, when:
@@ -217,6 +222,8 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+    bool execution_extension_supports(const llama_ubatch & ubatch, const llama_memory_context_i * mctx) const;
+
     //
     // output
     //
@@ -274,6 +281,9 @@ private:
     //
 
     const llama_model & model;
+
+    const llama_execution_extension * execution_extension = nullptr;
+    llama_execution_extension_stats execution_extension_stats;
 
     llama_cparams cparams;
 

@@ -2,6 +2,10 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#include "ggml-rpc-graph-metadata.h"
+#include "ggml-rpc-execution-scope.h"
+#include "ggml-rpc-sequence-timing.h"
+#include "ggml-rpc-execution-caps.h"
 #include "transport.h"
 
 #include <array>
@@ -89,10 +93,14 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_COMPUTE_SEQ,
     RPC_CMD_SET_TENSOR_2D_HASH,
     RPC_CMD_SET_TENSOR_2D,
+    RPC_CMD_GRAPH_COMPUTE_SEQ_EXT,
+    RPC_CMD_QUERY_EXECUTION_CAPS,
     RPC_CMD_COUNT,
 };
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
+static_assert(RPC_CMD_GRAPH_COMPUTE_SEQ_EXT == 23 && RPC_CMD_QUERY_EXECUTION_CAPS == 24, "append-only RPC commands");
+static_assert(GGML_RPC_EXECUTION_EXTENSION_PROTOCOL_VERSION == RPC_EXECUTION_CAPS_PROTOCOL, "execution packet version remains 2");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
@@ -108,6 +116,9 @@ struct rpc_msg_hello_rsp {
     uint8_t padding;
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
+
+static_assert(RPC_CONN_CAPS_SIZE == 24, "transport QPN/PSN/GID capability bytes stay intact");
+static_assert(sizeof(rpc_msg_hello_req) == 24 && sizeof(rpc_msg_hello_rsp) == 28, "HELLO wire layout unchanged");
 
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
@@ -249,6 +260,24 @@ struct rpc_msg_allreduce_rsp {
 
 struct rpc_msg_graph_compute_seq_rsp {
     uint8_t ok;
+};
+
+struct rpc_msg_graph_compute_seq_ext_header {
+    uint32_t version;
+    uint32_t plan;
+};
+
+struct rpc_msg_graph_compute_seq_ext_rsp {
+    uint8_t ok;
+    uint64_t custom_stages;
+};
+
+static_assert(sizeof(rpc_msg_graph_compute_seq_ext_rsp) == 9, "extension response wire size changed");
+
+struct rpc_msg_graph_metadata_header {
+    uint64_t fingerprint;
+    uint64_t allreduce_id;
+    uint32_t n_counts; // zero reuses validated metadata for this graph UID
 };
 
 #pragma pack(pop)
@@ -488,10 +517,13 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size,
+                         rpc_sequence_timing::scope * timing = nullptr) {
+    if (timing) timing->next(rpc_sequence_timing::send);
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
+    if (timing) timing->next(rpc_sequence_timing::response_wait);
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
@@ -510,33 +542,49 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, rpc_execution_capabilities & caps) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
-
     sock->get_caps(request.conn_caps);
-
-    bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
-
-    if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
-        GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
-                       response.major, response.minor, response.patch);
+    if (!send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response))) {
+        GGML_LOG_ERROR("RPC HELLO failed or returned a malformed frame\n");
         return false;
     }
-
-    sock->update_caps(response.conn_caps);
+    if (!rpc_execution_peer_version_supported(response.major, response.minor,
+                                               RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION)) {
+        GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n", response.major, response.minor, response.patch);
+        return false;
+    }
+    sock->update_caps(response.conn_caps); // Complete transport activation before the framed optional query.
+    caps = rpc_execution_caps_from_legacy(response.major, response.minor, response.patch, response.padding);
+    if (!rpc_execution_caps_discover(caps, [&](const rpc_msg_execution_caps_req & req, rpc_msg_execution_caps_rsp & rsp) {
+            return send_rpc_cmd(sock, RPC_CMD_QUERY_EXECUTION_CAPS, &req, sizeof(req), &rsp, sizeof(rsp));
+        })) {
+        GGML_LOG_ERROR("RPC execution capability query failed or returned invalid schema; closing connection\n");
+        return false;
+    }
+    if (caps.query == rpc_execution_query_state::queried_negative) {
+        GGML_LOG_WARN("RPC peer %u.%u.%u declined execution capability schema %u (status %u); stock operation remains available\n",
+                      unsigned(caps.major), unsigned(caps.minor), unsigned(caps.patch), RPC_EXECUTION_CAPS_SCHEMA, caps.query_status);
+    }
     return true;
 }
 
-static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+static std::shared_ptr<socket_t> get_socket(const std::string & endpoint, rpc_execution_capabilities * extension_caps = nullptr) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
+    struct cached_socket {
+        std::weak_ptr<socket_t> socket;
+        rpc_execution_capabilities extension_caps;
+    };
+    static std::unordered_map<std::string, cached_socket> sockets;
 
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
-        if (auto sock = it->second.lock()) {
+        if (auto sock = it->second.socket.lock()) {
+            if (extension_caps != nullptr) {
+                *extension_caps = it->second.extension_caps;
+            }
             return sock;
         }
     }
@@ -554,11 +602,15 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (sock == nullptr) {
         return nullptr;
     }
-    if (!negotiate_hello(sock)) {
+    rpc_execution_capabilities caps;
+    if (!negotiate_hello(sock, caps)) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
-    sockets[endpoint] = sock;
+    sockets[endpoint] = {sock, caps};
+    if (extension_caps != nullptr) {
+        *extension_caps = caps;
+    }
     return sock;
 }
 
@@ -1137,10 +1189,13 @@ public:
         stored_graphs.resize(backends.size());
         uid_graphs.resize(backends.size());
         uid_ctxs.resize(backends.size());
+        if (rpc_sequence_timing::enabled()) sequence_timing = std::make_unique<rpc_sequence_timing::collector>();
     }
     ~rpc_server();
 
+    rpc_execution_capabilities execution_capabilities();
     void hello(rpc_msg_hello_rsp & response);
+    void query_execution_caps(const rpc_msg_execution_caps_req & request, rpc_msg_execution_caps_rsp & response);
     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
     bool get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response);
     bool get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_get_max_size_rsp & response);
@@ -1161,11 +1216,20 @@ public:
     bool comm_get_id(rpc_msg_comm_get_id_rsp & response);
     bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
     bool allreduce(const rpc_msg_allreduce_req & request, rpc_msg_allreduce_rsp & response);
-    bool graph_compute_seq(const std::vector<uint8_t> & input, rpc_msg_graph_compute_seq_rsp & response);
+    bool graph_compute_seq(const std::vector<uint8_t> & input, rpc_msg_graph_compute_seq_rsp & response,
+                           const char * plan = nullptr, uint64_t * custom_stages = nullptr, size_t offset = 0,
+                           rpc_sequence_timing::scope * timing = nullptr);
+    bool graph_compute_seq_ext(const std::vector<uint8_t> & input, rpc_msg_graph_compute_seq_ext_rsp & response,
+                               rpc_sequence_timing::scope * timing = nullptr);
+    rpc_sequence_timing::collector * sequence_timer() { return sequence_timing.get(); }
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
-        ggml_cgraph          * graph;
+        ggml_cgraph          * graph = nullptr;
+        std::vector<uint64_t> node_ids;
+        std::unique_ptr<rpc_graph_metadata> extension_metadata;
+        uint64_t extension_metadata_hash = 0;
+        uint64_t extension_allreduce_id = 0;
     };
 
 private:
@@ -1197,13 +1261,70 @@ private:
     void * (*nccl_comm_init_rank)(ggml_backend_t, int, int, const void *)  = nullptr;
     bool   (*nccl_allreduce)(ggml_backend_t, void *, struct ggml_tensor *) = nullptr;
     void   (*nccl_comm_free)(void *)                                       = nullptr;
+    uint32_t rank = 0;
+    bool decode_graph_dumped = false;
+    std::unique_ptr<rpc_sequence_timing::collector> sequence_timing;
 };
+
+rpc_execution_capabilities rpc_server::execution_capabilities() {
+    rpc_execution_capabilities caps;
+    caps.execution_protocol = RPC_EXECUTION_CAPS_PROTOCOL;
+    caps.features = backends.empty() ? 0 : RPC_EXECUTION_KNOWN_FEATURES;
+    caps.plans = backends.empty() ? 0 : RPC_EXECUTION_KNOWN_PLANS;
+    for (auto backend : backends) {
+        auto dev = backend ? ggml_backend_get_device(backend) : nullptr;
+        auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_execution_extension_begin") ||
+            !ggml_backend_reg_get_proc_address(reg, "ggml_backend_execution_extension_end") ||
+            !ggml_backend_reg_get_proc_address(reg, "ggml_backend_execution_extension_cancel_v1")) {
+            caps.features = caps.plans = 0;
+            break;
+        }
+        auto supports = (ggml_backend_execution_extension_supports_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_execution_extension_supports");
+        if (!supports) {
+            caps.features = caps.plans = 0;
+            break;
+        }
+        const bool lifecycle = ggml_backend_reg_get_proc_address(reg, "ggml_backend_execution_extension_prepare_v1") &&
+                               ggml_backend_reg_get_proc_address(reg, "ggml_backend_execution_extension_seal_v1");
+        if (!lifecycle) caps.features &= ~RPC_EXECUTION_FEATURE_PREPARE_SEAL;
+        for (uint32_t plan = 1; plan <= RPC_EXECUTION_PLAN_MAX; ++plan) {
+            if ((!lifecycle && rpc_execution_plan_requires_lifecycle(plan)) || !supports(backend, rpc_execution_plan_name(plan))) {
+                caps.plans &= ~rpc_execution_plan_bit(plan);
+            }
+        }
+    }
+    return caps;
+}
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
+    const auto caps = execution_capabilities();
+    response.padding = rpc_execution_caps_legacy_projection(caps.features, caps.plans);
+    // conn_caps remains owned and populated entirely by the transport handshake.
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+}
+
+void rpc_server::query_execution_caps(const rpc_msg_execution_caps_req & request, rpc_msg_execution_caps_rsp & response) {
+    response = {};
+    response.magic = RPC_EXECUTION_CAPS_MAGIC;
+    response.schema_version = RPC_EXECUTION_CAPS_SCHEMA;
+    if (request.schema_version != RPC_EXECUTION_CAPS_SCHEMA) {
+        response.status = RPC_EXECUTION_CAPS_UNSUPPORTED_SCHEMA;
+        return;
+    }
+    if (request.reserved != 0) {
+        response.status = RPC_EXECUTION_CAPS_BAD_REQUEST;
+        return;
+    }
+    const auto caps = execution_capabilities();
+    response.status = RPC_EXECUTION_CAPS_OK;
+    response.execution_protocol = caps.execution_protocol;
+    response.feature_flags = caps.features;
+    response.supported_plans = caps.plans;
 }
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
@@ -1898,6 +2019,73 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     return true;
 }
 
+static rpc_execution_extension_hooks rpc_execution_extension_get_hooks(ggml_backend_t backend) {
+    rpc_execution_extension_hooks hooks;
+    auto dev = backend ? ggml_backend_get_device(backend) : nullptr;
+    auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) return hooks;
+    hooks.begin = (ggml_backend_execution_extension_begin_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_execution_extension_begin");
+    hooks.end = (ggml_backend_execution_extension_end_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_execution_extension_end");
+    hooks.prepare = (ggml_backend_execution_extension_prepare_v1_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_execution_extension_prepare_v1");
+    hooks.seal = (ggml_backend_execution_extension_seal_v1_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_execution_extension_seal_v1");
+    hooks.cancel = (ggml_backend_execution_extension_cancel_v1_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_execution_extension_cancel_v1");
+    return hooks;
+}
+
+static std::vector<const ggml_tensor *> rpc_graph_tensors(const ggml_cgraph * graph) {
+    std::vector<const ggml_tensor *> tensors;
+    std::unordered_set<const ggml_tensor *> seen;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i] != nullptr && seen.insert(graph->nodes[i]).second) {
+            tensors.push_back(graph->nodes[i]);
+        }
+    }
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const auto * tensor = tensors[i];
+        for (const auto * src : tensor->src) {
+            if (src != nullptr && seen.insert(src).second) {
+                tensors.push_back(src);
+            }
+        }
+        if (tensor->view_src != nullptr && seen.insert(tensor->view_src).second) {
+            tensors.push_back(tensor->view_src);
+        }
+    }
+    return tensors;
+}
+
+static bool rpc_graph_is_decode(const ggml_cgraph * graph) {
+    for (const auto * tensor : rpc_graph_tensors(graph)) {
+        if (strcmp(tensor->name, "inp_tokens") == 0 && ggml_nelements(tensor) == 1) {
+            return true;
+        }
+        if (strncmp(tensor->name, "attn_norm-", 10) == 0 &&
+            tensor->ne[1] == 1 && tensor->ne[2] == 1 && tensor->ne[3] == 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void rpc_dump_graph(uint32_t rank, uint32_t step, uint64_t uid, const ggml_cgraph * graph) {
+    fprintf(stderr, "[RPC decode graph] rank=%u step=%u uid=%" PRIu64 " nodes=%d\n", rank, step, uid, graph->n_nodes);
+    for (const auto * t : rpc_graph_tensors(graph)) {
+        fprintf(stderr, "[RPC decode tensor] id=%p data=%p op=%s name=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+                "] nb=[%zu,%zu,%zu,%zu] view=%p view_offs=%zu src=[", (const void *) t,
+                t->data, ggml_op_name(t->op), t->name, ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+                t->nb[0], t->nb[1], t->nb[2], t->nb[3], (const void *) t->view_src, t->view_offs);
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            fprintf(stderr, "%s%p", i == 0 ? "" : ",", (const void *) t->src[i]);
+        }
+        fprintf(stderr, "]\n");
+    }
+}
+
 // Batched per-token execution for tensor-parallel decode. Runs an ordered sequence of
 // (subgraph compute -> optional allreduce) steps autonomously, enqueueing everything on the
 // backend stream and synchronizing exactly once at the end. This collapses ~180 per-layer RPC
@@ -1915,9 +2103,18 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 // ar_tensor's data pointers are stable across tokens too, but it is cheap to re-send each time.
 // Response: ok=1 success; ok=2 means a referenced uid was not cached -> orchestrator should run a
 // normal warm-up pass for this token and retry batched next token.
-bool rpc_server::graph_compute_seq(const std::vector<uint8_t> & input, rpc_msg_graph_compute_seq_rsp & response) {
+bool rpc_server::graph_compute_seq(const std::vector<uint8_t> & input, rpc_msg_graph_compute_seq_rsp & response,
+                                   const char * plan, uint64_t * custom_stages, size_t offset,
+                                   rpc_sequence_timing::scope * timing) {
+    if (timing) {
+        timing->next(rpc_sequence_timing::setup);
+        timing->data().plan = rpc_execution_plan_id(plan);
+    }
     response.ok = 0;
-    const uint8_t * p   = input.data();
+    if (offset > input.size()) {
+        return false;
+    }
+    const uint8_t * p   = input.data() + offset;
     const uint8_t * end = input.data() + input.size();
     if (end - p < (ptrdiff_t)(2*sizeof(uint32_t))) {
         return false;
@@ -1929,41 +2126,84 @@ bool rpc_server::graph_compute_seq(const std::vector<uint8_t> & input, rpc_msg_g
     }
     uint32_t n_steps;
     memcpy(&n_steps, p, sizeof(n_steps)); p += sizeof(n_steps);
+    if (timing) timing->data().sequence_graphs = n_steps;
+
+    rpc_execution_extension_scope extension_scope;
+    if (plan != nullptr && !extension_scope.begin(backends[device], plan,
+            rpc_execution_extension_get_hooks(backends[device]),
+            rpc_execution_plan_requires_lifecycle(rpc_execution_plan_id(plan)))) {
+        GGML_LOG_ERROR("[%s] rank %u rejected execution plan %s\n", __func__, rank, plan);
+        return false;
+    }
+
+    static const bool dump_enabled = [] {
+        const char * value = std::getenv("GGML_RPC_DUMP_DECODE_GRAPH");
+        return value != nullptr && strcmp(value, "1") == 0;
+    }();
+    bool dump_sequence = false;
 
     auto & cache = uid_graphs[device];
     // transient contexts for allreduce tensors (graphs live in the persistent cache)
     std::vector<ggml_context_ptr> ar_ctxs;
+    struct execution_step {
+        ggml_cgraph * graph;
+        ggml_tensor * allreduce;
+    };
+    std::vector<execution_step> planned_steps;
+    std::unordered_set<uint64_t> planned_uids;
+    if (plan != nullptr) {
+        constexpr size_t min_step_bytes = sizeof(uint64_t) + 2 + sizeof(rpc_msg_graph_metadata_header);
+        if (n_steps == 0 || n_steps > size_t(end - p) / min_step_bytes) return false;
+        planned_steps.reserve(n_steps);
+    }
 
+    if (timing) timing->next(plan ? rpc_sequence_timing::parse : rpc_sequence_timing::stock_parse_enqueue);
     for (uint32_t s = 0; s < n_steps; s++) {
         if (end - p < (ptrdiff_t)(sizeof(uint64_t) + 1)) {
             return false;
         }
         uint64_t uid;
         memcpy(&uid, p, sizeof(uid)); p += sizeof(uid);
+        if (plan != nullptr && (uid == 0 || !planned_uids.insert(uid).second)) return false;
         uint8_t has_graph = *p; p += 1;
+        if (timing) {
+            ++timing->data().graphs_seen;
+            timing->data().graph_payloads += has_graph != 0;
+        }
 
         ggml_cgraph * graph = nullptr;
+        stored_graph * graph_record = nullptr;
         if (has_graph) {
             if (end - p < (ptrdiff_t)sizeof(uint32_t)) {
                 return false;
             }
             uint32_t gsize;
             memcpy(&gsize, p, sizeof(gsize)); p += sizeof(gsize);
-            if (end - p < (ptrdiff_t)gsize || gsize < 2*sizeof(uint32_t)) {
+            if (end - p < (ptrdiff_t)gsize || gsize < 3*sizeof(uint32_t)) {
                 return false;
             }
             const uint8_t * gp = p; p += gsize;
             gp += sizeof(uint32_t); // skip embedded device
             uint32_t n_nodes;
             memcpy(&n_nodes, gp, sizeof(n_nodes)); gp += sizeof(n_nodes);
+            if (n_nodes > (gsize - 3*sizeof(uint32_t))/sizeof(uint64_t)) {
+                return false;
+            }
             const uint64_t * nodes = (const uint64_t *)gp;
             gp += (size_t)n_nodes*sizeof(uint64_t);
             uint32_t n_tensors;
             memcpy(&n_tensors, gp, sizeof(n_tensors)); gp += sizeof(n_tensors);
+            const size_t graph_header_size = 3*sizeof(uint32_t) + (size_t) n_nodes*sizeof(uint64_t);
+            if ((size_t) n_tensors*sizeof(rpc_tensor) != gsize - graph_header_size) {
+                return false;
+            }
             const rpc_tensor * tensors = (const rpc_tensor *)gp;
 
             // build into a persistent per-uid context so the graph survives across tokens
             stored_graph & sg = cache[uid];
+            sg.extension_metadata.reset();
+            sg.node_ids.resize(n_nodes);
+            memcpy(sg.node_ids.data(), nodes, size_t(n_nodes) * sizeof(uint64_t));
             size_t buf_size = ggml_tensor_overhead()*((size_t)n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
             sg.buffer.assign(buf_size, 0);
             ggml_init_params params = { buf_size, sg.buffer.data(), true };
@@ -1994,6 +2234,7 @@ bool rpc_server::graph_compute_seq(const std::vector<uint8_t> & input, rpc_msg_g
             }
             sg.graph = g;
             graph = g;
+            graph_record = &sg;
         } else {
             auto it = cache.find(uid);
             if (it == cache.end() || it->second.graph == nullptr) {
@@ -2002,17 +2243,69 @@ bool rpc_server::graph_compute_seq(const std::vector<uint8_t> & input, rpc_msg_g
                 return true;
             }
             graph = it->second.graph;
+            graph_record = &it->second;
         }
 
-        ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
-        if (status != GGML_STATUS_SUCCESS) {
-            return false;
+        rpc_msg_graph_metadata_header metadata_header{};
+        if (plan != nullptr) {
+            if (end - p < ptrdiff_t(sizeof(metadata_header))) return false;
+            memcpy(&metadata_header, p, sizeof(metadata_header));
+            p += sizeof(metadata_header);
+            if (graph_record->node_ids.size() != size_t(graph->n_nodes)) return false;
+            if (metadata_header.n_counts) {
+                if (timing) ++timing->data().metadata_payloads;
+                if (metadata_header.n_counts != uint32_t(graph->n_nodes) ||
+                    size_t(metadata_header.n_counts) > size_t(end - p) / sizeof(int32_t)) return false;
+                std::vector<int32_t> counts(metadata_header.n_counts);
+                memcpy(counts.data(), p, counts.size() * sizeof(int32_t));
+                p += counts.size() * sizeof(int32_t);
+                if (rpc_graph_metadata_hash(graph_record->node_ids.data(), counts.data(), counts.size(),
+                                            metadata_header.allreduce_id) != metadata_header.fingerprint) return false;
+                const ggml_tensor * metadata_allreduce = nullptr;
+                if (metadata_header.allreduce_id) {
+                    const auto found = std::find(graph_record->node_ids.begin(), graph_record->node_ids.end(),
+                                                 metadata_header.allreduce_id);
+                    if (found == graph_record->node_ids.end()) return false;
+                    metadata_allreduce = graph->nodes[found - graph_record->node_ids.begin()];
+                }
+                auto metadata = std::make_unique<rpc_graph_metadata>();
+                if (!metadata->initialize(graph, counts.data(), counts.size(), metadata_allreduce)) return false;
+                graph_record->extension_metadata = std::move(metadata);
+                graph_record->extension_metadata_hash = metadata_header.fingerprint;
+                graph_record->extension_allreduce_id = metadata_header.allreduce_id;
+            } else if (has_graph || !graph_record->extension_metadata ||
+                       graph_record->extension_metadata_hash != metadata_header.fingerprint ||
+                       graph_record->extension_allreduce_id != metadata_header.allreduce_id) {
+                return false;
+            }
+            graph = graph_record->extension_metadata->view();
+            if (!graph) return false;
         }
 
+        if (dump_enabled && !decode_graph_dumped && n_steps > 1 && s == 0) {
+            dump_sequence = rpc_graph_is_decode(graph);
+            if (dump_sequence) {
+                fprintf(stderr, "[RPC decode graph] rank=%u steps=%u plan=%s\n", rank, n_steps, plan ? plan : "stock");
+            }
+        }
+        if (dump_sequence) {
+            rpc_dump_graph(rank, s, uid, graph);
+        }
+
+        if (plan == nullptr) {
+            const ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
+            if (status != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+        }
+
+        ggml_tensor * ar_tensor = nullptr;
         if (end - p < (ptrdiff_t)1) {
             return false;
         }
         uint8_t has_ar = *p; p += 1;
+        if (timing) timing->data().allreduces_seen += has_ar != 0;
+        if (plan != nullptr && bool(has_ar) != (metadata_header.allreduce_id != 0)) return false;
         if (has_ar) {
             if (nccl_comm == nullptr || nccl_backend == nullptr) {
                 return false;
@@ -2022,22 +2315,94 @@ bool rpc_server::graph_compute_seq(const std::vector<uint8_t> & input, rpc_msg_g
             }
             const rpc_tensor * ar_rt = (const rpc_tensor *)p;
             p += sizeof(rpc_tensor);
+            if (plan != nullptr && ar_rt->id != metadata_header.allreduce_id) return false;
             ggml_init_params arp = { ggml_tensor_overhead(), nullptr, true };
             ggml_context_ptr arctx { ggml_init(arp) };
-            ggml_tensor * ar_tensor = deserialize_tensor(arctx.get(), ar_rt);
+            ar_tensor = deserialize_tensor(arctx.get(), ar_rt);
             if (ar_tensor == nullptr) {
                 return false;
             }
             ar_ctxs.push_back(std::move(arctx));
-            if (!nccl_allreduce(nccl_backend, nccl_comm, ar_tensor)) {
+            if (plan == nullptr && !nccl_allreduce(nccl_backend, nccl_comm, ar_tensor)) {
+                return false;
+            }
+        }
+        if (plan != nullptr) {
+            planned_steps.push_back({graph, ar_tensor});
+        }
+    }
+
+    if (plan != nullptr) {
+        if (p != end) {
+            return false;
+        }
+        if (timing) timing->next(rpc_sequence_timing::prepare);
+        // Validate and bind the complete local sequence before its first submission.
+        std::vector<ggml_cgraph *> graphs;
+        std::vector<ggml_tensor *> allreduce_operands;
+        graphs.reserve(planned_steps.size());
+        allreduce_operands.reserve(planned_steps.size());
+        for (const auto & step : planned_steps) {
+            graphs.push_back(step.graph);
+            allreduce_operands.push_back(step.allreduce);
+        }
+        if (!extension_scope.prepare(graphs.size(), graphs.data(), allreduce_operands.data())) {
+            GGML_LOG_ERROR("[%s] rank %u rejected preparation for plan %s\n", __func__, rank, plan);
+            return false;
+        }
+        if (timing) timing->next(rpc_sequence_timing::enqueue);
+        for (const auto & step : planned_steps) {
+            if (ggml_backend_graph_compute_async(backends[device], step.graph) != GGML_STATUS_SUCCESS ||
+                (step.allreduce != nullptr && !nccl_allreduce(nccl_backend, nccl_comm, step.allreduce))) {
                 return false;
             }
         }
     }
 
-    // single host sync for the whole token
-    ggml_backend_synchronize(backends[device]);
+    // Seal may queue a final status copy. Even if that enqueue fails, retain
+    // the existing token synchronization after the complete collective sequence.
+    if (timing) timing->next(rpc_sequence_timing::complete);
+    if (!extension_scope.complete([&]() {
+            if (timing) timing->measure(rpc_sequence_timing::sync, [&]() { ggml_backend_synchronize(backends[device]); });
+            else ggml_backend_synchronize(backends[device]);
+        }, custom_stages)) {
+        // The token completed synchronization; report failure without closing
+        // this connection while the other ranks complete their acknowledgements.
+        return true;
+    }
+    if (dump_sequence) {
+        decode_graph_dumped = true;
+        fflush(stderr);
+    }
     response.ok = 1;
+    return true;
+}
+
+bool rpc_server::graph_compute_seq_ext(const std::vector<uint8_t> & input, rpc_msg_graph_compute_seq_ext_rsp & response,
+                                      rpc_sequence_timing::scope * timing) {
+    if (timing) timing->next(rpc_sequence_timing::setup);
+    response = {};
+    if (input.size() < sizeof(rpc_msg_graph_compute_seq_ext_header)) {
+        return false;
+    }
+    rpc_msg_graph_compute_seq_ext_header header;
+    memcpy(&header, input.data(), sizeof(header));
+    if (timing) timing->data().plan = header.plan;
+    const char * plan_name = rpc_execution_plan_name(header.plan);
+    if (header.version != GGML_RPC_EXECUTION_EXTENSION_PROTOCOL_VERSION || plan_name == nullptr) {
+        return false;
+    }
+
+    rpc_msg_graph_compute_seq_rsp legacy_response = {};
+    uint64_t custom_stages = 0;
+    const bool ok = graph_compute_seq(input, legacy_response, plan_name,
+                                      &custom_stages, sizeof(header), timing);
+    if (ok && legacy_response.ok == 1) {
+        response.ok = 1;
+        response.custom_stages = custom_stages;
+    } else {
+        GGML_LOG_ERROR("[%s] rank %u execution failed; stock retry is disabled\n", __func__, rank);
+    }
     return true;
 }
 
@@ -2109,6 +2474,7 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         nccl_comm = nullptr;
     }
     nccl_backend = backends[dev_id];
+    rank = request.rank;
     nccl_comm = nccl_comm_init_rank(nccl_backend, (int) request.nranks, (int) request.rank, request.unique_id);
     response.ok = (nccl_comm != nullptr) ? 1 : 0;
     LOG_DBG("[%s] rank %u/%u device %u -> %s\n", __func__, request.rank, request.nranks, dev_id, response.ok ? "ok" : "FAILED");
@@ -2138,6 +2504,7 @@ bool rpc_server::allreduce(const rpc_msg_allreduce_req & request, rpc_msg_allred
 }
 
 rpc_server::~rpc_server() {
+    if (sequence_timing) sequence_timing->emit("worker", rank);
     if (nccl_comm != nullptr && nccl_comm_free != nullptr) {
         nccl_comm_free(nccl_comm);
     }
@@ -2198,6 +2565,14 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
                 return;
+            }
+            case RPC_CMD_QUERY_EXECUTION_CAPS: {
+                rpc_msg_execution_caps_req request{};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                rpc_msg_execution_caps_rsp response{};
+                server.query_execution_caps(request, response);
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                break;
             }
             case RPC_CMD_DEVICE_COUNT: {
                 if (!recv_msg(sock, nullptr, 0)) {
@@ -2479,17 +2854,49 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_GRAPH_COMPUTE_SEQ: {
+                rpc_sequence_timing::sample sample;
+                auto * collector = server.sequence_timer();
+                rpc_sequence_timing::scope scope(sample, collector, collector != nullptr);
+                auto * timing = collector ? &scope : nullptr;
+                if (timing) timing->next(rpc_sequence_timing::receive);
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
                     return;
                 }
+                if (timing) sample.bytes = input.size();
                 rpc_msg_graph_compute_seq_rsp response;
-                if (!server.graph_compute_seq(input, response)) {
+                if (!server.graph_compute_seq(input, response, nullptr, nullptr, 0, timing)) {
                     return;
                 }
+                if (timing) timing->next(rpc_sequence_timing::reply);
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
+                if (timing) sample.result = response.ok == 1 ? rpc_sequence_timing::success :
+                    response.ok == 2 ? rpc_sequence_timing::cache_miss : rpc_sequence_timing::failed;
+                break;
+            }
+            case RPC_CMD_GRAPH_COMPUTE_SEQ_EXT: {
+                rpc_sequence_timing::sample sample;
+                sample.plan = UINT32_MAX; // unknown until the extension header is validated
+                auto * collector = server.sequence_timer();
+                rpc_sequence_timing::scope scope(sample, collector, collector != nullptr);
+                auto * timing = collector ? &scope : nullptr;
+                if (timing) timing->next(rpc_sequence_timing::receive);
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (timing) sample.bytes = input.size();
+                rpc_msg_graph_compute_seq_ext_rsp response = {};
+                if (!server.graph_compute_seq_ext(input, response, timing)) {
+                    return;
+                }
+                if (timing) timing->next(rpc_sequence_timing::reply);
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                if (timing) sample.result = response.ok == 1 ? rpc_sequence_timing::success : rpc_sequence_timing::failed;
                 break;
             }
             default: {
@@ -2696,9 +3103,24 @@ static ggml_backend_dev_t ggml_backend_rpc_reg_get_device(ggml_backend_reg_t reg
 // so default RPC behaviour (butterfly-over-TCP) is unchanged.
 // ---------------------------------------------------------------------------
 struct rpc_comm_ctx {
+    rpc_comm_ctx() {
+        if (rpc_sequence_timing::enabled()) sequence_timing = std::make_unique<rpc_sequence_timing::collector>();
+    }
+    ~rpc_comm_ctx() {
+        if (sequence_timing) sequence_timing->emit("client", -1);
+        for (size_t j = 0; j < rank_timing.size(); ++j) rank_timing[j]->emit("client_rank", int64_t(j));
+    }
     std::vector<std::shared_ptr<socket_t>> socks;
     std::vector<uint32_t>                  devices; // remote device id per rank, for graph serialization
     std::unordered_set<uint64_t>           warmed_uids; // graph uids already cached on the servers
+    std::unordered_map<uint64_t, uint64_t>  warmed_metadata;
+    uint64_t extension_features = RPC_EXECUTION_KNOWN_FEATURES;
+    uint64_t extension_plans = RPC_EXECUTION_KNOWN_PLANS;
+    std::vector<rpc_execution_capabilities> rank_capabilities;
+    bool extension_counts_reported = false;
+    std::unique_ptr<rpc_sequence_timing::collector> sequence_timing;
+    std::vector<std::unique_ptr<rpc_sequence_timing::collector>> rank_timing;
+    std::vector<rpc_sequence_timing::sample> rank_samples;
 };
 
 static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_backends) {
@@ -2714,7 +3136,8 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
             return nullptr;
         }
         ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backends[i]->context;
-        auto sock = get_socket(rpc_ctx->endpoint);
+        rpc_execution_capabilities extension_caps;
+        auto sock = get_socket(rpc_ctx->endpoint, &extension_caps);
         if (sock == nullptr) {
             GGML_LOG_ERROR("[RPC comm] failed to get socket for %s\n", rpc_ctx->endpoint.c_str());
             delete cc;
@@ -2722,8 +3145,18 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         }
         cc->socks.push_back(sock);
         cc->devices.push_back(rpc_ctx->device);
+        cc->extension_features &= extension_caps.features;
+        cc->extension_plans &= extension_caps.plans;
+        cc->rank_capabilities.push_back(extension_caps);
+        GGML_LOG_DEBUG("[RPC comm] rank %zu execution caps: peer=%u.%u.%u query=%u features=0x%" PRIx64 " plans=0x%" PRIx64 "\n",
+                       i, extension_caps.major, extension_caps.minor, extension_caps.patch,
+                       unsigned(extension_caps.query), extension_caps.features, extension_caps.plans);
     }
 
+    if (cc->sequence_timing) {
+        cc->rank_samples.resize(n_backends);
+        for (size_t j = 0; j < n_backends; ++j) cc->rank_timing.emplace_back(std::make_unique<rpc_sequence_timing::collector>());
+    }
     // rank 0 generates the unique id, all ranks init concurrently
     rpc_msg_comm_get_id_rsp id_rsp;
     if (!send_rpc_cmd(cc->socks[0], RPC_CMD_COMM_GET_ID, nullptr, 0, &id_rsp, sizeof(id_rsp))) {
@@ -2761,7 +3194,19 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         }
     }
     GGML_LOG_INFO("[RPC comm] RCCL communicator initialized across %zu ranks\n", n);
+    GGML_LOG_DEBUG("[RPC comm] execution capabilities across all ranks: features=0x%" PRIx64 " plans=0x%" PRIx64 "\n",
+                   cc->extension_features, cc->extension_plans);
     return cc;
+}
+
+static bool ggml_backend_rpc_comm_execution_extension_supports(void * comm_ctx, const char * plan_name) {
+    const auto * cc = static_cast<const rpc_comm_ctx *>(comm_ctx);
+    const uint32_t plan = rpc_execution_plan_id(plan_name);
+    const uint64_t bit = rpc_execution_plan_bit(plan);
+    if (!cc || !bit || !(cc->extension_plans & bit) ||
+        !(cc->extension_features & RPC_EXECUTION_FEATURE_METADATA) ||
+        cc->rank_capabilities.size() != cc->socks.size()) return false;
+    return rpc_execution_all_ranks_support(cc->rank_capabilities.data(), cc->rank_capabilities.size(), plan);
 }
 
 static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, struct ggml_tensor ** tensors) {
@@ -2805,20 +3250,52 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, struct ggml_
 // a single round-trip per token instead of one per subgraph, and the RCCL ranks stay in lockstep
 // because every server executes the same fixed sequence.
 // cgraphs/ar_nodes are [n_backends * n_subgraphs] row-major by backend.
-static bool ggml_backend_rpc_comm_exec_sequence(void * comm_ctx, size_t n_backends, size_t n_subgraphs,
-                                                struct ggml_cgraph ** cgraphs, struct ggml_tensor ** ar_nodes) {
+static bool ggml_backend_rpc_comm_exec_sequence_impl(void * comm_ctx, size_t n_backends, size_t n_subgraphs,
+        struct ggml_cgraph ** cgraphs, struct ggml_tensor ** ar_nodes, uint32_t plan, uint64_t * custom_stages) {
+    const bool extension = plan != 0;
+    if (custom_stages != nullptr) {
+        *custom_stages = 0;
+    }
     if (comm_ctx == nullptr) {
         return false;
     }
     auto * cc = static_cast<rpc_comm_ctx *>(comm_ctx);
+    rpc_sequence_timing::sample timing_sample;
+    timing_sample.plan = plan;
+    timing_sample.sequence_graphs = n_subgraphs;
+    const bool timing_enabled = cc->sequence_timing != nullptr;
+    rpc_sequence_timing::scope timing_scope(timing_sample, cc->sequence_timing.get(), timing_enabled);
+    auto * timing = timing_enabled ? &timing_scope : nullptr;
     if (cc->socks.size() != n_backends) {
         return false;
     }
+    if (extension && (!n_backends || !n_subgraphs || n_subgraphs > UINT32_MAX || !cgraphs || !ar_nodes)) {
+        return false;
+    }
+    if (timing) {
+        for (auto & value : cc->rank_samples) {
+            value = {};
+            value.plan = plan;
+            value.sequence_graphs = n_subgraphs;
+        }
+        timing->next(rpc_sequence_timing::build);
+    }
 
-    // Serialize one SEQ blob per backend. Per step: uid(8) | has_graph(1) | [gsize+blob] | has_ar(1) | [ar]
+    // The extension adds whole-graph use metadata before each has_ar field.
+    // Build and validate every rank's message before any sequence is submitted.
     std::vector<std::vector<uint8_t>> msgs(n_backends);
+    std::vector<uint64_t> stage_limits(extension ? n_backends : 0, 0);
+    std::vector<int32_t> metadata_counts;
+    std::unordered_map<uint64_t, uint64_t> submitted_metadata;
     for (size_t j = 0; j < n_backends; j++) {
         std::vector<uint8_t> & buf = msgs[j];
+        if (extension) {
+            const rpc_msg_graph_compute_seq_ext_header header = {
+                GGML_RPC_EXECUTION_EXTENSION_PROTOCOL_VERSION, plan,
+            };
+            const auto * bytes = reinterpret_cast<const uint8_t *>(&header);
+            buf.insert(buf.end(), bytes, bytes + sizeof(header));
+        }
         uint32_t device  = cc->devices[j];
         uint32_t n_steps = (uint32_t) n_subgraphs;
         buf.insert(buf.end(), (uint8_t*)&device,  (uint8_t*)&device  + sizeof(device));
@@ -2826,9 +3303,18 @@ static bool ggml_backend_rpc_comm_exec_sequence(void * comm_ctx, size_t n_backen
         for (size_t i = 0; i < n_subgraphs; i++) {
             ggml_cgraph * cg = cgraphs[j*n_subgraphs + i];
             ggml_tensor * ar = ar_nodes[j*n_subgraphs + i];
+            if (!cg) return false;
             uint64_t uid = cg->uid;
             uint8_t has_graph = cc->warmed_uids.count(uid) ? 0 : 1;
             uint8_t has_ar = ar != nullptr ? 1 : 0;
+            if (timing) {
+                ++timing_sample.graphs_seen;
+                ++cc->rank_samples[j].graphs_seen;
+                timing_sample.graph_payloads += has_graph;
+                cc->rank_samples[j].graph_payloads += has_graph;
+                timing_sample.allreduces_seen += has_ar;
+                cc->rank_samples[j].allreduces_seen += has_ar;
+            }
             buf.insert(buf.end(), (uint8_t*)&uid, (uint8_t*)&uid + sizeof(uid));
             buf.push_back(has_graph);
             if (has_graph) {
@@ -2838,41 +3324,141 @@ static bool ggml_backend_rpc_comm_exec_sequence(void * comm_ctx, size_t n_backen
                 buf.insert(buf.end(), (uint8_t*)&gsize, (uint8_t*)&gsize + sizeof(gsize));
                 buf.insert(buf.end(), gblob.begin(), gblob.end());
             }
+            if (extension) {
+                uint64_t fingerprint;
+                if (!rpc_graph_metadata_fingerprint(cg, ar, fingerprint)) return false;
+                stage_limits[j] += cg->n_nodes;
+                const uint64_t allreduce_id = reinterpret_cast<uintptr_t>(ar);
+                const auto cached = cc->warmed_metadata.find(uid);
+                const bool send_counts = has_graph || cached == cc->warmed_metadata.end() || cached->second != fingerprint;
+                if (timing) {
+                    timing_sample.metadata_payloads += send_counts;
+                    cc->rank_samples[j].metadata_payloads += send_counts;
+                }
+                if (send_counts && !rpc_graph_metadata_collect(cg, ar, metadata_counts)) return false;
+                const rpc_msg_graph_metadata_header header = {
+                    fingerprint, allreduce_id, send_counts ? uint32_t(metadata_counts.size()) : 0,
+                };
+                const auto * bytes = reinterpret_cast<const uint8_t *>(&header);
+                buf.insert(buf.end(), bytes, bytes + sizeof(header));
+                if (send_counts) {
+                    bytes = reinterpret_cast<const uint8_t *>(metadata_counts.data());
+                    buf.insert(buf.end(), bytes, bytes + metadata_counts.size() * sizeof(int32_t));
+                }
+                if (uid == 0 || !submitted_metadata.emplace(uid, fingerprint).second) return false;
+            }
             buf.push_back(has_ar);
             if (has_ar) {
                 rpc_tensor art = serialize_tensor(ar);
                 buf.insert(buf.end(), (uint8_t*)&art, (uint8_t*)&art + sizeof(art));
             }
         }
+        if (timing) {
+            timing_sample.bytes += buf.size();
+            cc->rank_samples[j].bytes = buf.size();
+        }
     }
 
     // Send concurrently and wait for all acks (one round-trip per token, total).
+    if (timing) timing->next(rpc_sequence_timing::dispatch_join);
     std::vector<uint8_t> ok(n_backends, 0);
+    std::vector<uint64_t> custom_counts(extension ? n_backends : 0, 0);
     std::vector<std::thread> threads;
     threads.reserve(n_backends);
     for (size_t j = 0; j < n_backends; j++) {
         threads.emplace_back([&, j]() {
-            rpc_msg_graph_compute_seq_rsp rsp = {};
-            if (send_rpc_cmd(cc->socks[j], RPC_CMD_GRAPH_COMPUTE_SEQ, msgs[j].data(), msgs[j].size(), &rsp, sizeof(rsp))) {
-                ok[j] = rsp.ok;
+            std::optional<rpc_sequence_timing::scope> rank_scope;
+            auto * rank_timer = timing ? &rank_scope.emplace(cc->rank_samples[j], nullptr, true) : nullptr;
+            if (extension) {
+                rpc_msg_graph_compute_seq_ext_rsp rsp = {};
+                if (send_rpc_cmd(cc->socks[j], RPC_CMD_GRAPH_COMPUTE_SEQ_EXT, msgs[j].data(), msgs[j].size(), &rsp, sizeof(rsp), rank_timer)) {
+                    ok[j] = rsp.ok;
+                    custom_counts[j] = rsp.custom_stages;
+                }
+            } else {
+                rpc_msg_graph_compute_seq_rsp rsp = {};
+                if (send_rpc_cmd(cc->socks[j], RPC_CMD_GRAPH_COMPUTE_SEQ, msgs[j].data(), msgs[j].size(), &rsp, sizeof(rsp), rank_timer)) {
+                    ok[j] = rsp.ok;
+                }
             }
         });
     }
     for (auto & t : threads) {
         t.join();
     }
+    if (timing) timing->next(rpc_sequence_timing::commit);
+    bool all_ok = true;
+    uint64_t total_custom_stages = 0;
     for (size_t j = 0; j < n_backends; j++) {
-        if (ok[j] != 1) {
-            // ok==2 (uid not cached on a server) or 0 (send failed): fall back to per-subgraph path.
-            // Do not mark uids warmed so the next attempt re-sends the graph blobs.
-            return false;
+        const bool valid_count = !extension ||
+            (custom_counts[j] <= stage_limits[j] &&
+             (ok[j] == 1 || custom_counts[j] == 0) &&
+             (plan != RPC_EXECUTION_PLAN_QWEN3MOE_METADATA_ONLY || custom_counts[j] == 0) &&
+             custom_counts[j] <= UINT64_MAX - total_custom_stages);
+        if (timing) {
+            cc->rank_samples[j].result = ok[j] == 1 && valid_count ? rpc_sequence_timing::success :
+                !extension && ok[j] == 2 ? rpc_sequence_timing::cache_miss : rpc_sequence_timing::failed;
+            cc->rank_timing[j]->record(cc->rank_samples[j]);
         }
+        if (ok[j] != 1 || !valid_count) {
+            if (extension) {
+                GGML_LOG_ERROR("[RPC comm] execution extension failed on rank %zu (ok=%u, custom_stages=%" PRIu64
+                               "); token cannot be retried\n", j, unsigned(ok[j]), custom_counts[j]);
+            }
+            all_ok = false;
+        } else if (extension) {
+            total_custom_stages += custom_counts[j];
+        }
+    }
+    // Only the legacy caller may retry. Extension failures propagate to decode().
+    if (!all_ok) {
+        if (timing && !extension && std::find(ok.begin(), ok.end(), uint8_t(2)) != ok.end())
+            timing_sample.result = rpc_sequence_timing::cache_miss;
+        return false;
     }
     // all servers ran the full sequence; their graph caches now hold every (rank, subgraph) uid
     for (size_t k = 0; k < n_backends * n_subgraphs; k++) {
         cc->warmed_uids.insert(cgraphs[k]->uid);
     }
+    for (const auto & item : submitted_metadata) cc->warmed_metadata[item.first] = item.second;
+    if (custom_stages != nullptr) {
+        *custom_stages = total_custom_stages;
+    }
+    if (extension && !cc->extension_counts_reported) {
+        const char * stats_env = std::getenv("LLAMA_EXECUTION_EXTENSION_STATS");
+        const bool direct_stats = stats_env != nullptr && strcmp(stats_env, "1") == 0;
+        for (size_t j = 0; j < n_backends; ++j) {
+            if (direct_stats) {
+                fprintf(stderr, "[RPC comm] first extension sequence: rank=%zu custom_stages=%" PRIu64
+                                " plan=%s metadata_graphs=%zu\n", j, custom_counts[j], rpc_execution_plan_name(plan), n_subgraphs);
+            } else {
+                GGML_LOG_INFO("[RPC comm] first extension sequence: rank=%zu custom_stages=%" PRIu64
+                              " plan=%s metadata_graphs=%zu\n", j, custom_counts[j], rpc_execution_plan_name(plan), n_subgraphs);
+            }
+        }
+        if (direct_stats) {
+            fflush(stderr);
+        }
+        cc->extension_counts_reported = true;
+    }
+    if (timing) timing_sample.result = rpc_sequence_timing::success;
     return true;
+}
+
+static bool ggml_backend_rpc_comm_exec_sequence(void * comm_ctx, size_t n_backends, size_t n_subgraphs,
+                                                struct ggml_cgraph ** cgraphs, struct ggml_tensor ** ar_nodes) {
+    return ggml_backend_rpc_comm_exec_sequence_impl(comm_ctx, n_backends, n_subgraphs, cgraphs, ar_nodes, 0, nullptr);
+}
+
+static ggml_status ggml_backend_rpc_comm_exec_sequence_ext(void * comm_ctx, const char * plan_name,
+        size_t n_backends, size_t n_subgraphs, struct ggml_cgraph ** cgraphs, struct ggml_tensor ** ar_nodes,
+        uint64_t * custom_stages) {
+    if (!ggml_backend_rpc_comm_execution_extension_supports(comm_ctx, plan_name)) {
+        return GGML_STATUS_FAILED;
+    }
+    return ggml_backend_rpc_comm_exec_sequence_impl(comm_ctx, n_backends, n_subgraphs, cgraphs, ar_nodes,
+            rpc_execution_plan_id(plan_name), custom_stages)
+        ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
 }
 
 static void ggml_backend_rpc_comm_free(void * comm_ctx) {
@@ -2900,6 +3486,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
         }
         if (std::strcmp(name, "ggml_backend_comm_exec_sequence") == 0) {
             return (void *)ggml_backend_rpc_comm_exec_sequence;
+        }
+        if (std::strcmp(name, "ggml_backend_comm_execution_extension_supports") == 0) {
+            return (void *)ggml_backend_rpc_comm_execution_extension_supports;
+        }
+        if (std::strcmp(name, "ggml_backend_comm_exec_sequence_ext") == 0) {
+            return (void *)ggml_backend_rpc_comm_exec_sequence_ext;
         }
         if (std::strcmp(name, "ggml_backend_comm_free") == 0) {
             return (void *)ggml_backend_rpc_comm_free;

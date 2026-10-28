@@ -14,6 +14,8 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -414,9 +416,42 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    execution_extension = model.execution_extension;
+    if (execution_extension != nullptr) {
+        try {
+            if (!execution_extension->context_init(this)) {
+                throw std::runtime_error("execution extension initialization failed");
+            }
+        } catch (...) {
+            execution_extension->context_free(this);
+            execution_extension = nullptr;
+            throw;
+        }
+    }
 }
 
 llama_context::~llama_context() {
+    if (execution_extension != nullptr) {
+        synchronize();
+        execution_extension->context_free(this);
+
+        const auto & stats = execution_extension_stats;
+        char message[512];
+        std::snprintf(message, sizeof(message), "%s: execution extension %s: eligible_tokens=%" PRIu64 " custom_tokens=%" PRIu64
+                " custom_stages=%" PRIu64 " fallback_tokens=%" PRIu64 " stock_prefill_tokens=%" PRIu64
+                " failed_tokens=%" PRIu64 " metadata_only_tokens=%" PRIu64 " eligible_no_output_tokens=%" PRIu64 "\n", __func__, execution_extension->name,
+                stats.eligible_tokens, stats.custom_tokens, stats.custom_stages, stats.fallback_tokens,
+                stats.stock_prefill_tokens, stats.failed_tokens, stats.metadata_only_tokens, stats.eligible_no_output_tokens);
+        const char * stats_env = std::getenv("LLAMA_EXECUTION_EXTENSION_STATS");
+        if (stats_env != nullptr && std::strcmp(stats_env, "1") == 0) {
+            std::fputs(message, stderr);
+            std::fflush(stderr);
+        } else {
+            LLAMA_LOG_INFO("%s", message);
+        }
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1301,6 +1336,26 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+const llama_execution_extension_stats & llama_context::get_execution_extension_stats() const {
+    return execution_extension_stats;
+}
+
+bool llama_context::execution_extension_supports(const llama_ubatch & ubatch, const llama_memory_context_i * mctx) const {
+    if (execution_extension == nullptr || ubatch.n_tokens != 1 ||
+        cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.embeddings || cparams.embeddings_nextn ||
+        cparams.cb_eval != nullptr || !sampling.samplers.empty() || !loras->empty()) {
+        return false;
+    }
+
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        if (cparams.embeddings_layer_inp[il] || cvec->tensor_for(il) != nullptr) {
+            return false;
+        }
+    }
+
+    return execution_extension->supports(this, ubatch, mctx);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1838,11 +1893,66 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
-        ggml_status status;
+        ggml_status status = GGML_STATUS_SUCCESS;
+        llm_graph_result * res = nullptr;
+        bool extension_handled = false;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (execution_extension != nullptr) {
+            if (n_tokens_all > 1) {
+                execution_extension_stats.stock_prefill_tokens += ubatch.n_tokens;
+            } else if (execution_extension_supports(ubatch, mctx.get())) {
+                execution_extension_stats.eligible_tokens += ubatch.n_tokens;
+                if (n_outputs == 0) {
+                    execution_extension_stats.eligible_no_output_tokens += ubatch.n_tokens;
+                }
+
+                llama_execution_extension_result result;
+                try {
+                    result = execution_extension->execute(this, ubatch, mctx.get());
+                } catch (const std::exception & err) {
+                    LLAMA_LOG_ERROR("%s: execution extension failed: %s\n", __func__, err.what());
+                    result.handled = true;
+                    result.status = GGML_STATUS_FAILED;
+                }
+
+                extension_handled = result.handled;
+                res = result.graph;
+                status = result.status;
+
+                if (!extension_handled) {
+                    GGML_ASSERT(res == nullptr && status == GGML_STATUS_SUCCESS && result.custom_stages == 0 &&
+                                !result.metadata_only);
+                } else if (res != nullptr && status == GGML_STATUS_SUCCESS) {
+                    if (result.metadata_only) {
+                        GGML_ASSERT(result.custom_stages == 0);
+                        execution_extension_stats.metadata_only_tokens += ubatch.n_tokens;
+                    } else if (result.custom_stages > 0) {
+                        execution_extension_stats.custom_tokens += ubatch.n_tokens;
+                        execution_extension_stats.custom_stages += result.custom_stages;
+                    } else {
+                        execution_extension_stats.fallback_tokens += ubatch.n_tokens;
+                    }
+                } else {
+                    res = nullptr;
+                    if (status == GGML_STATUS_SUCCESS) {
+                        status = GGML_STATUS_FAILED;
+                    }
+                    synchronize();
+                }
+            }
+        }
+
+        if (!extension_handled) {
+            if (execution_extension != nullptr && n_tokens_all == 1) {
+                execution_extension_stats.fallback_tokens += ubatch.n_tokens;
+            }
+            res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        }
 
         if (!res) {
+            if (execution_extension != nullptr) {
+                execution_extension_stats.failed_tokens += ubatch.n_tokens;
+            }
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {

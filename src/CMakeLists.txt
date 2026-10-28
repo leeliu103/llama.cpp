@@ -36,6 +36,10 @@ add_library(llama
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp
+            extensions/llama-execution-extension.cpp
+            extensions/llama-execution-extension.h
+            extensions/qwen3moe/qwen3moe-extension.cpp
+            extensions/qwen3moe/qwen3moe-extension.h
             unicode-data.cpp
             unicode.cpp
             unicode.h

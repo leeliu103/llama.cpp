@@ -61,6 +61,16 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+set(QWEN3MOE_KERNEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../src/extensions/qwen3moe/kernels")
+list(APPEND GGML_SOURCES_ROCM "${QWEN3MOE_KERNEL_DIR}/qwen3moe-gate-up.hip")
+list(APPEND GGML_SOURCES_ROCM "${QWEN3MOE_KERNEL_DIR}/qwen3moe-down.hip")
+list(APPEND GGML_SOURCES_ROCM "${QWEN3MOE_KERNEL_DIR}/qwen3moe-full-moe.hip")
+list(APPEND GGML_SOURCES_ROCM "${QWEN3MOE_KERNEL_DIR}/qwen3moe-full-moe-q8-256.hip")
+list(APPEND GGML_SOURCES_ROCM "${QWEN3MOE_KERNEL_DIR}/qwen3moe-full-moe-q8-128.hip")
+list(APPEND GGML_SOURCES_ROCM "${QWEN3MOE_KERNEL_DIR}/qwen3moe-ffn-router-q8-128.hip")
+list(APPEND GGML_SOURCES_ROCM "${QWEN3MOE_KERNEL_DIR}/qwen3moe-split-moe-q8-128.hip")
+list(APPEND GGML_SOURCES_ROCM "${QWEN3MOE_KERNEL_DIR}/qwen3moe-qkv-prefix-q8-128.hip")
+list(APPEND GGML_SOURCES_ROCM "${QWEN3MOE_KERNEL_DIR}/qwen3moe-o-q8-128.hip")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
@@ -86,6 +96,7 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
                         )
+target_include_directories(ggml-hip PRIVATE "${QWEN3MOE_KERNEL_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda")
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)

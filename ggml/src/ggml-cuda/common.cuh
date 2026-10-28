@@ -1221,6 +1221,9 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+#ifdef GGML_USE_HIP
+    uint64_t execution_extension_launches = 0;
+#endif
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
@@ -1388,6 +1391,43 @@ struct ggml_cuda_stream_context {
     }
 };
 
+#ifdef GGML_USE_HIP
+struct ggml_cuda_full_moe_state;
+enum class ggml_cuda_execution_extension_plan {
+    none,
+    qwen3moe,
+    qwen3moe_gate_up_reference,
+    qwen3moe_metadata_only,
+    qwen3moe_combined_stages,
+    qwen3moe_full_moe,
+    qwen3moe_full_moe_q8_256,
+    qwen3moe_full_moe_q8_128,
+    qwen3moe_ffn_router_q8_128,
+    qwen3moe_split_moe_q8_128,
+    qwen3moe_ffn_router_q8_128_direct,
+    qwen3moe_split_moe_qkv_prefix_q8_128,
+    qwen3moe_split_moe_qkv_prefix_o_q8_128,
+    count,
+};
+static_assert(static_cast<size_t>(ggml_cuda_execution_extension_plan::qwen3moe_ffn_router_q8_128) == 8 &&
+              static_cast<size_t>(ggml_cuda_execution_extension_plan::qwen3moe_split_moe_q8_128) == 9 &&
+              static_cast<size_t>(ggml_cuda_execution_extension_plan::qwen3moe_ffn_router_q8_128_direct) == 10 &&
+              static_cast<size_t>(ggml_cuda_execution_extension_plan::qwen3moe_split_moe_qkv_prefix_q8_128) == 11 &&
+              static_cast<size_t>(ggml_cuda_execution_extension_plan::qwen3moe_split_moe_qkv_prefix_o_q8_128) == 12 &&
+              static_cast<size_t>(ggml_cuda_execution_extension_plan::count) == 13, "plan-indexed capture/storage slots");
+
+static inline bool ggml_cuda_execution_extension_is_full_moe(ggml_cuda_execution_extension_plan plan) {
+    return plan == ggml_cuda_execution_extension_plan::qwen3moe_full_moe ||
+           plan == ggml_cuda_execution_extension_plan::qwen3moe_full_moe_q8_256 ||
+           plan == ggml_cuda_execution_extension_plan::qwen3moe_full_moe_q8_128 ||
+           plan == ggml_cuda_execution_extension_plan::qwen3moe_ffn_router_q8_128 ||
+           plan == ggml_cuda_execution_extension_plan::qwen3moe_split_moe_q8_128 ||
+           plan == ggml_cuda_execution_extension_plan::qwen3moe_ffn_router_q8_128_direct ||
+           plan == ggml_cuda_execution_extension_plan::qwen3moe_split_moe_qkv_prefix_q8_128 ||
+           plan == ggml_cuda_execution_extension_plan::qwen3moe_split_moe_qkv_prefix_o_q8_128;
+}
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1398,12 +1438,35 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-#ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+#ifdef GGML_USE_HIP
+    ggml_cuda_execution_extension_plan execution_extension_plan = ggml_cuda_execution_extension_plan::none;
+    bool execution_extension_failed = false;
+    uint64_t execution_extension_launches = 0;
+    uint32_t execution_extension_rejections[static_cast<size_t>(ggml_cuda_execution_extension_plan::count)] = {};
+    ggml_cuda_full_moe_state * full_moe = nullptr;
+#endif
 
+#ifdef USE_CUDA_GRAPH
+    // A stable graph key can be submitted through stock and different decode
+    // plans. Keep their captures, warmup state and replay counts separate.
+    using cuda_graph_map = std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>>;
+#ifdef GGML_USE_HIP
+    std::array<cuda_graph_map, static_cast<size_t>(ggml_cuda_execution_extension_plan::count)> cuda_graphs;
+#else
+    std::array<cuda_graph_map, 1> cuda_graphs;
+#endif
     int64_t last_graph_eviction_sweep = 0;
+
+    size_t cuda_graph_plan_index() const {
+#ifdef GGML_USE_HIP
+        return static_cast<size_t>(execution_extension_plan);
+#else
+        return 0;
+#endif
+    }
+
+    cuda_graph_map & cuda_graph_cache() { return cuda_graphs[cuda_graph_plan_index()]; }
+    const cuda_graph_map & cuda_graph_cache() const { return cuda_graphs[cuda_graph_plan_index()]; }
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
@@ -1411,18 +1474,21 @@ struct ggml_backend_cuda_context {
         // sweep every 5s, evicting cuda graphs unused for >=10s
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
-            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
-                    it = cuda_graphs.erase(it);
-                } else {
-                    ++it;
+            for (auto & cache : cuda_graphs) {
+                for (auto it = cache.begin(); it != cache.end(); ) {
+                    if (time_now - it->second->last_used_time >= 10'000'000) {
+                        it = cache.erase(it);
+                    } else {
+                        ++it;
+                    }
                 }
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
-        if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+        auto & cache = cuda_graph_cache();
+        auto it = cache.find(first_node_ptr);
+        if (it == cache.end()) {
+            it = cache.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
@@ -1431,7 +1497,7 @@ struct ggml_backend_cuda_context {
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
     // if graphs are in use without having access to the specific graph key)
     bool any_cuda_graph_enabled() const {
-        for (const auto & [key, graph] : cuda_graphs) {
+        for (const auto & [key, graph] : cuda_graph_cache()) {
             if (graph && graph->is_enabled()) {
                 return true;
             }
@@ -1441,7 +1507,7 @@ struct ggml_backend_cuda_context {
 
     // Check if any CUDA graph has an instance for this context
     bool any_cuda_graph_has_instance() const {
-        for (const auto & [key, graph] : cuda_graphs) {
+        for (const auto & [key, graph] : cuda_graph_cache()) {
             if (graph && graph->instance != nullptr) {
                 return true;
             }

@@ -2,6 +2,8 @@
 
 #include "llama-impl.h"
 
+#include "extensions/llama-execution-extension.h"
+
 #include "llama-chat.h"
 #include "llama-context.h"
 #include "llama-mmap.h"
@@ -329,6 +331,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
+        }
+
+        if (!params.no_alloc) {
+            const auto * extension = llama_execution_extension_get(model->arch);
+            if (extension != nullptr && !extension->model_init(model)) {
+                throw std::runtime_error("failed to initialize execution extension");
+            }
+            model->execution_extension = extension;
         }
 
         return {0, model_ptr.release()};

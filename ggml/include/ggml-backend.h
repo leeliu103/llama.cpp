@@ -212,6 +212,23 @@ extern "C" {
     typedef bool   (*ggml_backend_comm_exec_sequence_t)(void * comm_ctx, size_t n_backends, size_t n_subgraphs,
                                                         struct ggml_cgraph ** cgraphs, struct ggml_tensor ** ar_nodes);
 
+    // Scoped worker execution. Unsupported whole stages stay stock; partial failures must not retry.
+    typedef bool (*ggml_backend_execution_extension_supports_t)(ggml_backend_t backend, const char * plan_name);
+    typedef bool (*ggml_backend_execution_extension_begin_t)(ggml_backend_t backend, const char * plan_name);
+    typedef bool (*ggml_backend_execution_extension_end_t)(ggml_backend_t backend, uint64_t * custom_stages);
+    // Worker-local lifecycle. Prepare sees all graph/collective pairs before
+    // submission; seal queues final status work before the existing sync.
+    // Cancel only clears host bookkeeping and must never synchronize or free
+    // resources referenced by outstanding device work.
+    typedef bool (*ggml_backend_execution_extension_prepare_v1_t)(ggml_backend_t backend, size_t n_graphs,
+            struct ggml_cgraph * const * graphs, struct ggml_tensor * const * allreduce_operands);
+    typedef bool (*ggml_backend_execution_extension_seal_v1_t)(ggml_backend_t backend);
+    typedef void (*ggml_backend_execution_extension_cancel_v1_t)(ggml_backend_t backend);
+    typedef bool (*ggml_backend_comm_execution_extension_supports_t)(void * comm_ctx, const char * plan_name);
+    typedef enum ggml_status (*ggml_backend_comm_exec_sequence_ext_t)(void * comm_ctx, const char * plan_name,
+            size_t n_backends, size_t n_subgraphs, struct ggml_cgraph ** cgraphs, struct ggml_tensor ** ar_nodes,
+            uint64_t * custom_stages);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend

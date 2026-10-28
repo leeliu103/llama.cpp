@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend.h"
+#include "ggml-backend-meta.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
@@ -1613,6 +1614,11 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_comm_exec_sequence_t    comm_exec_seq  = nullptr;
+    ggml_backend_comm_execution_extension_supports_t comm_extension_supports = nullptr;
+    ggml_backend_comm_exec_sequence_ext_t comm_exec_seq_ext = nullptr;
+    std::string execution_plan;
+    uint64_t custom_stages = 0;
+    bool execution_failed = false;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1647,6 +1653,10 @@ struct ggml_backend_meta_context {
             // optional: batched whole-token dispatch (one round-trip per token instead of per layer)
             comm_exec_seq = (ggml_backend_comm_exec_sequence_t)
                 ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_exec_sequence");
+            comm_extension_supports = (ggml_backend_comm_execution_extension_supports_t)
+                ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_execution_extension_supports");
+            comm_exec_seq_ext = (ggml_backend_comm_exec_sequence_ext_t)
+                ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_exec_sequence_ext");
         }
     }
 
@@ -2204,6 +2214,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ar_nodes[j*S + i] = (i + 1 < S) ? cg->nodes[cg->n_nodes - 1] : nullptr;
             }
         }
+        if (!backend_ctx->execution_plan.empty()) {
+            uint64_t custom_stages = 0;
+            const ggml_status status = backend_ctx->comm_exec_seq_ext(backend_ctx->comm_ctx,
+                    backend_ctx->execution_plan.c_str(), n_backends, S, cgraphs.data(), ar_nodes.data(), &custom_stages);
+            backend_ctx->custom_stages += custom_stages;
+            backend_ctx->execution_failed |= status != GGML_STATUS_SUCCESS;
+            return status;
+        }
         if (backend_ctx->comm_exec_seq(backend_ctx->comm_ctx, n_backends, S, cgraphs.data(), ar_nodes.data())) {
             return GGML_STATUS_SUCCESS;
         }
@@ -2264,6 +2282,40 @@ static const ggml_backend_i ggml_backend_meta_i = {
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {
     return backend != nullptr && backend->iface.get_name == ggml_backend_meta_i.get_name;
+}
+
+bool ggml_backend_meta_execution_extension_begin(ggml_backend_t backend, const char * plan_name) {
+    if (!ggml_backend_is_meta(backend) || plan_name == nullptr || plan_name[0] == '\0') {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_meta_context *>(backend->context);
+    if (!ctx->execution_plan.empty() || ctx->comm_ctx == nullptr || ctx->comm_exec_seq == nullptr ||
+        ctx->comm_extension_supports == nullptr || ctx->comm_exec_seq_ext == nullptr ||
+        !ctx->comm_extension_supports(ctx->comm_ctx, plan_name)) {
+        return false;
+    }
+    ctx->execution_plan = plan_name;
+    ctx->custom_stages = 0;
+    ctx->execution_failed = false;
+    return true;
+}
+
+bool ggml_backend_meta_execution_extension_end(ggml_backend_t backend, uint64_t * custom_stages) {
+    if (custom_stages != nullptr) {
+        *custom_stages = 0;
+    }
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_meta_context *>(backend->context);
+    if (ctx->execution_plan.empty()) {
+        return false;
+    }
+    if (custom_stages != nullptr) {
+        *custom_stages = ctx->custom_stages;
+    }
+    ctx->execution_plan.clear();
+    return !ctx->execution_failed;
 }
 
 static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t dev, const char * params) {
