@@ -1,0 +1,81 @@
+{
+  "case": "extension",
+  "test": "tg128",
+  "status": "ok",
+  "exit_code": 0,
+  "extension_plan": "qwen3moe.decode.split-moe-qkv-prefix-q8-128.v1",
+  "extension_counters": [
+    {
+      "eligible_tokens": 385,
+      "custom_tokens": 385,
+      "custom_stages": 217140,
+      "fallback_tokens": 0,
+      "stock_prefill_tokens": 0,
+      "failed_tokens": 0,
+      "metadata_only_tokens": 0,
+      "eligible_no_output_tokens": 0
+    }
+  ],
+  "first_sequence_stages_by_rank": {
+    "0": 188,
+    "1": 188,
+    "2": 188
+  },
+  "rows": [
+    {
+      "build_commit": "40d1867bd-reconstructed-extension",
+      "build_number": 9790,
+      "cpu_info": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "gpu_info": "AMD Radeon 8060S Graphics, ${TP3_RPC_RANK0}:50052, ${TP3_RPC_RANK1}:50052, ${TP3_RPC_RANK2}:50052",
+      "backends": "ROCm,RPC",
+      "model_filename": "${MODEL}",
+      "model_type": "qwen3moe 235B.A22B Q4_K - Medium",
+      "model_size": 142148069376,
+      "model_n_params": 235093634560,
+      "n_batch": 512,
+      "n_ubatch": 512,
+      "n_threads": 16,
+      "cpu_mask": "0x0",
+      "cpu_strict": false,
+      "poll": 50,
+      "type_k": "f16",
+      "type_v": "f16",
+      "n_gpu_layers": 99,
+      "n_cpu_moe": 0,
+      "split_mode": "tensor",
+      "main_gpu": 0,
+      "no_kv_offload": false,
+      "flash_attn": 1,
+      "devices": "RPC0/RPC1/RPC2",
+      "tensor_split": "0.00",
+      "tensor_buft_overrides": "none",
+      "use_mmap": true,
+      "use_direct_io": false,
+      "embeddings": false,
+      "no_op_offload": 0,
+      "no_host": false,
+      "fit_target": 0,
+      "fit_min_ctx": 0,
+      "n_prompt": 0,
+      "n_gen": 128,
+      "n_depth": 0,
+      "test_time": "2026-10-28T12:51:16Z",
+      "avg_ns": 5728678614,
+      "stddev_ns": 45748792,
+      "avg_ts": 22.344669,
+      "stddev_ts": 0.178042,
+      "samples_ns": [
+        5778273035,
+        5719637261,
+        5688125546
+      ],
+      "samples_ts": [
+        22.1519,
+        22.379,
+        22.503
+      ]
+    }
+  ],
+  "elapsed_seconds": 266.9089012309996,
+  "cleanup_errors": []
+}

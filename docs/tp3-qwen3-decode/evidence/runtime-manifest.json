@@ -1,0 +1,99 @@
+{
+  "build": "extension",
+  "files": {
+    "libggml-base.so": {
+      "link": "libggml-base.so.0"
+    },
+    "libggml-base.so.0": {
+      "link": "libggml-base.so.0.15.2"
+    },
+    "libggml-base.so.0.15.2": {
+      "size": 872976,
+      "sha256": "f24b5a66c4ca24cb26cd0263d96314c4ffbf3082792051f95cf6f87156ef0881"
+    },
+    "libggml-cpu.so": {
+      "link": "libggml-cpu.so.0"
+    },
+    "libggml-cpu.so.0": {
+      "link": "libggml-cpu.so.0.15.2"
+    },
+    "libggml-cpu.so.0.15.2": {
+      "size": 1349552,
+      "sha256": "3e295af3bbfd6190c598cc6bc1817c5503ce295427fceb74570137da7e0b907a"
+    },
+    "libggml-hip.so": {
+      "link": "libggml-hip.so.0"
+    },
+    "libggml-hip.so.0": {
+      "link": "libggml-hip.so.0.15.2"
+    },
+    "libggml-hip.so.0.15.2": {
+      "size": 65104128,
+      "sha256": "3f59f3c9b1f1379238be6dcbcced470d27b2ce4a27696d4b4654bfabea4daf11"
+    },
+    "libggml-rpc.so": {
+      "link": "libggml-rpc.so.0"
+    },
+    "libggml-rpc.so.0": {
+      "link": "libggml-rpc.so.0.15.2"
+    },
+    "libggml-rpc.so.0.15.2": {
+      "size": 285048,
+      "sha256": "075acd13bf749b7728a1d862df9e831b324163310df36eed04822ba2c69feae2"
+    },
+    "libggml.so": {
+      "link": "libggml.so.0"
+    },
+    "libggml.so.0": {
+      "link": "libggml.so.0.15.2"
+    },
+    "libggml.so.0.15.2": {
+      "size": 55616,
+      "sha256": "f4ff45b092ff55d068b45b0e0e58589fb5fa4260f39b7a4ca5b032f4245af915"
+    },
+    "libllama-bench-impl.so": {
+      "size": 428312,
+      "sha256": "863b6bb647f255f16b7fa87411e639069c9b6c22249db749925e98156dbfc5f9"
+    },
+    "libllama-common.so": {
+      "link": "libllama-common.so.0"
+    },
+    "libllama-common.so.0": {
+      "link": "libllama-common.so.0.0.9790"
+    },
+    "libllama-common.so.0.0.9790": {
+      "size": 5516880,
+      "sha256": "df69df3a63c352c29c235b03fdedd6ab94c90ea9c513155d527d59ae598c6efb"
+    },
+    "libllama-perplexity-impl.so": {
+      "size": 167744,
+      "sha256": "4b27f3229111d7a203c3a9d7e5f998d437f44402bf777deb19862076296e2614"
+    },
+    "libllama.so": {
+      "link": "libllama.so.0"
+    },
+    "libllama.so.0": {
+      "link": "libllama.so.0.0.9790"
+    },
+    "libllama.so.0.0.9790": {
+      "size": 3789072,
+      "sha256": "1781ebd4c3210c3a5063134ff5babde85bad6965b9030c571c38b4b46c5aa34e"
+    },
+    "llama-bench": {
+      "size": 17952,
+      "sha256": "aaf7f20baac597f74410eb368e601f48455a1931fb6ac5848c851b5dba3297dd"
+    },
+    "llama-perplexity": {
+      "size": 15960,
+      "sha256": "4ef2d874646f7041a122ca6a8c64a54d89d38caa49105f94fabeea118c98f69f"
+    },
+    "rpc-server": {
+      "size": 214920,
+      "sha256": "86c9fc458e83ea17aa219a7b2180eead64e3cc9174038942c4a4e574483195c8"
+    }
+  },
+  "source_snapshot": {
+    "directory": "${TP3_SOURCE_SNAPSHOT}",
+    "manifest_sha256": "0e7a34de4d4f07650649894dc84432f0a2d872d24d03bc7a8819798dd77a3199"
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "branch": "feat/qwen3-tp3-decode-megakernels",
+  "upstream_base_commit": "09cedfd6996d2ff90b4e617f56230212005c0166",
+  "cse_baseline": {
+    "reported_commit": "40d1867bd",
+    "method": "Reconstructed distributed CSE TP3 patch over upstream base; not original CSE commit history.",
+    "published_commit": "63226c73931ac1b427b60afd98e9a1937483d823"
+  },
+  "measured_source_commit": "d56382b222231a3d41afb5ac13bd43927a168f5c",
+  "source_snapshot": "20261028-082059-519127",
+  "source_manifest_sha256": "0e7a34de4d4f07650649894dc84432f0a2d872d24d03bc7a8819798dd77a3199",
+  "measured_run": "20261028-084704-569075/extension-tg128-run1",
+  "selected_variant": "split-moe-qkv-prefix-q8-128",
+  "omitted_snapshot_files": {
+    "memory.md": "Inherited non-build operational notes contained credentials. Excluded from every published commit and patch artifact."
+  },
+  "retained_snapshot_file_count": 3024,
+  "publication_added_paths": [
+    "docs/tp3-qwen3-decode/"
+  ],
+  "verification": "All retained source files checked byte-for-byte against frozen build inventory; no build or benchmark rerun for publication.",
+  "retained_formatting_note": "The frozen qwen3moe-qkv-prefix-q8-128.h ends with a blank line; preserved to maintain source identity.",
+  "statistics": {
+    "sample_tokens_per_second": [
+      22.151947342169855,
+      22.3790415648878,
+      22.50301948592047
+    ],
+    "mean_tokens_per_second": 22.344669464326042,
+    "sample_standard_deviation": 0.17804211159774416,
+    "independent_worker_sessions": 1,
+    "samples_in_session": 3
+  },
+  "evidence_sha256": {
+    "result.json": "ad8b455c91ab0623f0c24b5979d93a8fc53c26671a47b6f88d79014f7d85cd5e",
+    "invocation.json": "db1d8126609784299c942ecfa8a04bf644eace868000f91ee3629399a304f365",
+    "benchmark.log": "9bbcf81fc426c7031b27fe02755aa94a75e01a659ffc16b1bd34e58f60aa5fa0",
+    "source-manifest.json": "0e7a34de4d4f07650649894dc84432f0a2d872d24d03bc7a8819798dd77a3199",
+    "build-source-check.json": "9d02592081d0c70b0de4adbbcceccb0faff7718c7f964347a2cb0d4e977b3dbc",
+    "build-binary-manifest.json": "a46d0ad68b794b25c0aaf951d7cb23d6cac880da8fd253c8e82a85c9eb74db1e",
+    "runtime-manifest.json": "8b319afa096a4b3983547693c6708eb60e7077405a0ee7caeecc538d874cfdf5"
+  },
+  "limitations": [
+    "Earlier plan11 PPL8 and handoff evidence used snapshot 20261028-070726-571346.",
+    "560-chunk decode PPL and complete long-decode benchmark matrix not completed.",
+    "The measured source predates subsequent RPC UID-cache lifetime repair; this publication does not include that unmeasured fix.",
+    "Runtime binaries, model weights, datasets, credentials, SDKs, and later experiments are not included."
+  ],
+  "original_evidence_sha256": {
+    "result.json": "fc997f47dff8bf43b91c4d537330f001185bc2463381b10884efd231c172327b",
+    "invocation.json": "e426bbfa843a6527729781afe3a58698d995084ca15a1c2a567ca2a59f810a8f",
+    "benchmark.log": "574c85da3b7e2c9da58013f2b464ad6c7589fd5dbe388217ef6e476cf4932574",
+    "source-manifest.json": "0e7a34de4d4f07650649894dc84432f0a2d872d24d03bc7a8819798dd77a3199",
+    "build-source-check.json": "9d02592081d0c70b0de4adbbcceccb0faff7718c7f964347a2cb0d4e977b3dbc",
+    "build-binary-manifest.json": "0afb25f8180ee60074c302b966dce87ae99da7db0770c255b98fa1c75e31efcc",
+    "runtime-manifest.json": "a8cd646c19b91a6bdae9e9160a5e34ae4778f917420c4fecfbdc2f6bb8551d1e"
+  },
+  "sanitization": {
+    "description": "Published evidence substitutes configurable placeholders for cluster addresses, host aliases, absolute installation/model/workspace paths and the network-interface name. Timing samples, execution counters, settings unrelated to location, and source/binary hashes are unchanged.",
+    "sanitized_files": [
+      "result.json",
+      "invocation.json",
+      "benchmark.log",
+      "build-binary-manifest.json",
+      "runtime-manifest.json"
+    ],
+    "placeholders": {
+      "MODEL": "Path to the first existing GGUF model shard.",
+      "TP3_BUILD": "Build directory for the measured source.",
+      "TP3_RUN_DIR": "Directory for one benchmark run and its temporary files.",
+      "TP3_SOURCE_SNAPSHOT": "Directory of the archived source snapshot identified by source_snapshot.",
+      "TP3_KIT": "Existing CSE runtime kit directory.",
+      "TP3_ARTIFACTS": "Private artifact staging directory visible inside a peer namespace.",
+      "TP3_RPC_RANK0": "Rank0 RPC address, without a port.",
+      "TP3_RPC_RANK1": "Rank1 RPC address, without a port.",
+      "TP3_RPC_RANK2": "Rank2 RPC address, without a port.",
+      "TP3_SOCKET_IFNAME": "NCCL bootstrap network-interface name for the process."
+    },
+    "host_labels": "rank0, rank1 and rank2 replace machine aliases, including RPC command-map keys.",
+    "original_evidence_hashes": "original_evidence_sha256 identifies private archived originals; evidence_sha256 verifies the published copies.",
+    "original_runtime_manifest_canonical_sha256": "1c3e07dcb32b5ad489988dca9eb066d88b59a75a04d6c46e1834b61a3f9155af",
+    "published_runtime_manifest_canonical_sha256": "3a716472756b9aa59c4f8d62b241c88db3ca5c4e8e9c12fedabf2baef749dd4b",
+    "runtime_manifest_note": "The invocation artifact_manifest_sha256 records the original runtime manifest identity. It does not hash the sanitized runtime-manifest.json representation."
+  }
+}
