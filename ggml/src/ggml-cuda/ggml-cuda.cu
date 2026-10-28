@@ -1436,6 +1436,94 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
+// ---------------------------------------------------------------------------
+// Cross-process single-GPU RCCL/NCCL primitives for multi-node tensor
+// parallelism over the RPC backend.  Each process owns exactly one GPU and one
+// rank.  The RPC backend (which cannot link RCCL itself) drives these through
+// ggml_backend_reg_get_proc_address.  comm bootstrap (uniqueId exchange) and
+// the collective barrier are handled by the RPC transport / caller.
+// ---------------------------------------------------------------------------
+#ifdef GGML_USE_NCCL
+struct ggml_backend_cuda_nccl_comm {
+    ncclComm_t comm;
+    int        device;
+};
+
+bool ggml_backend_cuda_nccl_get_unique_id(void * id_out) {
+    ncclUniqueId id;
+    if (ncclGetUniqueId(&id) != ncclSuccess) {
+        return false;
+    }
+    static_assert(sizeof(ncclUniqueId) <= 128, "ncclUniqueId larger than wire field");
+    memset(id_out, 0, 128);
+    memcpy(id_out, &id, sizeof(id));
+    return true;
+}
+
+void * ggml_backend_cuda_nccl_comm_init_rank(ggml_backend_t backend, int nranks, int rank, const void * id128) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ncclUniqueId id;
+    memcpy(&id, id128, sizeof(id));
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    ncclComm_t comm = nullptr;
+    ncclResult_t rc = ncclCommInitRank(&comm, nranks, id, rank);
+    if (rc != ncclSuccess) {
+        GGML_LOG_ERROR("ncclCommInitRank failed (rank %d/%d): %s\n", rank, nranks, ncclGetErrorString(rc));
+        return nullptr;
+    }
+    auto * h = new ggml_backend_cuda_nccl_comm{ comm, cuda_ctx->device };
+    return h;
+}
+
+bool ggml_backend_cuda_nccl_allreduce(ggml_backend_t backend, void * comm_v, struct ggml_tensor * tensor) {
+    if (comm_v == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    auto * h = static_cast<ggml_backend_cuda_nccl_comm *>(comm_v);
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    const int64_t ne = ggml_nelements(tensor);
+    if (ne == 0) {
+        return true;
+    }
+    ncclDataType_t dt;
+    switch (tensor->type) {
+        case GGML_TYPE_F32:  dt = ncclFloat32; break;
+        case GGML_TYPE_F16:  dt = ncclFloat16; break;
+        case GGML_TYPE_BF16: dt = ncclBfloat16; break;
+        default: return false;
+    }
+    if (!ggml_is_contiguously_allocated(tensor)) {
+        return false;
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    ncclResult_t rc = ncclAllReduce(tensor->data, tensor->data, ne, dt, ncclSum, h->comm, cuda_ctx->stream());
+    if (rc != ncclSuccess) {
+        GGML_LOG_ERROR("ncclAllReduce failed: %s\n", ncclGetErrorString(rc));
+        return false;
+    }
+    // Enqueue only - no host sync. The caller is responsible for synchronizing the
+    // backend once the surrounding sequence of compute/allreduce ops is submitted.
+    return true;
+}
+
+void ggml_backend_cuda_nccl_comm_free(void * comm_v) {
+    if (comm_v == nullptr) {
+        return;
+    }
+    auto * h = static_cast<ggml_backend_cuda_nccl_comm *>(comm_v);
+    if (h->comm) {
+        ncclCommDestroy(h->comm);
+    }
+    delete h;
+}
+#endif // GGML_USE_NCCL
+
 ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(int main_device, const float * tensor_split) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -5636,6 +5724,20 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+#ifdef GGML_USE_NCCL
+    if (strcmp(name, "ggml_backend_cuda_nccl_get_unique_id") == 0) {
+        return (void *)ggml_backend_cuda_nccl_get_unique_id;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_comm_init_rank") == 0) {
+        return (void *)ggml_backend_cuda_nccl_comm_init_rank;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_allreduce") == 0) {
+        return (void *)ggml_backend_cuda_nccl_allreduce;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_comm_free") == 0) {
+        return (void *)ggml_backend_cuda_nccl_comm_free;
+    }
+#endif // GGML_USE_NCCL
     return nullptr;
 }
 

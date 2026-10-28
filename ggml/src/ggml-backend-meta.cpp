@@ -1612,6 +1612,7 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_comm_exec_sequence_t    comm_exec_seq  = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1639,10 +1640,13 @@ struct ggml_backend_meta_context {
             }
         }
         if (comm_ctx != nullptr) {
+            ggml_backend_reg_t reg0 = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
-                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+                ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            // optional: batched whole-token dispatch (one round-trip per token instead of per layer)
+            comm_exec_seq = (ggml_backend_comm_exec_sequence_t)
+                ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_exec_sequence");
         }
     }
 
@@ -2182,6 +2186,29 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
+
+    // Batched whole-token dispatch: hand each backend its full ordered sequence of
+    // (subgraph compute -> optional allreduce) so a remote (RPC) backend can run it
+    // autonomously with a single round-trip per token. Only used when the comm layer
+    // provides it (RPC+RCCL) and there is an allreduce to carry between subgraphs.
+    if (backend_ctx->comm_ctx && backend_ctx->comm_exec_seq && n_backends > 1 && backend_ctx->n_subgraphs > 1) {
+        const size_t S = backend_ctx->n_subgraphs;
+        std::vector<ggml_cgraph *> cgraphs(n_backends * S, nullptr);
+        std::vector<ggml_tensor *> ar_nodes(n_backends * S, nullptr);
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            for (size_t i = 0; i < S; i++) {
+                ggml_cgraph * cg = bcj.cgraphs[i].cgraph_main;
+                cgraphs[j*S + i] = cg;
+                // allreduce follows every subgraph except the last
+                ar_nodes[j*S + i] = (i + 1 < S) ? cg->nodes[cg->n_nodes - 1] : nullptr;
+            }
+        }
+        if (backend_ctx->comm_exec_seq(backend_ctx->comm_ctx, n_backends, S, cgraphs.data(), ar_nodes.data())) {
+            return GGML_STATUS_SUCCESS;
+        }
+        // fall through to the per-subgraph path on failure
+    }
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {

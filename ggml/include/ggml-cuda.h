@@ -45,6 +45,13 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
+// cross-process single-GPU RCCL/NCCL primitives for multi-node tensor parallelism over RPC.
+// resolved by name via ggml_backend_reg_get_proc_address; available only when built with NCCL.
+GGML_BACKEND_API bool   ggml_backend_cuda_nccl_get_unique_id(void * id_out);
+GGML_BACKEND_API void * ggml_backend_cuda_nccl_comm_init_rank(ggml_backend_t backend, int nranks, int rank, const void * id128);
+GGML_BACKEND_API bool   ggml_backend_cuda_nccl_allreduce(ggml_backend_t backend, void * comm, struct ggml_tensor * tensor);
+GGML_BACKEND_API void   ggml_backend_cuda_nccl_comm_free(void * comm);
+
 #ifdef  __cplusplus
 }
 #endif

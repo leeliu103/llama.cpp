@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -1411,9 +1413,35 @@ bool llama_model_loader::load_all_data(
         llama_mlocks * lmlocks,
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
+    const bool trace_load = std::getenv("GGML_RPC_LOAD_TRACE") != nullptr || std::getenv("GGML_RPC_LOAD_TIME") != nullptr;
+    size_t trace_tensors = 0;
+    size_t trace_bytes = 0;
+
+    struct load_trace_guard {
+        bool enabled;
+        int64_t t0;
+        size_t * n_tensors;
+        size_t * n_bytes;
+        size_t size_data;
+        size_t n_files;
+        bool use_mmap;
+
+        ~load_trace_guard() {
+            if (!enabled) {
+                return;
+            }
+            const int64_t t1 = ggml_time_us();
+            fprintf(stderr, "[rpc-load] master load_all_data done tensors=%zu bytes=%zu size_data=%zu files=%zu use_mmap=%d total_us=%" PRId64 "\n",
+                    *n_tensors, *n_bytes, size_data, n_files, use_mmap ? 1 : 0, t1 - t0);
+            fflush(stderr);
+        }
+    } trace_guard{trace_load, trace_load ? ggml_time_us() : 0, &trace_tensors, &trace_bytes, size_data, files.size(), use_mmap};
+
     if (files.empty()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             set_tensor_data(t, set_tensor_data_ud);
+            trace_tensors++;
+            trace_bytes += ggml_nbytes(t);
         }
         return true;
     }
@@ -1640,6 +1668,8 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+        trace_tensors++;
+        trace_bytes += n_size;
         size_done += n_size;
     }
 

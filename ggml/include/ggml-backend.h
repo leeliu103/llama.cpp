@@ -206,6 +206,11 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Optional: execute a whole token's compute+allreduce sequence in one shot (batched dispatch).
+    // cgraphs and ar_nodes are [n_backends * n_subgraphs] row-major by backend; ar_nodes[k] may be
+    // NULL where no allreduce follows that subgraph. Returns false if unsupported (caller falls back).
+    typedef bool   (*ggml_backend_comm_exec_sequence_t)(void * comm_ctx, size_t n_backends, size_t n_subgraphs,
+                                                        struct ggml_cgraph ** cgraphs, struct ggml_tensor ** ar_nodes);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
