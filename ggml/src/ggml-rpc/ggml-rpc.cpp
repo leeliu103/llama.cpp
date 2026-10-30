@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "transport.h"
+#include "mk-qwen3moe-tp.h"
 
 #include <array>
 #include <cinttypes>
@@ -20,6 +21,7 @@
 #include <thread>
 
 #ifndef _WIN32
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -89,6 +91,8 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_COMPUTE_SEQ,
     RPC_CMD_SET_TENSOR_2D_HASH,
     RPC_CMD_SET_TENSOR_2D,
+    RPC_CMD_MK_INIT,
+    RPC_CMD_MK_DECODE,
     RPC_CMD_COUNT,
 };
 
@@ -249,6 +253,33 @@ struct rpc_msg_allreduce_rsp {
 
 struct rpc_msg_graph_compute_seq_rsp {
     uint8_t ok;
+};
+
+// RPC_CMD_MK_INIT: this header, then n_tensors rpc_tensor in the order of rpc_mk_tensors()
+struct rpc_msg_mk_init_hdr {
+    uint32_t device;
+    int32_t  rank;
+    int32_t  n_ranks;
+    int32_t  n_layers;
+    int32_t  n_cells;
+    int32_t  vocab_off;
+    int32_t  emb_type;  // token_embd stays on the orchestrator's host: its type and shape; rows come per token
+    int32_t  emb_ne0;
+    int32_t  emb_ne1;
+    uint32_t n_tensors;
+};
+
+struct rpc_msg_mk_init_rsp {
+    uint8_t ok;
+    char    err[255];
+};
+
+// RPC_CMD_MK_DECODE: this, then emb_bytes of the token's token_embd row; the response is int32 status, then the
+// device's LM head rows of logits (float)
+struct rpc_msg_mk_decode_req {
+    int32_t  token;
+    int32_t  pos;
+    uint32_t emb_bytes;
 };
 
 #pragma pack(pop)
@@ -1162,6 +1193,8 @@ public:
     bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
     bool allreduce(const rpc_msg_allreduce_req & request, rpc_msg_allreduce_rsp & response);
     bool graph_compute_seq(const std::vector<uint8_t> & input, rpc_msg_graph_compute_seq_rsp & response);
+    bool mk_init(const std::vector<uint8_t> & input, rpc_msg_mk_init_rsp & response);
+    bool mk_decode(const std::vector<uint8_t> & input, std::vector<uint8_t> & response);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -1197,6 +1230,15 @@ private:
     void * (*nccl_comm_init_rank)(ggml_backend_t, int, int, const void *)  = nullptr;
     bool   (*nccl_allreduce)(ggml_backend_t, void *, struct ggml_tensor *) = nullptr;
     void   (*nccl_comm_free)(void *)                                       = nullptr;
+
+    // llama.cpp's tensor-split decode kernel for this device (RPC_CMD_MK_*): the library is GGML_RPC_MK_LIB
+    // (libmk-qwen3moe-tp.so), its own exchange between the servers GGML_RPC_MK_PEERS ("odl:host:port,...")
+    void *         mk         = nullptr;
+    ggml_backend_t mk_backend = nullptr;
+    int32_t        mk_rows    = 0;
+    void * (*mk_create_fn)(const mk_tp_model *, char *, size_t) = nullptr;
+    int    (*mk_decode_fn)(void *, int32_t, int32_t, const void *, float *) = nullptr;
+    void   (*mk_free_fn)(void *)                                = nullptr;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -2137,7 +2179,116 @@ bool rpc_server::allreduce(const rpc_msg_allreduce_req & request, rpc_msg_allred
     return true;
 }
 
+// per layer q k v o gate up down router attn_norm ffn_norm q_norm k_norm k_cache v_cache, then output out_norm
+static constexpr uint32_t RPC_MK_PER_LAYER = 14;
+
+bool rpc_server::mk_init(const std::vector<uint8_t> & input, rpc_msg_mk_init_rsp & response) {
+    memset(&response, 0, sizeof(response));
+    auto fail = [&](const char * why) {
+        snprintf(response.err, sizeof(response.err), "%s", why);
+        return true;
+    };
+    if (input.size() < sizeof(rpc_msg_mk_init_hdr)) {
+        return false;
+    }
+    rpc_msg_mk_init_hdr hdr;
+    memcpy(&hdr, input.data(), sizeof(hdr));
+    if (hdr.n_layers <= 0 || hdr.n_tensors != (uint32_t) hdr.n_layers * RPC_MK_PER_LAYER + 2 ||
+        input.size() != sizeof(hdr) + (size_t) hdr.n_tensors * sizeof(rpc_tensor) || hdr.device >= backends.size()) {
+        return false;
+    }
+#ifndef _WIN32
+    if (mk_create_fn == nullptr) {
+        const char * lib = std::getenv("GGML_RPC_MK_LIB");
+        void * h = lib ? dlopen(lib, RTLD_NOW | RTLD_LOCAL) : nullptr;
+        if (h == nullptr) {
+            return fail(lib ? dlerror() : "GGML_RPC_MK_LIB is not set");
+        }
+        mk_create_fn = (void * (*)(const mk_tp_model *, char *, size_t)) dlsym(h, "mk_tp_create");
+        mk_decode_fn = (int (*)(void *, int32_t, int32_t, const void *, float *)) dlsym(h, "mk_tp_decode");
+        mk_free_fn   = (void (*)(void *)) dlsym(h, "mk_tp_free");
+        if (!mk_create_fn || !mk_decode_fn || !mk_free_fn) {
+            mk_create_fn = nullptr;
+            return fail("GGML_RPC_MK_LIB does not export mk_tp_create / mk_tp_decode / mk_tp_free");
+        }
+    }
+#else
+    return fail("not supported on Windows yet");
+#endif
+    if (mk != nullptr) {
+        mk_free_fn(mk);
+        mk = nullptr;
+    }
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead() * hdr.n_tensors,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    const rpc_tensor * rt = (const rpc_tensor *) (input.data() + sizeof(hdr));
+    std::vector<mk_tp_tensor> t(hdr.n_tensors);
+    for (uint32_t i = 0; i < hdr.n_tensors; i++) {
+        ggml_tensor * x = deserialize_tensor(ctx_ptr.get(), &rt[i]);
+        if (x == nullptr || x->buffer == nullptr || x->data == nullptr) {
+            return fail("a tensor is not in a buffer of this connection");
+        }
+        t[i] = { x->data, (int32_t) x->type, { x->ne[0], x->ne[1], x->ne[2] } };
+    }
+    std::vector<mk_tp_layer> layers(hdr.n_layers);
+    for (int32_t il = 0; il < hdr.n_layers; il++) {
+        const mk_tp_tensor * l = &t[(size_t) il * RPC_MK_PER_LAYER];
+        layers[il] = { l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], l[8], l[9], l[10], l[11],
+                       const_cast<void *>(l[12].data), const_cast<void *>(l[13].data) };
+    }
+    const mk_tp_tensor * g = &t[(size_t) hdr.n_layers * RPC_MK_PER_LAYER];
+    mk_tp_model m = {};
+    m.rank      = hdr.rank;
+    m.n_ranks   = hdr.n_ranks;
+    m.n_layers  = hdr.n_layers;
+    m.n_cells   = hdr.n_cells;
+    m.vocab_off = hdr.vocab_off;
+    m.layers    = layers.data();
+    m.tok_embd  = { nullptr, hdr.emb_type, { hdr.emb_ne0, hdr.emb_ne1, 1 } };
+    m.output    = g[0];
+    m.out_norm  = g[1];
+    m.peers     = std::getenv("GGML_RPC_MK_PEERS");
+    if (m.peers == nullptr) {
+        return fail("GGML_RPC_MK_PEERS is not set");
+    }
+    mk_backend = backends[hdr.device];
+    // the weights were written through this backend: let that finish before copying them
+    ggml_backend_synchronize(mk_backend);
+    char err[256] = "";
+    mk = mk_create_fn(&m, err, sizeof(err));
+    if (mk == nullptr) {
+        return fail(err[0] ? err : "mk_tp_create failed");
+    }
+    mk_rows     = (int32_t) m.output.ne[1];
+    response.ok = 1;
+    return true;
+}
+
+bool rpc_server::mk_decode(const std::vector<uint8_t> & input, std::vector<uint8_t> & response) {
+    response.assign(sizeof(int32_t) + (size_t) mk_rows * sizeof(float), 0);
+    int32_t status = 1;
+    rpc_msg_mk_decode_req request;
+    if (input.size() >= sizeof(request)) {
+        memcpy(&request, input.data(), sizeof(request));
+    }
+    if (mk != nullptr && input.size() == sizeof(request) + request.emb_bytes) {
+        // the KV cache is written by this backend's graphs (prompt processing)
+        ggml_backend_synchronize(mk_backend);
+        status = mk_decode_fn(mk, request.token, request.pos, request.emb_bytes ? input.data() + sizeof(request) : nullptr,
+                              (float *) (response.data() + sizeof(int32_t)));
+    }
+    memcpy(response.data(), &status, sizeof(status));
+    return true;
+}
+
 rpc_server::~rpc_server() {
+    if (mk != nullptr && mk_free_fn != nullptr) {
+        mk_free_fn(mk);
+    }
     if (nccl_comm != nullptr && nccl_comm_free != nullptr) {
         nccl_comm_free(nccl_comm);
     }
@@ -2488,6 +2639,32 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_MK_INIT: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                rpc_msg_mk_init_rsp response;
+                if (!server.mk_init(input, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_MK_DECODE: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                std::vector<uint8_t> response;
+                server.mk_decode(input, response);
+                if (!send_msg(sock, response.data(), response.size())) {
                     return;
                 }
                 break;
@@ -2879,7 +3056,95 @@ static void ggml_backend_rpc_comm_free(void * comm_ctx) {
     delete static_cast<rpc_comm_ctx *>(comm_ctx);
 }
 
+// llama.cpp's tensor-split decode kernel on the servers (RPC_CMD_MK_*). Every server is called at once: they
+// connect to each other while creating the kernel and exchange partial sums while decoding.
+// tensors: [n_backends][count], each backend's own slices in the order of RPC_MK_PER_LAYER;
+// hdr: [n_backends][8] = rank, n_ranks, n_layers, n_cells, vocab_off, emb_type, emb_ne0, emb_ne1.
+static bool ggml_backend_rpc_mk_init(ggml_backend_t * backends, size_t n_backends, struct ggml_tensor * const * tensors,
+                                     size_t count, const int32_t * hdr, char * err, size_t err_len) {
+    std::vector<rpc_msg_mk_init_rsp> rsp(n_backends);
+    std::vector<uint8_t> sent(n_backends, 0);
+    std::vector<std::thread> threads;
+    for (size_t j = 0; j < n_backends; j++) {
+        if (!ggml_backend_is_rpc(backends[j])) {
+            snprintf(err, err_len, "device %zu is not an RPC device", j);
+            return false;
+        }
+    }
+    for (size_t j = 0; j < n_backends; j++) {
+        threads.emplace_back([&, j]() {
+            ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *) backends[j]->context;
+            auto sock = get_socket(ctx->endpoint);
+            if (sock == nullptr) {
+                return;
+            }
+            const int32_t * hj = hdr + 8*j;
+            rpc_msg_mk_init_hdr h = { ctx->device, hj[0], hj[1], hj[2], hj[3], hj[4], hj[5], hj[6], hj[7], (uint32_t) count };
+            std::vector<uint8_t> input(sizeof(h) + count * sizeof(rpc_tensor));
+            memcpy(input.data(), &h, sizeof(h));
+            for (size_t i = 0; i < count; i++) {
+                rpc_tensor t = serialize_tensor(tensors[j*count + i]);
+                memcpy(input.data() + sizeof(h) + i * sizeof(rpc_tensor), &t, sizeof(t));
+            }
+            sent[j] = send_rpc_cmd(sock, RPC_CMD_MK_INIT, input.data(), input.size(), &rsp[j], sizeof(rsp[j]));
+        });
+    }
+    for (auto & t : threads) {
+        t.join();
+    }
+    for (size_t j = 0; j < n_backends; j++) {
+        if (!sent[j] || !rsp[j].ok) {
+            snprintf(err, err_len, "device %zu: %s", j, sent[j] ? rsp[j].err : "no response");
+            return false;
+        }
+    }
+    return true;
+}
+
+// One token on every server at once, with its token_embd row; logits[j] receives rows[j] floats (backend j's
+// LM head rows).
+static bool ggml_backend_rpc_mk_decode(ggml_backend_t * backends, size_t n_backends, int32_t token, int32_t pos,
+                                       const void * emb_row, size_t emb_bytes, float * const * logits, const int32_t * rows) {
+    std::vector<uint8_t> input(sizeof(rpc_msg_mk_decode_req) + emb_bytes);
+    const rpc_msg_mk_decode_req req = { token, pos, (uint32_t) emb_bytes };
+    memcpy(input.data(), &req, sizeof(req));
+    if (emb_bytes) {
+        memcpy(input.data() + sizeof(req), emb_row, emb_bytes);
+    }
+    std::vector<uint8_t> ok(n_backends, 0);
+    std::vector<std::thread> threads;
+    for (size_t j = 0; j < n_backends; j++) {
+        threads.emplace_back([&, j]() {
+            ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *) backends[j]->context;
+            auto sock = get_socket(ctx->endpoint);
+            if (sock == nullptr) {
+                return;
+            }
+            std::vector<uint8_t> out(sizeof(int32_t) + (size_t) rows[j] * sizeof(float));
+            if (!send_rpc_cmd(sock, RPC_CMD_MK_DECODE, input.data(), input.size(), out.data(), out.size())) {
+                return;
+            }
+            int32_t status;
+            memcpy(&status, out.data(), sizeof(status));
+            if (status == 0 && logits[j]) {
+                memcpy(logits[j], out.data() + sizeof(int32_t), (size_t) rows[j] * sizeof(float));
+            }
+            ok[j] = status == 0;
+        });
+    }
+    for (auto & t : threads) {
+        t.join();
+    }
+    return std::all_of(ok.begin(), ok.end(), [](uint8_t b) { return b != 0; });
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (std::strcmp(name, "ggml_backend_rpc_mk_init") == 0) {
+        return (void *)ggml_backend_rpc_mk_init;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_mk_decode") == 0) {
+        return (void *)ggml_backend_rpc_mk_decode;
+    }
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
     }

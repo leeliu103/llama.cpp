@@ -2283,6 +2283,11 @@ size_t ggml_backend_meta_n_backends(ggml_backend_t meta_backend) {
     return backend_ctx->backend_configs.size();
 }
 
+struct ggml_tensor * ggml_backend_meta_tensor_simple(const struct ggml_tensor * tensor, size_t index) {
+    GGML_ASSERT(tensor->buffer != nullptr && ggml_backend_buffer_is_meta(tensor->buffer));
+    return ggml_backend_meta_buffer_simple_tensor(tensor, index);
+}
+
 ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index) {
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;

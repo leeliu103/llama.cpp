@@ -12,6 +12,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -401,6 +402,12 @@ llama_context::llama_context(
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+            }
+        }
+
+        for (auto & backend : backends) {
+            if (ggml_backend_is_meta(backend.get())) {
+                megakernel_tp = llama_megakernel_tp_init(model, cparams, backend.get(), memory.get());
             }
         }
     }
@@ -1301,8 +1308,8 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool apply_mctx) {
+    if (mctx && apply_mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -1838,9 +1845,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
+        // single-token decode on the tensor-split kernel: only the logits are extracted, nothing else the graph
+        // produces, and the kernel applies no adapters
+        const auto has_cvec = [&]() {
+            for (uint32_t il = 0; cvec && il < model.hparams.n_layer(); ++il) {
+                if (cvec->tensor_for(il) != nullptr) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        llama_megakernel_tp_result mk_res = LLAMA_MEGAKERNEL_TP_SKIPPED;
+        if (megakernel_tp && n_outputs <= 1 && !has_samplers && !cparams.embeddings && !cparams.embeddings_nextn &&
+            std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; }) &&
+            (!loras || loras->empty()) && !has_cvec()) {
+            float * logits_out = logits.data && n_outputs == 1 ? logits.data + n_outputs_prev*n_vocab : nullptr;
+            mk_res = llama_megakernel_tp_decode(megakernel_tp.get(), ubatch, mctx.get(), sched.get(), logits_out);
+            if (mk_res == LLAMA_MEGAKERNEL_TP_DONE) {
+                n_outputs_prev += n_outputs;
+                n_tokens_prev  += ubatch.n_tokens;
+                continue;
+            }
+        }
+
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
+                                          /*apply_mctx =*/ mk_res != LLAMA_MEGAKERNEL_TP_APPLIED);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module

@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-megakernel-tp.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -134,11 +135,13 @@ struct llama_context {
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
+    // apply_mctx = false: mctx was already applied for this ubatch
     llm_graph_result * process_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                              bool   apply_mctx = true);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -283,6 +286,9 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    // tensor-split decode kernel on the RPC devices (LLAMA_MEGAKERNEL=1), nullptr when not in use
+    llama_megakernel_tp_ptr megakernel_tp;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

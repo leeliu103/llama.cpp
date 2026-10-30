@@ -2630,3 +2630,49 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
 }
+
+bool llama_kv_cache::get_megakernel_tp_view(const slot_info & sinfo, const llama_ubatch & ubatch, std::vector<ggml_tensor *> & k,
+                                            std::vector<ggml_tensor *> & v) const {
+    if (n_stream != 1 || v_trans || attn_rot_k || attn_rot_v || swa_type != LLAMA_SWA_TYPE_NONE) {
+        return false;
+    }
+    if (ubatch.n_tokens != 1 || ubatch.n_seq_id[0] != 1 || sinfo.n_stream() != 1 || sinfo.size() != 1) {
+        return false;
+    }
+    const auto &       cells = v_cells[0];
+    const llama_pos    pos   = ubatch.pos[0];
+    const llama_seq_id seq   = ubatch.seq_id[0][0];
+    if (pos < 0 || (uint32_t) pos >= cells.size() || sinfo.idxs[0][0] != (uint32_t) pos) {
+        return false;
+    }
+    for (llama_pos p = 0; p < pos; ++p) {
+        if (cells.is_empty(p) || cells.pos_get(p) != p || cells.seq_count(p) != 1 || !cells.seq_has(p, seq)) {
+            return false;
+        }
+    }
+    for (const auto & layer : layers) {
+        if (layer.il >= k.size() || layer.k->type != GGML_TYPE_F16 || layer.v->type != GGML_TYPE_F16) {
+            return false;
+        }
+        k[layer.il] = layer.k;
+        v[layer.il] = layer.v;
+    }
+    return true;
+}
+
+bool llama_kv_cache_context::get_megakernel_tp_view(std::vector<ggml_tensor *> & k, std::vector<ggml_tensor *> & v) const {
+    if (ubatches.empty() || i_cur >= ubatches.size()) {
+        return false;
+    }
+    return kv->get_megakernel_tp_view(sinfos[i_cur], ubatches[i_cur], k, v);
+}
+
+ggml_tensor * llama_kv_cache::get_layer_k(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    return it == map_layer_ids.end() ? nullptr : layers[it->second].k;
+}
+
+ggml_tensor * llama_kv_cache::get_layer_v(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    return it == map_layer_ids.end() ? nullptr : layers[it->second].v;
+}

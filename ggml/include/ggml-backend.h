@@ -407,6 +407,13 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // a meta backend's simple backends and a meta buffer's per-device slices (also in ggml-backend-impl.h)
+    GGML_API bool                 ggml_backend_is_meta            (ggml_backend_t backend);
+    GGML_API bool                 ggml_backend_buffer_is_meta     (ggml_backend_buffer_t buf);
+    GGML_API size_t               ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
+    GGML_API ggml_backend_t       ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    GGML_API struct ggml_tensor * ggml_backend_meta_tensor_simple (const struct ggml_tensor * tensor, size_t index);
+
     //
     // Utils
     //

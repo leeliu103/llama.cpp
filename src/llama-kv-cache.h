@@ -214,6 +214,16 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    // for llama-megakernel-tp: when the cache is F16 [cell][head][dim] per layer (one stream, V not transposed,
+    //   not rotated) and the ubatch's one token goes to cell pos with every earlier position p of its sequence
+    //   (and nothing else) in cell p, stores each layer's K / V tensors at the model layer's index. false otherwise
+    bool get_megakernel_tp_view(const slot_info & sinfo, const llama_ubatch & ubatch, std::vector<ggml_tensor *> & k,
+                                std::vector<ggml_tensor *> & v) const;
+
+    // the K / V tensor of model layer il, nullptr if this cache does not hold it
+    ggml_tensor * get_layer_k(int32_t il) const;
+    ggml_tensor * get_layer_v(int32_t il) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -395,6 +405,9 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // see llama_kv_cache::get_megakernel_tp_view(), for the current ubatch; call before apply()
+    bool get_megakernel_tp_view(std::vector<ggml_tensor *> & k, std::vector<ggml_tensor *> & v) const;
 
 private:
     llama_memory_status status;
