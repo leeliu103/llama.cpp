@@ -31,6 +31,7 @@
 //   shard bench <part-00001.gguf> [layers]        # N shards in this process (GPU r % devices), real exchanges
 //   shard compare <gguf> <ref_prefix> [layers]    # teacher-forced against tools/llama_ref.cpp
 //   shard run <gguf> <rank> <host:port,...> [layers] [tokens]   # one shard per process / box, TCP
+// MK_STAGE_SPLIT=1: finish each attention/MoE kernel before a host exchange (no device mailbox wait).
 // MK_SOLO=1 with bench: rank 0 alone, each exchange returning its own partial (timing of one shard).
 
 #include "common.h"
@@ -83,6 +84,9 @@ constexpr int kWaves = kBlock / 32;
 #endif
 #ifndef MK_GRID
 #define MK_GRID 32
+#endif
+#ifndef MK_STAGE_SPLIT
+#define MK_STAGE_SPLIT 0
 #endif
 constexpr int kShards = MK_SHARDS;
 #ifndef MK_DEPTH
@@ -1101,197 +1105,166 @@ __device__ __forceinline__ void qkv_stage(const Args& a, Smem& sm, const Layer& 
 }
 
 template <bool XCHG>
-__device__ __forceinline__ int decode_step(const Args& a, Smem& sm, int pos, int token, unsigned& my_gen,
-                                           unsigned& xseq, unsigned long long* stamps, float* trace, float* logits) {
-  const int t = threadIdx.x, lane = t & 31, wv = t >> 5;
-  const int wave = wave_index(), nw = wave_count();
-  const int b0 = blockIdx.x;
-  int ns = 0;
-  stamp(stamps, ns);
-
-  for (int e = b0 * kBlock + t; e < kHidden; e += gridDim.x * kBlock) a.x[e] = q4_value_raw(a.emb, token, e);
+__device__ __forceinline__ void layer_attention(const Args& a, Smem& sm, const Layer& L, int layer,
+                                               int pos, int nchunk, int chunk, unsigned& my_gen,
+                                               unsigned long long* stamps, int& ns) {
+  const int t = threadIdx.x, lane = t & 31, wv = t >> 5, b0 = blockIdx.x;
+  {  // qkv
+    float v[kSPW][8], w[kSPW][8];
+    load_groups(a.x, v);
+    load_groups(L.attn_norm, w);
+    if (b0 < kQBlocks) {
+      const int start = b0 * kQLo + min(b0, kQExtra);
+      if (b0 < kQExtra) qkv_stage<kQLo + 1>(a, sm, L, v, w, start, -1);
+      else qkv_stage<kQLo>(a, sm, L, v, w, start, -1);
+    } else {
+      qkv_stage<kVQ>(a, sm, L, v, w, kQRest + (b0 - kQBlocks) * kVQ, b0 - kQBlocks);
+    }
+  }
   grid_barrier(a, my_gen);
   stamp(stamps, ns);
 
-  int nchunk, chunk;
-  shard_attn_split(pos + 1, nchunk, chunk);
+  attention(a, sm, L, layer, pos, nchunk, chunk);
+  grid_barrier(a, my_gen);
+  stamp(stamps, ns);
 
-  for (int layer = 0; layer < a.n_layers; layer++) {
-    const Layer L = a.layers[layer];
-    if (trace && b0 == 0)
-      for (int e = t; e < kHidden; e += kBlock) trace[(size_t)layer * kHidden + e] = a.x[e];
-
-    {  // qkv
-      float v[kSPW][8], w[kSPW][8];
-      load_groups(a.x, v);
-      load_groups(L.attn_norm, w);
-      if (b0 < kQBlocks) {
-        const int start = b0 * kQLo + min(b0, kQExtra);
-        if (b0 < kQExtra) qkv_stage<kQLo + 1>(a, sm, L, v, w, start, -1);
-        else qkv_stage<kQLo>(a, sm, L, v, w, start, -1);
-      } else {
-        qkv_stage<kVQ>(a, sm, L, v, w, kQRest + (b0 - kQBlocks) * kVQ, b0 - kQBlocks);
-      }
+  {  // o: row blocks b + kGrid j; wave set ws = w / kOWR takes j in [ws kORW, ..), its wave i = w % kOWR
+     // superblocks i, i + kOWR, ... of this shard's columns
+    float v[kOQG][8];
+    load_groups(a.attn, v);
+    const QMat mo = {L.o, nullptr, kQSB};
+    const int ws = kORS == 1 ? 0 : wv / kOWR, wi = kORS == 1 ? wv : wv % kOWR;
+    Stream<kORW * kOSW, kD, 0u, chain_mask(kORW, kOSW)> st;
+#pragma unroll
+    for (int j = 0; j < kORW; j++)
+#pragma unroll
+      for (int i = 0; i < kOSW; i++)
+        stream_set(st, j * kOSW + i, mo, b0 + kGrid * (ws * kORW + j), wi + kOWR * i);
+    st.pre();
+    groups_quantize(sm, v);
+    float o[kORW * kOSW];
+    st.run(sm, o);
+    float p[kOR][1];
+#pragma unroll
+    for (int j = 0; j < kOR; j++) p[j][0] = j / kORW == ws ? o[j % kORW * kOSW + kOSW - 1] : 0.f;
+    float tot[1];
+    int r;
+    if (reduce_partials(sm, p, tot, r)) {
+      const int rb = b0 + kGrid * r;
+      if constexpr (XCHG) publish(a, rb * 32 + lane, tot[0]);
+      else set_rows(a, sm, L, r, a.x[rb * 32 + lane] + tot[0], true);
     }
-    grid_barrier(a, my_gen);
-    stamp(stamps, ns);
-
-    attention(a, sm, L, layer, pos, nchunk, chunk);
-    grid_barrier(a, my_gen);
-    stamp(stamps, ns);
-
-    {  // o: row blocks b + kGrid j; wave set ws = w / kOWR takes j in [ws kORW, ..), its wave i = w % kOWR
-       // superblocks i, i + kOWR, ... of this shard's columns
-      float v[kOQG][8];
-      load_groups(a.attn, v);
-      const QMat mo = {L.o, nullptr, kQSB};
-      const int ws = kORS == 1 ? 0 : wv / kOWR, wi = kORS == 1 ? wv : wv % kOWR;
-      Stream<kORW * kOSW, kD, 0u, chain_mask(kORW, kOSW)> st;
-#pragma unroll
-      for (int j = 0; j < kORW; j++)
-#pragma unroll
-        for (int i = 0; i < kOSW; i++)
-          stream_set(st, j * kOSW + i, mo, b0 + kGrid * (ws * kORW + j), wi + kOWR * i);
-      st.pre();
-      groups_quantize(sm, v);
-      float o[kORW * kOSW];
-      st.run(sm, o);
-      float p[kOR][1];
-#pragma unroll
-      for (int j = 0; j < kOR; j++) p[j][0] = j / kORW == ws ? o[j % kORW * kOSW + kOSW - 1] : 0.f;
-      float tot[1];
-      int r;
-      if (reduce_partials(sm, p, tot, r)) {
-        const int rb = b0 + kGrid * r;
-        if constexpr (XCHG) publish(a, rb * 32 + lane, tot[0]);
-        else set_rows(a, sm, L, r, a.x[rb * 32 + lane] + tot[0], true);
-      }
-      if constexpr (!XCHG) {
-        lds_sync();
-        router_partials(a, sm, L);
-      }
-    }
-    if constexpr (XCHG) {
-      exchange(a, my_gen, xseq, kOpSum, kHidden);
-      stamp(stamps, ns);
-      if (t < kOR * 32) {
-        const int r = t >> 5, rb = b0 + kGrid * r;
-        set_rows(a, sm, L, r, a.x[rb * 32 + lane] + received(a, rb * 32 + lane), true);
-      }
+    if constexpr (!XCHG) {
       lds_sync();
       router_partials(a, sm, L);
     }
-    grid_barrier(a, my_gen);
-    stamp(stamps, ns);
-
-    {  // gate, up: pairs p = b0 + kGrid j (slot p / kRBE, row block p % kRBE of that expert's shard rows)
-      float v[kSPW][8], w[kSPW][8];
-      load_groups(a.x, v);
-      load_groups(L.ffn_norm, w);
-      route(a, sm);
-      if (a.trace_sel && b0 == 0 && t < kTopK) a.trace_sel[layer * kTopK + t] = sm.sel[t];
-#pragma unroll
-      for (int h = 0; h < kPPB / kPPC; h++) {
-        Stream<kPPC * 2 * kSPW, kD, 0u, chain_mask(kPPC * 2, kSPW)> st;
-#pragma unroll
-        for (int j = 0; j < kPPC; j++) {
-          const int pr = b0 + kGrid * (kPPC * h + j), rb = sm.sel[pr / kRBE] * kRBE + pr % kRBE;
-#pragma unroll
-          for (int i = 0; i < kSPW; i++) {
-            stream_set(st, (2 * j) * kSPW + i, QMat{L.gate, nullptr, kHSB}, rb, wv + kWaves * i);
-            stream_set(st, (2 * j + 1) * kSPW + i, QMat{L.up, nullptr, kHSB}, rb, wv + kWaves * i);
-          }
-        }
-        st.pre();
-        if (h == 0) {
-          groups_rmsnorm(sm, v, w);
-          groups_quantize(sm, v);
-        }
-        float o[kPPC * 2 * kSPW];
-        st.run(sm, o);
-        float p[kPPC][2];
-#pragma unroll
-        for (int j = 0; j < kPPC; j++) {
-          p[j][0] = o[(2 * j) * kSPW + kSPW - 1];
-          p[j][1] = o[(2 * j + 1) * kSPW + kSPW - 1];
-        }
-        float tot[2];
-        int r;
-        if (reduce_partials(sm, p, tot, r)) {
-          const int pr = b0 + kGrid * (kPPC * h + r);
-          const float g = tot[0], u = tot[1];
-          a.act[(pr / kRBE) * kFFP + a.act_off + (pr % kRBE) * 32 + lane] = (g / (1.f + expf(-g))) * u;
-        }
-      }
-    }
-    grid_barrier(a, my_gen);
-    stamp(stamps, ns);
-
-    {  // down: wave w = slot w, row blocks hb = b0 + kGrid h of expert sel[w] over this shard's kDSB superblocks,
-       // kDH of them per stream; the routing-weighted sum in slot order
-#pragma unroll
-      for (int pass = 0; pass < kOR / kDH; pass++) {
-        auto body = [&](auto& st) {
-#pragma unroll
-          for (int j = 0; j < kDH; j++)
-#pragma unroll
-            for (int i = 0; i < kDSB; i++) {
-              const int hb = b0 + kGrid * (kDH * pass + j);
-              stream_set(st, j * kDSB + i, QMat{L.down, L.down_d, kDSB}, sm.sel[wv] * kHB + hb, i);
-              st.sb[j * kDSB + i] = kDSB * wv + i;
-            }
-          st.pre();
-          if (pass == 0) {
-            float v[kDSB][8];
-#pragma unroll
-            for (int i = 0; i < kDSB; i++) {
-              const float4* src = (const float4*)(a.act + wv * kFFP + 256 * i + 8 * lane);
-              const float4 x0 = src[0], x1 = src[1];
-              v[i][0] = x0.x, v[i][1] = x0.y, v[i][2] = x0.z, v[i][3] = x0.w;
-              v[i][4] = x1.x, v[i][5] = x1.y, v[i][6] = x1.z, v[i][7] = x1.w;
-            }
-#pragma unroll
-            for (int i = 0; i < kDSB; i++) quantize_group(sm, kDSB * wv + i, v[i]);
-            lds_sync();
-          }
-          float o[kDH * kDSB];
-          st.run(sm, o);
-#pragma unroll
-          for (int j = 0; j < kDH; j++) sm.part[(kDH * pass + j) * kWaves + wv][lane] = o[j * kDSB + kDSB - 1];
-        };
-        if (L.down_q6) {
-          Stream<kDH * kDSB, kD, (1u << (kDH * kDSB)) - 1, chain_mask(kDH, kDSB)> st;
-          body(st);
-        } else {
-          Stream<kDH * kDSB, kD, 0u, chain_mask(kDH, kDSB)> st;
-          body(st);
-        }
-      }
-      lds_sync();
-      if (t < kOR * 32) {
-        const int h = t >> 5, hb = b0 + kGrid * h;
-        float acc = 0.f;
-#pragma unroll
-        for (int k = 0; k < kTopK; k++) acc = __builtin_fmaf(sm.selw[k], sm.part[h * kWaves + k][lane], acc);
-        if constexpr (XCHG) publish(a, hb * 32 + lane, acc);
-        else a.x[hb * 32 + lane] += acc;
-      }
-    }
-    if constexpr (XCHG) {
-      exchange(a, my_gen, xseq, kOpSum, kHidden);
-      stamp(stamps, ns);
-      if (t < kOR * 32) {
-        const int r = t >> 5, rb = b0 + kGrid * r;
-        set_rows(a, sm, L, r, a.x[rb * 32 + lane] + received(a, rb * 32 + lane), false);
-      }
-    }
-    grid_barrier(a, my_gen);
-    stamp(stamps, ns);
   }
+}
 
-  if (trace && b0 == 0)
-    for (int e = t; e < kHidden; e += kBlock) trace[(size_t)a.n_layers * kHidden + e] = a.x[e];
+template <bool XCHG>
+__device__ __forceinline__ void layer_moe(const Args& a, Smem& sm, const Layer& L, int layer,
+                                         unsigned& my_gen, unsigned long long* stamps, int& ns) {
+  const int t = threadIdx.x, lane = t & 31, wv = t >> 5, b0 = blockIdx.x;
+  {  // gate, up: pairs p = b0 + kGrid j (slot p / kRBE, row block p % kRBE of that expert's shard rows)
+    float v[kSPW][8], w[kSPW][8];
+    load_groups(a.x, v);
+    load_groups(L.ffn_norm, w);
+    route(a, sm);
+    if (a.trace_sel && b0 == 0 && t < kTopK) a.trace_sel[layer * kTopK + t] = sm.sel[t];
+#pragma unroll
+    for (int h = 0; h < kPPB / kPPC; h++) {
+      Stream<kPPC * 2 * kSPW, kD, 0u, chain_mask(kPPC * 2, kSPW)> st;
+#pragma unroll
+      for (int j = 0; j < kPPC; j++) {
+        const int pr = b0 + kGrid * (kPPC * h + j), rb = sm.sel[pr / kRBE] * kRBE + pr % kRBE;
+#pragma unroll
+        for (int i = 0; i < kSPW; i++) {
+          stream_set(st, (2 * j) * kSPW + i, QMat{L.gate, nullptr, kHSB}, rb, wv + kWaves * i);
+          stream_set(st, (2 * j + 1) * kSPW + i, QMat{L.up, nullptr, kHSB}, rb, wv + kWaves * i);
+        }
+      }
+      st.pre();
+      if (h == 0) {
+        groups_rmsnorm(sm, v, w);
+        groups_quantize(sm, v);
+      }
+      float o[kPPC * 2 * kSPW];
+      st.run(sm, o);
+      float p[kPPC][2];
+#pragma unroll
+      for (int j = 0; j < kPPC; j++) {
+        p[j][0] = o[(2 * j) * kSPW + kSPW - 1];
+        p[j][1] = o[(2 * j + 1) * kSPW + kSPW - 1];
+      }
+      float tot[2];
+      int r;
+      if (reduce_partials(sm, p, tot, r)) {
+        const int pr = b0 + kGrid * (kPPC * h + r);
+        const float g = tot[0], u = tot[1];
+        a.act[(pr / kRBE) * kFFP + a.act_off + (pr % kRBE) * 32 + lane] = (g / (1.f + expf(-g))) * u;
+      }
+    }
+  }
+  grid_barrier(a, my_gen);
+  stamp(stamps, ns);
 
+  {  // down: wave w = slot w, row blocks hb = b0 + kGrid h of expert sel[w] over this shard's kDSB superblocks,
+     // kDH of them per stream; the routing-weighted sum in slot order
+#pragma unroll
+    for (int pass = 0; pass < kOR / kDH; pass++) {
+      auto body = [&](auto& st) {
+#pragma unroll
+        for (int j = 0; j < kDH; j++)
+#pragma unroll
+          for (int i = 0; i < kDSB; i++) {
+            const int hb = b0 + kGrid * (kDH * pass + j);
+            stream_set(st, j * kDSB + i, QMat{L.down, L.down_d, kDSB}, sm.sel[wv] * kHB + hb, i);
+            st.sb[j * kDSB + i] = kDSB * wv + i;
+          }
+        st.pre();
+        if (pass == 0) {
+          float v[kDSB][8];
+#pragma unroll
+          for (int i = 0; i < kDSB; i++) {
+            const float4* src = (const float4*)(a.act + wv * kFFP + 256 * i + 8 * lane);
+            const float4 x0 = src[0], x1 = src[1];
+            v[i][0] = x0.x, v[i][1] = x0.y, v[i][2] = x0.z, v[i][3] = x0.w;
+            v[i][4] = x1.x, v[i][5] = x1.y, v[i][6] = x1.z, v[i][7] = x1.w;
+          }
+#pragma unroll
+          for (int i = 0; i < kDSB; i++) quantize_group(sm, kDSB * wv + i, v[i]);
+          lds_sync();
+        }
+        float o[kDH * kDSB];
+        st.run(sm, o);
+#pragma unroll
+        for (int j = 0; j < kDH; j++) sm.part[(kDH * pass + j) * kWaves + wv][lane] = o[j * kDSB + kDSB - 1];
+      };
+      if (L.down_q6) {
+        Stream<kDH * kDSB, kD, (1u << (kDH * kDSB)) - 1, chain_mask(kDH, kDSB)> st;
+        body(st);
+      } else {
+        Stream<kDH * kDSB, kD, 0u, chain_mask(kDH, kDSB)> st;
+        body(st);
+      }
+    }
+    lds_sync();
+    if (t < kOR * 32) {
+      const int h = t >> 5, hb = b0 + kGrid * h;
+      float acc = 0.f;
+#pragma unroll
+      for (int k = 0; k < kTopK; k++) acc = __builtin_fmaf(sm.selw[k], sm.part[h * kWaves + k][lane], acc);
+      if constexpr (XCHG) publish(a, hb * 32 + lane, acc);
+      else a.x[hb * 32 + lane] += acc;
+    }
+  }
+}
+
+template <bool XCHG>
+__device__ __forceinline__ void output_logits(const Args& a, Smem& sm, float* logits, unsigned& my_gen,
+                                             unsigned long long* stamps, int& ns) {
+  const int t = threadIdx.x, lane = t & 31, wv = t >> 5, b0 = blockIdx.x;
+  const int wave = wave_index(), nw = wave_count();
   {  // LM head over this shard's vocabulary rows + argmax
     const QMat lm = {a.lm, a.lm_d, kHSB};
     float v[kSPW][8], w[kSPW][8];
@@ -1354,6 +1327,59 @@ __device__ __forceinline__ int decode_step(const Args& a, Smem& sm, int pos, int
       publish(a, 1, __int_as_float(bidx + a.vocab_off));
     }
   }
+}
+
+template <bool XCHG>
+__device__ __forceinline__ int decode_step(const Args& a, Smem& sm, int pos, int token, unsigned& my_gen,
+                                           unsigned& xseq, unsigned long long* stamps, float* trace, float* logits) {
+  const int t = threadIdx.x, lane = t & 31;
+  const int b0 = blockIdx.x;
+  int ns = 0;
+  stamp(stamps, ns);
+
+  for (int e = b0 * kBlock + t; e < kHidden; e += gridDim.x * kBlock) a.x[e] = q4_value_raw(a.emb, token, e);
+  grid_barrier(a, my_gen);
+  stamp(stamps, ns);
+
+  int nchunk, chunk;
+  shard_attn_split(pos + 1, nchunk, chunk);
+
+  for (int layer = 0; layer < a.n_layers; layer++) {
+    const Layer L = a.layers[layer];
+    if (trace && b0 == 0)
+      for (int e = t; e < kHidden; e += kBlock) trace[(size_t)layer * kHidden + e] = a.x[e];
+
+    layer_attention<XCHG>(a, sm, L, layer, pos, nchunk, chunk, my_gen, stamps, ns);
+    if constexpr (XCHG) {
+      exchange(a, my_gen, xseq, kOpSum, kHidden);
+      stamp(stamps, ns);
+      if (t < kOR * 32) {
+        const int r = t >> 5, rb = b0 + kGrid * r;
+        set_rows(a, sm, L, r, a.x[rb * 32 + lane] + received(a, rb * 32 + lane), true);
+      }
+      lds_sync();
+      router_partials(a, sm, L);
+    }
+    grid_barrier(a, my_gen);
+    stamp(stamps, ns);
+
+    layer_moe<XCHG>(a, sm, L, layer, my_gen, stamps, ns);
+    if constexpr (XCHG) {
+      exchange(a, my_gen, xseq, kOpSum, kHidden);
+      stamp(stamps, ns);
+      if (t < kOR * 32) {
+        const int r = t >> 5, rb = b0 + kGrid * r;
+        set_rows(a, sm, L, r, a.x[rb * 32 + lane] + received(a, rb * 32 + lane), false);
+      }
+    }
+    grid_barrier(a, my_gen);
+    stamp(stamps, ns);
+  }
+
+  if (trace && b0 == 0)
+    for (int e = t; e < kHidden; e += kBlock) trace[(size_t)a.n_layers * kHidden + e] = a.x[e];
+
+  output_logits<XCHG>(a, sm, logits, my_gen, stamps, ns);
   if constexpr (XCHG) {
     exchange(a, my_gen, xseq, kOpArgmax, 2);
     stamp(stamps, ns);
@@ -1378,6 +1404,63 @@ __global__ void __launch_bounds__(kBlock) decode(Args a) {
   if (blockIdx.x == 0 && threadIdx.x == 0) *a.token = token;
   mk_status(a.status, a.bar_count);
 }
+
+#if MK_STAGE_SPLIT
+// Each stage returns its partial before the host exchanges it. The next stage
+// consumes the reduced result; no GPU thread waits for a host notification.
+__global__ void __launch_bounds__(kBlock) decode_attention_stage(Args a, int layer) {
+  __shared__ Smem sm;
+  unsigned my_gen = a.gen_base;
+  const int t = threadIdx.x, lane = t & 31, b0 = blockIdx.x;
+  const Layer L = a.layers[layer];
+  if (layer == 0) {
+    const int token = a.inputs ? a.inputs[0] : *a.token;
+    for (int e = b0 * kBlock + t; e < kHidden; e += gridDim.x * kBlock)
+      a.x[e] = q4_value_raw(a.emb, token, e);
+  } else if (t < kOR * 32) {
+    const int r = t >> 5, rb = b0 + kGrid * r;
+    set_rows(a, sm, L, r, a.x[rb * 32 + lane] + received(a, rb * 32 + lane), false);
+  }
+  grid_barrier(a, my_gen);
+  if (a.trace && b0 == 0)
+    for (int e = t; e < kHidden; e += kBlock) a.trace[(size_t)layer * kHidden + e] = a.x[e];
+  int nchunk, chunk, ns = 0;
+  shard_attn_split(a.pos + 1, nchunk, chunk);
+  layer_attention<true>(a, sm, L, layer, a.pos, nchunk, chunk, my_gen, nullptr, ns);
+}
+
+__global__ void __launch_bounds__(kBlock) decode_moe_stage(Args a, int layer) {
+  __shared__ Smem sm;
+  unsigned my_gen = a.gen_base;
+  const int t = threadIdx.x, lane = t & 31, b0 = blockIdx.x;
+  const Layer L = a.layers[layer];
+  if (t < kOR * 32) {
+    const int r = t >> 5, rb = b0 + kGrid * r;
+    set_rows(a, sm, L, r, a.x[rb * 32 + lane] + received(a, rb * 32 + lane), true);
+  }
+  lds_sync();
+  router_partials(a, sm, L);
+  grid_barrier(a, my_gen);
+  int ns = 0;
+  layer_moe<true>(a, sm, L, layer, my_gen, nullptr, ns);
+}
+
+__global__ void __launch_bounds__(kBlock) decode_head_stage(Args a) {
+  __shared__ Smem sm;
+  unsigned my_gen = a.gen_base;
+  const int t = threadIdx.x, lane = t & 31, b0 = blockIdx.x;
+  const Layer L = a.layers[a.n_layers - 1];
+  if (t < kOR * 32) {
+    const int r = t >> 5, rb = b0 + kGrid * r;
+    set_rows(a, sm, L, r, a.x[rb * 32 + lane] + received(a, rb * 32 + lane), false);
+  }
+  grid_barrier(a, my_gen);
+  if (a.trace && b0 == 0)
+    for (int e = t; e < kHidden; e += kBlock) a.trace[(size_t)a.n_layers * kHidden + e] = a.x[e];
+  int ns = 0;
+  output_logits<true>(a, sm, a.logits_all ? a.logits_all : a.logits, my_gen, nullptr, ns);
+}
+#endif
 
 // Grid barriers and exchanges per decoded token.
 static int barriers_per_step(int n_layers, bool xchg) { return xchg ? 9 * n_layers + 4 : 5 * n_layers + 2; }
@@ -1695,6 +1778,9 @@ struct State {
   unsigned long long* stamps;
   unsigned* status;
   Xchg* xc = nullptr;
+#if MK_STAGE_SPLIT
+  Xchg* stage_xc = nullptr;
+#endif
   hipStream_t stream = nullptr;
   unsigned gen = 0, xseq = 0;
   int max_ctx = 0;
@@ -1968,11 +2054,18 @@ static void alloc_state(Shard& sh, int max_ctx, bool trace, const std::vector<ui
   CHECK(hipSetDevice(sh.device));
   State& s = sh.s;
   int per_cu = 0, cus = 0;
-  CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, decode, kBlock, 0));
   CHECK(hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, sh.device));
-  if (kGrid > per_cu * cus) {
-    fprintf(stderr, "grid %d: %d per CU x %d CUs fit\n", kGrid, per_cu, cus);
-    exit(1);
+#if MK_STAGE_SPLIT
+  for (const void* kernel : {(const void*)decode_attention_stage, (const void*)decode_moe_stage,
+                             (const void*)decode_head_stage}) {
+#else
+  for (const void* kernel : {(const void*)decode}) {
+#endif
+    CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, kernel, kBlock, 0));
+    if (kGrid > per_cu * cus) {
+      fprintf(stderr, "grid %d: %d per CU x %d CUs fit\n", kGrid, per_cu, cus);
+      exit(1);
+    }
   }
   s.max_ctx = max_ctx;
   auto f = [](float*& p, size_t n) {
@@ -2026,6 +2119,10 @@ static void alloc_state(Shard& sh, int max_ctx, bool trace, const std::vector<ui
   if (kShards > 1) {
     CHECK(hipHostMalloc((void**)&s.xc, sizeof(Xchg), hipHostMallocCoherent | hipHostMallocPortable));
     memset(s.xc, 0, sizeof(Xchg));
+#if MK_STAGE_SPLIT
+    CHECK(hipMalloc(&s.stage_xc, sizeof(Xchg)));
+    CHECK(hipMemset(s.stage_xc, 0, sizeof(Xchg)));
+#endif
   }
   if (trace) {
     f(s.trace, (size_t)(sh.n_layers + 1) * kHidden);
@@ -2078,7 +2175,11 @@ static Args make_args(const Shard& sh, int pos, int n_steps, bool stamps, const 
   a.bar_count = s.bar_count;
   a.stamps = stamps ? s.stamps : nullptr;
   a.status = s.status;
+#if MK_STAGE_SPLIT
+  a.xc = s.stage_xc;
+#else
   a.xc = s.xc;
+#endif
   return a;
 }
 
@@ -2089,11 +2190,40 @@ struct ProxyStats {
   unsigned max_at = 0;
 };
 
+struct ExchangeScratch {
+  std::vector<float> buf = std::vector<float>(kHidden), full;
+  std::vector<uint16_t> half;
+};
+
+static void exchange_host(Xchg* xc, Transport* tp, unsigned op, unsigned n, ExchangeScratch& scratch) {
+  static const bool half = getenv("MK_XCHG16") && atoi(getenv("MK_XCHG16"));
+  if (op == kOpSum) {
+    memcpy(scratch.buf.data(), xc->out, n * 4);
+    if (half) tp->allreduce_sum16(scratch.buf.data(), n, scratch.half);
+    else tp->allreduce_sum(scratch.buf.data(), n, scratch.full);
+    memcpy(xc->in, scratch.buf.data(), n * 4);
+  } else {
+    float mine[2] = {xc->out[0], xc->out[1]};
+    std::vector<float> all(2 * tp->size);
+    tp->all_gather(mine, all.data(), 8);
+    float best = all[0];
+    int bidx = __builtin_bit_cast(int, all[1]);
+    for (int p = 1; p < tp->size; p++) {
+      const float v = all[2 * p];
+      const int i = __builtin_bit_cast(int, all[2 * p + 1]);
+      if (v > best || (v == best && i < bidx)) {
+        best = v;
+        bidx = i;
+      }
+    }
+    xc->in[0] = best;
+    xc->in[1] = __builtin_bit_cast(float, bidx);
+  }
+}
+
 // The host side of one shard's exchanges: count of them, numbered after first.
 static bool proxy(Xchg* xc, Transport* tp, unsigned first, unsigned count, ProxyStats* st = nullptr) {
-  static const bool half = getenv("MK_XCHG16") && atoi(getenv("MK_XCHG16"));  // fp16 partials on the wire
-  std::vector<float> buf(kHidden), scratch;
-  std::vector<uint16_t> scratch16;
+  ExchangeScratch scratch;
   for (unsigned k = 1; k <= count; k++) {
     const unsigned seq = first + k;
     const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(20);
@@ -2104,28 +2234,7 @@ static bool proxy(Xchg* xc, Transport* tp, unsigned first, unsigned count, Proxy
       }
     const unsigned op = __atomic_load_n(&xc->op, __ATOMIC_RELAXED), n = __atomic_load_n(&xc->n, __ATOMIC_RELAXED);
     const double t0 = st ? now_us() : 0;
-    if (op == kOpSum) {
-      memcpy(buf.data(), xc->out, n * 4);
-      if (half) tp->allreduce_sum16(buf.data(), n, scratch16);
-      else tp->allreduce_sum(buf.data(), n, scratch);
-      memcpy(xc->in, buf.data(), n * 4);
-    } else {
-      float mine[2] = {xc->out[0], xc->out[1]};
-      std::vector<float> all(2 * tp->size);
-      tp->all_gather(mine, all.data(), 8);
-      float best = all[0];
-      int bidx = __builtin_bit_cast(int, all[1]);
-      for (int p = 1; p < tp->size; p++) {
-        const float v = all[2 * p];
-        const int i = __builtin_bit_cast(int, all[2 * p + 1]);
-        if (v > best || (v == best && i < bidx)) {
-          best = v;
-          bidx = i;
-        }
-      }
-      xc->in[0] = best;
-      xc->in[1] = __builtin_bit_cast(float, bidx);
-    }
+    exchange_host(xc, tp, op, n, scratch);
     if (st && now_us() - t0 > st->max_us) {
       st->max_us = now_us() - t0;
       st->max_at = k;
@@ -2141,9 +2250,87 @@ struct Run {
   std::vector<Transport*> tps;  // one per shard, null with one shard
 };
 
+#if MK_STAGE_SPLIT
+static bool launch_shard_staged(Shard& sh, Transport* tp, int pos, int n_steps, bool stamps,
+                                const int* inputs, float* logits_all, ProxyStats* st) {
+  if (kShards <= 1 || !tp || sh.n_layers <= 0 || stamps || n_steps <= 0 ||
+      n_steps > kMaxSteps || pos + n_steps > sh.s.max_ctx) {
+    fprintf(stderr, "staged unsupported launch dimensions or timing-stamp request\n");
+    return false;
+  }
+  CHECK(hipSetDevice(sh.device));
+  State& s = sh.s;
+  ExchangeScratch scratch;
+  unsigned exchange_index = 0;
+  for (int step = 0; step < n_steps; ++step) {
+    auto args = [&] {
+      Args a = make_args(sh, pos + step, 1, false, inputs ? inputs + step : nullptr,
+                         logits_all ? logits_all + (size_t)step * sh.vocab_s : nullptr);
+      if (step != 0) a.trace = nullptr;
+      return a;
+    };
+    auto finish = [&](unsigned barriers, unsigned op, unsigned n) {
+      CHECK(hipMemcpyAsync(s.xc->out, s.stage_xc->out, n * 4, hipMemcpyDeviceToHost, s.stream));
+      CHECK(hipMemcpyAsync(s.status, s.bar_count, 8, hipMemcpyDeviceToHost, s.stream));
+      CHECK(hipStreamSynchronize(s.stream));
+      s.gen += barriers;
+      if (s.status[1] || s.status[0] != s.gen * kGrid) {
+        fprintf(stderr, "staged rank %d: stage %u has %u arrivals, expected %u, error=%u\n",
+                sh.rank, exchange_index + 1, s.status[0], s.gen * kGrid, s.status[1]);
+        exit(1);
+      }
+      const double t0 = st ? now_us() : 0;
+      exchange_host(s.xc, tp, op, n, scratch);
+      ++s.xseq;
+      ++exchange_index;
+      if (st && now_us() - t0 > st->max_us) {
+        st->max_us = now_us() - t0;
+        st->max_at = exchange_index;
+      }
+      if (op == kOpSum)
+        CHECK(hipMemcpyAsync(s.stage_xc->in, s.xc->in, n * 4, hipMemcpyHostToDevice, s.stream));
+    };
+    for (int layer = 0; layer < sh.n_layers; ++layer) {
+      hipLaunchKernelGGL(decode_attention_stage, dim3(kGrid), dim3(kBlock), 0, s.stream, args(), layer);
+      CHECK(hipGetLastError());
+      finish(3, kOpSum, kHidden);
+      hipLaunchKernelGGL(decode_moe_stage, dim3(kGrid), dim3(kBlock), 0, s.stream, args(), layer);
+      CHECK(hipGetLastError());
+      finish(2, kOpSum, kHidden);
+    }
+    hipLaunchKernelGGL(decode_head_stage, dim3(kGrid), dim3(kBlock), 0, s.stream, args());
+    CHECK(hipGetLastError());
+    finish(2, kOpArgmax, 2);
+    const int token = __builtin_bit_cast(int, s.xc->in[1]);
+    CHECK(hipMemcpy(s.token, &token, 4, hipMemcpyHostToDevice));
+    CHECK(hipMemcpy(s.tokens_out + step, &token, 4, hipMemcpyHostToDevice));
+  }
+  return true;
+}
+
+static bool launch_steps_staged(Run& run, int pos, int n_steps, bool stamps,
+                                const std::vector<int*>& inputs,
+                                const std::vector<float*>& logits_all, ProxyStats* st) {
+  auto one = [&](size_t i) {
+    return launch_shard_staged(*run.shards[i], run.tps[i], pos, n_steps, stamps,
+                               inputs.empty() ? nullptr : inputs[i],
+                               logits_all.empty() ? nullptr : logits_all[i], st);
+  };
+  if (run.shards.size() == 1) return one(0);
+  std::vector<std::thread> threads;
+  std::vector<int> ok(run.shards.size(), 0);
+  for (size_t i = 0; i < run.shards.size(); ++i) threads.emplace_back([&, i] { ok[i] = one(i); });
+  for (auto& thread : threads) thread.join();
+  return std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
+}
+#endif
+
 // false (after a message) when a step failed: watchdog, exchange, barrier count, or buffers too small.
 static bool launch_steps(Run& run, int pos, int n_steps, bool stamps, const std::vector<int*>& inputs = {},
                          const std::vector<float*>& logits_all = {}, ProxyStats* st = nullptr) {
+#if MK_STAGE_SPLIT
+  return launch_steps_staged(run, pos, n_steps, stamps, inputs, logits_all, st);
+#endif
   for (size_t i = 0; i < run.shards.size(); i++) {
     Shard& sh = *run.shards[i];
     if (n_steps > kMaxSteps || pos + n_steps > sh.s.max_ctx) {
@@ -3197,6 +3384,9 @@ extern "C" void* mk_tp_create(const mk_tp_model* m, char* err, size_t err_len) {
   }
   fprintf(stderr, "mk_tp: rank %d of %d, %d layers, %.2f GB of weights, %.3f GB read per token, %s exchanges\n",
           m->rank, kShards, m->n_layers, mk->sh.weight_bytes / 1e9, mk->sh.token_bytes / 1e9, mk->tp->name());
+  fprintf(stderr, "MK_STAGE_SPLIT mode=%d rank=%d layers=%d launches=%d exchanges=%d copy=%d\n",
+          MK_STAGE_SPLIT, m->rank, m->n_layers, MK_STAGE_SPLIT ? 2 * m->n_layers + 1 : 1,
+          exchanges_per_step(m->n_layers), MK_STAGE_SPLIT);
   return mk;
 }
 
